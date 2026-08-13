@@ -2064,3 +2064,51 @@ the full two-color plate and check the marker with the detector.
   module has no clients, and the machine has remained booted since August 4
   through repeated suspend/resume cycles. Reboot is the selected recovery;
   CuRobo/PyTorch reinstall is not justified by this evidence.
+
+## 2026-08-13 — Post-reboot real-state CuRobo verification
+
+- Reboot restored the existing environment without reinstalling it. Direct
+  `cuInit(0)` returns success, Torch 2.8.0+cu128 sees the RTX 5090 Laptop, and
+  Warp/CuRobo initialize on CUDA normally.
+- Three integration defects were found with real retained G1/Dex3 state and
+  fixed at their source boundaries: collision-only models now preserve
+  NVIDIA's required tool frames; NVIDIA's explicit
+  `extra_collision_spheres: null` is normalized before reserving attachment
+  slots; and Unitree Dex3 DDS finger values are mapped by joint name into
+  CuRobo's different kinematic-tree order.
+- The actual calibration workflow was checked after applying the planned
+  shoulder-clearance and middle-close preparation state, not from the raw
+  Ready snapshot. From 1544 visible candidates, CuRobo found 212 feasible
+  endpoints and selected all 80 requested information/coverage poses. The
+  frozen route contains 81 trajectories, every capture has a validated path
+  back to the measured handoff, and the one unavailable direct inter-pose edge
+  correctly falls back through that handoff. No robot command was issued.
+- The tabletop shortlist is valid only with object +Z upward, which is tag 132
+  on the generated 45 mm cube; arbitrary tabletop yaw remains allowed. This is
+  now an explicit preflight condition rather than an implicit assumption from
+  the Isaac support-plane filter.
+- CuRobo's grasp helper selects one reachable final grasp before checking its
+  approach and does not automatically try a different goal-set member after a
+  later failure. The wrapper now backtracks through the remaining qualified
+  goal set and accepts a grasp only after the complete approach, grasp,
+  closed-hand attached-payload lift, table-plane guards, and exact reverse
+  lifecycle pass. Each rejected candidate records its stage and numerical
+  reason.
+- A requested 16-sphere MorphIt payload fit silently returned only two spheres.
+  It was replaced by a deterministic 3 x 3 x 3 circumscribed-cell cuboid cover:
+  all 27 spheres are installed through CuRobo's AttachmentManager and their
+  union conservatively contains the complete 45 mm cube.
+- The complete real-state offline tabletop plan selected
+  `cube_head__seed_0000000089__sample_163`. Before that, it rejected sample 217
+  at attached-lift IK (`0/16` collision-constrained successes, best position
+  miss `18.224 mm`), sample 194 at approach planning, and sample 160 for a
+  `15.0 mm` right-middle-finger table-plane crossing. The accepted route has
+  `46.1 mm` open-hand, `45.7 mm` closed-hand, and `27.6 mm` payload minimum
+  plane clearance, and includes all six outbound/reverse phases. Its ignored
+  verification artifact is
+  `work/post_reboot_gpu_verification/tabletop_task_plan_upright_conservative.json`
+  with plan SHA-256
+  `4a8f01bfef1d91bd8d2afe1c3b3731da0a49efdaa62cc4962c034a8c577ae3d5`.
+- Final local verification is `233 passed, 3 skipped` in the Python 3.10
+  control environment and `229 passed, 1 skipped` in the Python 3.11 CuRobo
+  environment; Ruff is clean for project source, tests, and tools.

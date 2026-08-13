@@ -381,13 +381,14 @@ def _validate_curobo_finger_sweep(
         snapshot=snapshot,
         joint_position_offsets_rad=request.joint_position_offsets_rad,
     )
-    start = np.asarray(start_values, dtype=np.float64)
-    target = np.asarray(
-        (*request.left_target_q_rad, *request.right_target_q_rad), dtype=np.float64
+    start_by_name = dict(zip(names, start_values, strict=True))
+    target_by_name = dict(
+        zip(
+            names,
+            (*request.left_target_q_rad, *request.right_target_q_rad),
+            strict=True,
+        )
     )
-    intervals = max(int(np.ceil(np.max(np.abs(target - start)) / 0.02)), 1)
-    alpha = np.linspace(0.0, 1.0, intervals + 1)[:, None]
-    sweep = start[None] + alpha * (target - start)[None]
     device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
     checker = RobotCollisionChecker(
         RobotCollisionCheckerCfg.load_from_config(
@@ -396,6 +397,18 @@ def _validate_curobo_finger_sweep(
             self_collision_activation_distance=COLLISION_ACTIVATION_DISTANCE_M,
         )
     )
+    # CuRobo exposes active joints in kinematic-tree order, which is not the
+    # Unitree Dex3 DDS motor order above (the index fingers are first in this
+    # model).  Every raw tensor passed to RobotCollisionChecker must therefore
+    # be assembled by name in CuRobo's own order.
+    curobo_names = tuple(checker.kinematics.joint_names)
+    if len(curobo_names) != len(names) or set(curobo_names) != set(names):
+        raise RuntimeError("CuRobo Dex3 active-joint set differs from the requested model")
+    start = np.asarray([start_by_name[name] for name in curobo_names], dtype=np.float64)
+    target = np.asarray([target_by_name[name] for name in curobo_names], dtype=np.float64)
+    intervals = max(int(np.ceil(np.max(np.abs(target - start)) / 0.02)), 1)
+    alpha = np.linspace(0.0, 1.0, intervals + 1)[:, None]
+    sweep = start[None] + alpha * (target - start)[None]
     q = device_cfg.to_device(sweep).unsqueeze(0)
     state = checker.get_kinematics(q)
     collision_cost = checker.get_self_collision_distance(state.robot_spheres)
@@ -409,7 +422,7 @@ def _validate_curobo_finger_sweep(
     if np.any(target < lower - 1e-6) or np.any(target > upper + 1e-6):
         raise RuntimeError("NVIDIA middle-close target is outside CuRobo joint limits")
     violations = np.maximum(np.maximum(lower[None] - sweep, sweep - upper[None]), 0.0)
-    for joint_index, joint_name in enumerate(names):
+    for joint_index, joint_name in enumerate(curobo_names):
         values = violations[:, joint_index]
         if values[0] <= 1e-6 and np.any(values > 1e-6):
             raise RuntimeError(f"finger sweep leaves the hard limits at {joint_name}")

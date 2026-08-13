@@ -201,7 +201,14 @@ def build_robot_config_for_active_joints(
     kinematics["lock_joints"] = {
         name: corrected[name] for name in configured_names if name not in active_names
     }
-    kinematics["tool_frames"] = list(tool_frames)
+    # Collision-only consumers do not need a project-specific end-effector,
+    # but CuRobo's kinematics loader still requires at least one tool frame to
+    # seed the tree.  Preserve NVIDIA's complete-model tool frames when the
+    # caller does not override them.  Arm/task planners pass explicit frames.
+    if tool_frames:
+        kinematics["tool_frames"] = list(tool_frames)
+    elif not kinematics.get("tool_frames"):
+        raise ValueError("CuRobo robot configuration has no kinematics tool frame")
     reference = tuple(corrected[name] for name in active_names)
     return robot, reference
 
@@ -267,7 +274,14 @@ def build_tabletop_robot_config(
     links = kinematics["collision_link_names"]
     if RIGHT_ATTACHMENT_LINK not in links:
         links.append(RIGHT_ATTACHMENT_LINK)
-    kinematics.setdefault("extra_collision_spheres", {})[RIGHT_ATTACHMENT_LINK] = 32
+    # NVIDIA's G1 YAML carries this optional field explicitly as null.  Python
+    # ``setdefault`` does not replace an existing None value, so normalize it
+    # before reserving the payload spheres used after grasp closure.
+    extra_collision_spheres = kinematics.get("extra_collision_spheres")
+    if extra_collision_spheres is None:
+        extra_collision_spheres = {}
+        kinematics["extra_collision_spheres"] = extra_collision_spheres
+    extra_collision_spheres[RIGHT_ATTACHMENT_LINK] = 32
     ignore = kinematics.setdefault("self_collision_ignore", {})
     hand_links = [name for name in links if name.startswith("right_hand_")]
     ignore[RIGHT_ATTACHMENT_LINK] = sorted(set(hand_links))

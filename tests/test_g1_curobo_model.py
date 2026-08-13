@@ -2,11 +2,14 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.planning.g1_model import (
     _mounted_plate_collision_spheres,
+    build_robot_config_for_active_joints,
+    build_tabletop_robot_config,
     command_from_model_q,
     corrected_joint_positions,
     model_source_hashes,
@@ -52,3 +55,52 @@ def test_model_offsets_are_added_for_fk_and_removed_for_commands() -> None:
     )
     manifest = json.loads((ROOT / "cad/dex3_dorsal_aruco_mount/design_manifest.json").read_text())
     assert manifest["hand_side"] == "right"
+
+
+def test_collision_only_model_preserves_nvidia_tool_frames() -> None:
+    pytest.importorskip("curobo")
+    snapshot = RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7)
+    active = (
+        "left_hand_thumb_0_joint",
+        "left_hand_thumb_1_joint",
+        "left_hand_thumb_2_joint",
+        "left_hand_middle_0_joint",
+        "left_hand_middle_1_joint",
+        "left_hand_index_0_joint",
+        "left_hand_index_1_joint",
+        "right_hand_thumb_0_joint",
+        "right_hand_thumb_1_joint",
+        "right_hand_thumb_2_joint",
+        "right_hand_middle_0_joint",
+        "right_hand_middle_1_joint",
+        "right_hand_index_0_joint",
+        "right_hand_index_1_joint",
+    )
+
+    robot, reference = build_robot_config_for_active_joints(
+        active_joint_names=active,
+        snapshot=snapshot,
+        joint_position_offsets_rad={},
+    )
+
+    assert len(reference) == 14
+    assert robot["kinematics"]["tool_frames"] == [
+        "right_hand_index_1_link",
+        "left_hand_index_1_link",
+        "right_ankle_roll_link",
+        "left_ankle_roll_link",
+    ]
+
+
+def test_tabletop_model_reserves_attached_payload_spheres() -> None:
+    pytest.importorskip("curobo")
+    snapshot = RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7)
+
+    robot, reference = build_tabletop_robot_config(
+        snapshot=snapshot,
+        joint_position_offsets_rad={},
+        right_finger_q_rad=(0.0,) * 7,
+    )
+
+    assert len(reference) == 7
+    assert robot["kinematics"]["extra_collision_spheres"]["right_attached_object"] == 32

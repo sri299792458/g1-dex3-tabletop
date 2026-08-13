@@ -118,8 +118,10 @@ to the repository default. It never rewrites the base URDF.
 ## Tabletop cube task
 
 Physical starting state: G1 seated in FSM 3, both arms supported and stationary
-on the table, the 45 mm AprilCube resting upright and visible, the complete
-right-arm sweep clear, and the RealSense node running.
+on the table, the 45 mm AprilCube resting in the shortlist's canonical
+orientation (tag 132 / object +Z face upward) and visible, the complete
+right-arm sweep clear, and the RealSense node running. Tabletop yaw is free;
+placing any other cube face downward is rejected during read-only preflight.
 
 ```bash
 cd /home/kanth042/g1-dex3-tabletop
@@ -136,10 +138,11 @@ feedforward, observes the cube again in the loaded state, and asks isolated
 CuRobo workers for:
 
 1. a straight supported-hand escape along the observed support-plane normal;
-2. a collision-free goal from the 15 committed GraspGen-X/Isaac-qualified
-   Dex3 grasps;
-3. approach, grasp, attached-payload lift, exact reverse replacement, release,
-   retreat, clearance return, and exact reverse supported return.
+2. complete-path selection from the 15 committed GraspGen-X/Isaac-qualified
+   Dex3 grasps, with every rejected candidate and failure stage recorded;
+3. approach, grasp, a collision-aware 27-sphere conservative payload lift,
+   exact reverse replacement, release, retreat, clearance return, and exact
+   reverse supported return.
 
 Only the moving right wrist, articulated hand, and payload are checked against
 the locally observed support plane because one cube cannot reveal the table's
@@ -149,8 +152,10 @@ target and is held at the measured takeover state with gravity feedforward.
 
 The task is a visual-localization and motion-execution test, not an independent
 ground-truth calibration measurement. The selected calibration bundle itself
-records its holdout residuals and validation status. Hardware execution remains
-to be deliberately commissioned after the CUDA/UVM host issue is cleared.
+records its holdout residuals and validation status. The CUDA/UVM issue was
+cleared by reboot and the complete planning path has been exercised offline on
+the laptop GPU; physical execution still requires a deliberately slow first
+commissioning run.
 
 ## Verification
 
