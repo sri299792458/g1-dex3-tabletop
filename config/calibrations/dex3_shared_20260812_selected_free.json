@@ -1,0 +1,82 @@
+{
+  "base_urdf_sha256": "b403f92fdecc5c81057eb3c998f0b1f1b7273a187ee29daa0d929f664fc31240",
+  "bundle_id": "dex3_shared_20260812_selected_free",
+  "camera": {
+    "child_frame": "camera_color_optical_frame",
+    "parent_T_child": [
+      [-0.014972918768750815, -0.8467816213245607, 0.5317299102838702, 0.06986511495754122],
+      [-0.9997856610105821, 0.020283499821154783, 0.004148695293523939, 0.031131600000000002],
+      [-0.014298382467177306, -0.5315538217546305, -0.8469038262027565, 0.42080831483353104],
+      [0.0, 0.0, 0.0, 1.0]
+    ],
+    "parent_frame": "torso_link"
+  },
+  "content_sha256": "dae03341c35f7844cfb43cfee0a92386f2c508d26fa081f6683fb19ece99a2f3",
+  "joint_position_offsets_rad": {
+    "left_shoulder_roll_joint": 0.0526991,
+    "left_wrist_roll_joint": 0.0229595,
+    "right_elbow_joint": 0.0030577,
+    "right_shoulder_roll_joint": -0.0550579,
+    "right_shoulder_yaw_joint": 0.00595142,
+    "right_wrist_pitch_joint": 0.0293669,
+    "right_wrist_roll_joint": -0.0216867
+  },
+  "kind": "g1_calibration_bundle",
+  "provenance": {
+    "analysis_date": "2026-08-12",
+    "camera_optical_overlay": "rep103_rotation_only_zero_translation; serial_specific_rgb_sensor_transform_not_recorded",
+    "camera_serial": "348522074178",
+    "datasets": {
+      "left": {
+        "path": "work/dex3_left_41_analysis/dataset.json",
+        "sample_count": 41,
+        "sha256": "968ca0acd881f4bca5a5bfd6394020932876c8b5a0a597ca94218079b9b639fa"
+      },
+      "right": {
+        "path": "work/dex3_right_62_analysis/dataset_primary_62.json",
+        "sample_count": 62,
+        "sha256": "ab9a06c1c4e5a255305a7928db48b8d99c6f7cef4a1d64f48907d415e31ef16d"
+      }
+    },
+    "fold_seed": 29,
+    "model": "selected_free",
+    "optimizer_backend": "mikeferguson/robot_calibration:Ceres",
+    "robot_calibration_revision": "db991b040d1dc28af09d8865fc72f09720e12b73"
+  },
+  "schema_version": 1,
+  "targets": {
+    "left": {
+      "hand_T_target": [
+        [0.005822985679681869, -0.9988714077660958, 0.04713813302574549, 0.0373619],
+        [-0.05342030905540712, 0.04676089582465015, 0.9974766609811488, 0.0234421],
+        [-0.9985551378958499, -0.008326425947240312, -0.053087731282718376, -1.40789e-05],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "hand_frame": "left_rubber_hand",
+      "target_artifact_sha256": "815a5b33dbd3f2849651cfbd7772ee8ffe616e49e206ef9ffdfdcb764bb247d2",
+      "target_frame": "left_calibration_target"
+    },
+    "right": {
+      "hand_T_target": [
+        [-0.0277405592385557, -0.997926839772812, 0.05807309044799008, 0.036827],
+        [-0.030852181957551073, -0.05721303071747591, -0.9978851697387727, -0.0220941],
+        [0.9991389314012293, -0.029473574217753373, -0.029201098973159256, 0.00560701],
+        [0.0, 0.0, 0.0, 1.0]
+      ],
+      "hand_frame": "right_rubber_hand",
+      "target_artifact_sha256": "04527be5301e35382d5c4ae194fe77b7a21ff1a6b79261fc2499cdec5c1fa3fc",
+      "target_frame": "right_calibration_target"
+    }
+  },
+  "validation": {
+    "camera_pairwise_rotation_max_deg": 0.2592523581620448,
+    "camera_pairwise_translation_max_mm": 1.188516858483714,
+    "cv_holdout_radial_rms_px": 5.409130383257533,
+    "cv_left_radial_rms_px": 5.162394418580371,
+    "cv_right_radial_rms_px": 5.566290047507229,
+    "observable": true,
+    "parameter_count": 25,
+    "rank": 25,
+    "status": "analysis_candidate_not_physical_task_validation"
+  }
+}

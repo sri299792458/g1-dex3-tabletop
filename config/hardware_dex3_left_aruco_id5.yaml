@@ -1,0 +1,195 @@
+robot:
+  manufacturer: unitree
+  model: g1
+  mode_machine: 5
+  dof: 29
+  # The 29-DoF motion/FK model retains the exact mode-5 command coordinates.
+  # Its left_rubber_hand frame has the same wrist-fixed transform as the
+  # left Dex3 palm frame and is used only as that kinematic frame alias.
+  urdf: config/urdf/g1_29dof_rev_1_0_g1pilot_collision.urdf
+  calibration_reference_frame: torso_link
+  available_hands: [dex3]
+  calibration_hand: dex3
+  calibration_arm: left
+  calibration_hand_frame: left_rubber_hand
+  physical_hand_frame: left_hand_palm_link
+  calibration_target_mount: dex3_dorsal_two_m3_rev2
+  calibration_target_dictionary: DICT_6X6_50
+  calibration_target_id: 5
+  opposite_hand_calibration_target_id: 4
+  calibration_target_active_size_m: 0.040
+  calibration_target_mount_manifest: cad/dex3_dorsal_aruco_mount_id5/design_manifest.json
+  # Nominal left_hand_palm_link_T_marker from the mirrored official left palm.
+  # The physical carrier is dorsal on both hands, but dorsal is +palm-Y on the
+  # left and -palm-Y on the right. Marker +X is across the left hand, +Y points
+  # wristward, and +Z points outward.
+  calibration_target_modeled_hand_T_target:
+    - [0.0, -0.9998011179423463, 0.01994303289959598, 0.03681565314267739]
+    - [0.0, 0.01994303289959598, 0.9998011179423463, 0.02742719713567078]
+    - [-1.0, 0.0, 0.0, 0.0]
+    - [0.0, 0.0, 0.0, 1.0]
+  calibration_target_exposed_face_normal_target: [0.0, 0.0, 1.0]
+  calibration_finger_posture_model: nvidia_groot_middle_close
+  calibration_finger_posture_physical_precondition: >-
+    complete live-planned bilateral shoulder and finger sweep physically clear
+  collision_geometry_profile: dual_dex3_marker_nvidia_middle_close_segmented_aabbs
+  calibration_wrist_policy: command_all_three_measured_wrist_joints
+
+control:
+  implementation: unitree_arm_sdk_pose_executor
+  upstream_reference: unitreerobotics/xr_teleoperate_G1_29_ArmController
+  command_topic: rt/arm_sdk
+  state_topic: rt/lowstate
+  required_mode_machine: 5
+  right_arm_motor_indices: [22, 23, 24, 25, 26, 27, 28]
+  left_arm_motor_indices: [15, 16, 17, 18, 19, 20, 21]
+  calibration_arm: left
+  opposite_arm_policy: hold_measured_activation_pose
+  command_rate_hz: 250
+  hold_shoulder_elbow_kp: 80.0
+  hold_shoulder_elbow_kd: 3.0
+  hold_wrist_kp: 40.0
+  hold_wrist_kd: 1.5
+  guide_kp_scale: 0.5
+  guide_kd_scale: 0.25
+  gain_transition_ramp_s: 1.0
+  required_regular_fsm_id: 4
+  required_seated_fsm_id: 3
+  seated_table_control: debug_lowcmd
+  seated_debug_failure_policy: restore_ai_verify_zero_torque_fsm_0
+  seated_debug_command_topic: rt/lowcmd
+  seated_debug_lowcmd_commissioned: true
+  gravity_feedforward: pinocchio_rnea_at_commanded_q
+  # Unitree XR RNEA architecture with both Dex3 hands loaded; the fourteen
+  # finger joints are locked at NVIDIA GR00T's middle-close calibration posture.
+  gravity_model_urdf: third_party/unitree_ros/robots/g1_description/g1_29dof_with_hand_rev_1_0.urdf
+  gravity_locked_joint_positions_rad:
+    left_hand_thumb_0_joint: 0.0
+    left_hand_thumb_1_joint: 0.7
+    left_hand_thumb_2_joint: 0.7
+    left_hand_middle_0_joint: -1.0
+    left_hand_middle_1_joint: -1.5
+    left_hand_index_0_joint: -1.0
+    left_hand_index_1_joint: -1.5
+    right_hand_thumb_0_joint: 0.0
+    right_hand_thumb_1_joint: -0.7
+    right_hand_thumb_2_joint: -0.7
+    right_hand_middle_0_joint: 1.0
+    right_hand_middle_1_joint: 1.5
+    right_hand_index_0_joint: 1.0
+    right_hand_index_1_joint: 1.5
+  gravity_locked_joint_posture_source: nvlabs_groot_middle_close
+  # Same complete dual-Dex3 model and physical commissioning evidence as the
+  # right-arm hardware profile (maximum gravity-ramp drift 0.008317 rad).
+  seated_gravity_feedforward_commissioned: true
+  debug_body_strong_kp: 300.0
+  debug_body_strong_kd: 3.0
+  debug_body_weak_kp: 80.0
+  debug_body_weak_kd: 3.0
+  debug_body_hold_position_tolerance_rad: 0.08
+  debug_motion_switch_timeout_s: 5.0
+  debug_motion_switch_poll_interval_s: 0.05
+  guide_joint_limit_margin_rad: 0.03
+  max_joint_velocity_rad_s: 0.2
+  ownership_transition_position_tolerance_rad: 0.05
+  motion_position_tolerance_rad: 0.08
+  activation_position_tolerance_rad: 0.02
+  held_arm_position_tolerance_rad: 0.10
+  settled_position_spread_rad: 0.01
+  settle_dwell_s: 0.5
+  lowstate_timeout_s: 0.1
+  # Half of the independent 0.5 s PC2 watchdog deadline. A gap this large is
+  # still a local fault and intentionally stops the heartbeat.
+  control_gap_fault_s: 0.25
+  acquisition_weight_ramp_s: 1.0
+  release_weight_ramp_s: 1.0
+  motion_timeout_s: 30.0
+  clean_release_policy: return_to_per_run_activation_then_ramp_weight_to_zero
+  emergency_release_policy: pc2_g1_loco_damp
+
+dex3_control:
+  enabled: true
+  # Unitree XR topics/gains with NVIDIA GR00T's symmetric middle-close preset.
+  posture_name: nvidia_groot_middle_close
+  posture_source: >-
+    NVlabs/GR00T-WholeBodyControl
+    G1GripperInverseKinematicsSolver._get_middle_close_q_desired
+  left_command_topic: rt/dex3/left/cmd
+  right_command_topic: rt/dex3/right/cmd
+  left_state_topic: rt/dex3/left/state
+  right_state_topic: rt/dex3/right/state
+  command_rate_hz: 100
+  kp: 1.5
+  kd: 0.2
+  # Unitree's documented DDS order ends middle then index on both hands.
+  # NVIDIA assigns the same [base, tip] targets to both fingers here.
+  left_target_q_rad: [0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5]
+  right_target_q_rad: [0.0, -0.7, -0.7, 1.0, 1.5, 1.0, 1.5]
+  state_freshness_timeout_s: 0.1
+  # NVIDIA's measured-state command limiter; this bounds each hand write even
+  # if the physical starting posture differs from the fixed target.
+  maximum_measured_command_delta_rad: 0.25
+  posture_ramp_s: 2.0
+  posture_position_tolerance_rad: 0.08
+  # Settling reuses control.settled_position_spread_rad; raw dq is diagnostic.
+  posture_settle_dwell_s: 0.5
+  posture_timeout_s: 8.0
+  timeout_repetitions: 3
+  posture_control_commissioned: true
+
+safety:
+  physical_support: load_bearing_harness
+  emergency_policy: pc2_g1_loco_damp
+  heartbeat_interval_s: 0.1
+  heartbeat_timeout_s: 0.5
+  connect_timeout_s: 5.0
+  loco_client_timeout_s: 3.0
+  pc2_ros_setup: /opt/ros/foxy/setup.bash
+  pc2_cyclonedds_setup: /home/unitree/cyclonedds_ws/install/setup.bash
+  pc2_unitree_ros2_setup: /home/unitree/unitree_ros2/install/setup.bash
+  pc2_cyclonedds_uri: /home/unitree/cyclonedds_ws/cyclonedds.xml
+  pc2_watchdog_python: /home/unitree/.local/share/g1-aprilcube-watchdog/current/venv/bin/python
+  pc2_cyclonedds_home: /home/unitree/cyclonedds_ws/install/cyclonedds
+  pc2_motion_switcher_interface: eth0
+  manage_dex3: true
+  pc2_dex3_interface: eth0
+  pc2_g1_loco_client: /home/unitree/unitree_ros2/install/unitree_ros2_example/bin/g1_loco_client_example
+
+pose_recording:
+  stationary_duration_s: 0.5
+  minimum_state_samples: 5
+  maximum_state_gap_s: 0.1
+  maximum_calibration_position_spread_rad: 0.01
+  maximum_hold_position_spread_rad: 0.01
+  maximum_image_state_delta_s: 0.05
+  maximum_image_state_bracket_s: 0.1
+
+camera:
+  manufacturer: intel_realsense
+  model: D435i
+  name: g1_head_color
+  serial_number: "348522074178"
+  calibration_frame: camera_color_optical_frame
+  color_profile:
+    width: 1280
+    height: 720
+    frames_per_second: 15
+    encoding: rgb8
+    distortion_model: plumb_bob
+    d: [0.0, 0.0, 0.0, 0.0, 0.0]
+    k: [905.4686279296875, 0.0, 652.4732055664062, 0.0, 905.5797729492188, 368.78778076171875, 0.0, 0.0, 1.0]
+    r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    p: [905.4686279296875, 0.0, 652.4732055664062, 0.0, 0.0, 905.5797729492188, 368.78778076171875, 0.0, 0.0, 0.0, 1.0, 0.0]
+  mount:
+    pitch_adjustment: manual
+    pitch_measured: false
+    mechanically_fixed: true
+    witness_marked: true
+    calibration_policy: lock_before_calibration
+
+ros:
+  image_topic: /camera/color/image_raw
+  camera_info_topic: /camera/color/camera_info
+  camera_reliability: reliable
+  camera_qos_depth: 2
+  joint_states_topic: null

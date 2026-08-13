@@ -1,0 +1,45 @@
+schema_version: 1
+shortlist_id: cube_right_executable_v1
+hand_side: right
+
+object:
+  id: cube_head
+  mesh: generated/aprilcube_parts/cube_head/grasp_mesh.obj
+
+hand:
+  descriptor: dex3_rev1_right
+  urdf: third_party/GraspGenX/assets/x_grippers/dex3_rev1_right/gripper.urdf
+  visual_mesh: third_party/GraspGenX/assets/x_grippers/dex3_rev1_right/vis_mesh.obj
+  collision_mesh: third_party/GraspGenX/assets/x_grippers/dex3_rev1_right/coll_mesh.obj
+  contact_groups:
+    thumb:
+      - right_hand_thumb_0_link
+      - right_hand_thumb_1_link
+      - right_hand_thumb_2_link
+    opposing:
+      - right_hand_index_0_link
+      - right_hand_index_1_link
+      - right_hand_middle_0_link
+      - right_hand_middle_1_link
+
+source:
+  arm_grasp_pool: artifacts/grasp_atlas/cube_viral_v1/right/arm_grasp_pool.yaml
+  contact_trace_globs:
+    - artifacts/grasp_atlas/cube_viral_v1/right/physics_outputs_body_scalar_v2/*.contact_trace.jsonl
+
+execution_contract:
+  closure_phase: closed_before_tug
+  required_contact_groups: [thumb, opposing]
+  # A positive body-level scalar distinguishes contact from no contact. This
+  # epsilon only absorbs floating-point zero; force magnitude is not ranked.
+  contact_force_numerical_epsilon_N: 1.0e-6
+  # The complete approach is the same pure local-Z translation requested from
+  # cuRobo. Endpoint clearance therefore proves plane clearance throughout.
+  approach_distance_m: 0.15
+  # A cube face changes to the adjacent orientation every 90 degrees. More
+  # than half that interval is not accepted as pose-preserving closure.
+  max_closure_rotation_deg: 45.0
+  numerical_geometry_tolerance_m: 1.0e-6
+  pose_match_tolerance: 1.0e-7
+
+output: artifacts/grasp_shortlists/cube_right_executable_v1/shortlist.yaml

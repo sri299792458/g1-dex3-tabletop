@@ -1,0 +1,12 @@
+[submodule "third_party/curobo"]
+	path = third_party/curobo
+	url = https://github.com/NVlabs/curobo.git
+[submodule "third_party/robot_calibration"]
+	path = third_party/robot_calibration
+	url = https://github.com/mikeferguson/robot_calibration.git
+[submodule "third_party/aprilcube"]
+	path = third_party/aprilcube
+	url = https://github.com/sri299792458/aprilcube.git
+[submodule "third_party/unitree_ros"]
+	path = third_party/unitree_ros
+	url = https://github.com/unitreerobotics/unitree_ros.git

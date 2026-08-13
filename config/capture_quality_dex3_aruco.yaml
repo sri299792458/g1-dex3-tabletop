@@ -1,0 +1,35 @@
+schema_version: 1
+
+detector:
+  mode: stateless_current_frame
+  subpixel_refinement: true
+  allow_optical_flow: false
+  allow_temporal_prediction: false
+  allow_rejected_quad_recovery: false
+
+hard_gates:
+  minimum_decoded_tags: 1
+  minimum_tag_short_side_px: 25
+  minimum_corner_image_margin_px: 5
+  reject_duplicate_tag_ids: true
+  require_matching_rectified_camera_info: true
+
+preferred_quality:
+  minimum_visible_faces: 1
+  minimum_tag_short_side_px: 40
+  minimum_corner_image_margin_px: 20
+  multiface_pnp_warning_reprojection_px: 1.5
+  multiface_pnp_reject_reprojection_px: 3.0
+
+coverage:
+  image_grid_columns: 3
+  image_grid_rows: 3
+  depth_bins: 3
+  novelty_translation_m: 0.04
+  novelty_rotation_deg: 10.0
+
+stationary_burst:
+  frame_count: 7
+  maximum_duration_s: 2.0
+  output_samples_per_pose: 1
+  retain_all_raw_frames: true

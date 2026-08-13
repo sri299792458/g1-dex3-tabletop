@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "g1-dex3-tabletop"
+version = "0.1.0"
+description = "CuRobo-backed Dex3 calibration and tabletop manipulation for Unitree G1"
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+  "aprilcube",
+  "jsonschema>=4.23",
+  "manifold3d>=3.5.2",
+  "numpy>=1.26,<2",
+  "opencv-contrib-python>=4.8",
+  "pillow>=12.3.0",
+  "pin==2.7.0; python_version < '3.11'",
+  "pyyaml>=6.0",
+  "scipy>=1.13,<1.15",
+  "trimesh>=5.0.0",
+  "typing-extensions>=4.4",
+]
+
+[project.optional-dependencies]
+planner = [
+  "nvidia-curobo[cu12-torch]",
+]
+legacy-validation = [
+  "python-fcl>=0.7.0.10",
+]
+
+[project.scripts]
+g1-tabletop = "g1_dex3_tabletop.cli:main"
+g1-curobo-worker = "g1_dex3_tabletop.planning.worker:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0,<9",
+  "ruff>=0.12",
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+aprilcube = { path = "third_party/aprilcube", editable = true }
+nvidia-curobo = { path = "third_party/curobo", editable = true }
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = [
+  "src/g1_aprilcube_calibration",
+  "src/g1_dex3_tabletop",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 99
+target-version = "py310"

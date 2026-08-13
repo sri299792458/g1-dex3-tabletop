@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "G1 camera calibration result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "dataset_sha256", "training_capture_ids",
+    "holdout_capture_ids", "solution", "residual_summary", "provenance",
+    "bootstrap", "content_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "dataset_sha256": {"$ref": "#/$defs/sha"},
+    "training_capture_ids": {
+      "type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}
+    },
+    "holdout_capture_ids": {
+      "type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}
+    },
+    "solution": {
+      "type": "object",
+      "required": [
+        "backend", "torso_T_camera", "hand_T_target", "parameters", "success", "message",
+        "evaluations", "cost", "optimization_rms_px", "observability"
+      ],
+      "properties": {
+        "backend": {"const": "mikeferguson/robot_calibration:Ceres"},
+        "torso_T_camera": {"$ref": "#/$defs/matrix4"},
+        "hand_T_target": {"$ref": "#/$defs/matrix4"},
+        "parameters": {"type": "object", "minProperties": 6},
+        "success": {"const": true},
+        "message": {"type": "string"},
+        "evaluations": {"type": "integer", "minimum": 1},
+        "cost": {"type": "number", "minimum": 0},
+        "optimization_rms_px": {"type": "number", "minimum": 0},
+        "observability": {
+          "type": "object",
+          "required": [
+            "rank", "parameter_count", "singular_values", "condition_number",
+            "observable", "parameter_stddev"
+          ],
+          "properties": {
+            "rank": {"type": "integer", "minimum": 0},
+            "parameter_count": {"type": "integer", "minimum": 6},
+            "singular_values": {"type": "array", "minItems": 6},
+            "condition_number": {
+              "type": ["number", "null"], "minimum": 0
+            },
+            "observable": {"type": "boolean"},
+            "parameter_stddev": {
+              "type": "array", "minItems": 6,
+              "items": {"type": ["number", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "residual_summary": {"type": "object"},
+    "provenance": {"type": "object"},
+    "bootstrap": {"type": "object"},
+    "content_sha256": {"$ref": "#/$defs/sha"}
+  },
+  "$defs": {
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "vector4": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "items": {"type": "number"}
+    },
+    "matrix4": {
+      "type": "array", "minItems": 4, "maxItems": 4,
+      "items": {"$ref": "#/$defs/vector4"}
+    }
+  }
+}

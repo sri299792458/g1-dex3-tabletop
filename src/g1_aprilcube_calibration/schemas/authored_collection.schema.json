@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/g1/authored_collection.schema.json",
+  "title": "G1 authored automatic calibration collection plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "robot_model",
+    "mode_machine",
+    "urdf_sha256",
+    "calibration_arm",
+    "joint_order",
+    "full_joint_order",
+    "camera_profile_sha256",
+    "reference_full_q_sha256",
+    "generation_config",
+    "targets",
+    "route_pose_ids",
+    "capture_pose_ids",
+    "content_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "robot_model": {"type": "string", "minLength": 1},
+    "mode_machine": {"const": 5},
+    "urdf_sha256": {"$ref": "#/$defs/sha256"},
+    "calibration_arm": {"enum": ["left", "right"]},
+    "joint_order": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "full_joint_order": {
+      "type": "array",
+      "minItems": 29,
+      "maxItems": 29,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "camera_profile_sha256": {"$ref": "#/$defs/sha256"},
+    "reference_full_q_sha256": {"$ref": "#/$defs/sha256"},
+    "generation_config": {"type": "object"},
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/target"}
+    },
+    "route_pose_ids": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/id"},
+          {"const": "__handoff__"}
+        ]
+      }
+    },
+    "capture_pose_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/id"}
+    },
+    "content_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+    },
+    "finiteNumber": {"type": "number"},
+    "vector7": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"$ref": "#/$defs/finiteNumber"}
+    },
+    "row4": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"$ref": "#/$defs/finiteNumber"}
+    },
+    "matrix4": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {"$ref": "#/$defs/row4"}
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "authored_calibration_q",
+        "desired_camera_T_cube",
+        "ik_diagnostics"
+      ],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "authored_calibration_q": {"$ref": "#/$defs/vector7"},
+        "desired_camera_T_cube": {"$ref": "#/$defs/matrix4"},
+        "ik_diagnostics": {"type": "object"}
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+/.venv/
+/.venv-planner/
+/deps/
+/.pytest_cache/
+/.ruff_cache/
+/build/
+/dist/
+/install/
+/log/
+/work/
+/sessions/
+/runs/
+/generated/
+__pycache__/
+*.pyc

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "commissioned_source": {
+    "repository": "sri299792458/robot-calibration-aprilcube-prototype",
+    "commit": "97a78a5c9c48701400820922f0966cc3d3a9b7bc"
+  },
+  "upstream": {
+    "aprilcube": {
+      "repository": "sri299792458/aprilcube",
+      "commit": "80ed7c72ed00aef6dc70f77d8169a199e9a612cd"
+    },
+    "curobo": {
+      "repository": "NVlabs/curobo",
+      "commit": "8e734f3ced1df898990bcd92de40abce475907db"
+    },
+    "robot_calibration": {
+      "repository": "mikeferguson/robot_calibration",
+      "commit": "db991b040d1dc28af09d8865fc72f09720e12b73"
+    },
+    "unitree_ros": {
+      "repository": "unitreerobotics/unitree_ros",
+      "commit": "f3772ce54c56ef2d34c6aee8100bc768896c7d19"
+    }
+  }
+}

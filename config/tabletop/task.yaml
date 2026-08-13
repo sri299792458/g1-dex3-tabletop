@@ -1,0 +1,19 @@
+schema_version: 1
+object:
+  type: aprilcube
+  dimensions_m: [0.045, 0.045, 0.045]
+table:
+  # A single resting cube determines only its supporting plane. It cannot
+  # reveal unseen table edges, footprint, yaw, or thickness, so none are
+  # invented here. The plane guard covers only the moving right wrist, hand,
+  # and attached payload near the manipulation site. Full-robot self-collision
+  # remains active independently.
+  collision_policy: local_manipulation_geometry_plane
+motion:
+  supported_escape_m: 0.100
+  payload_lift_m: 0.100
+perception:
+  minimum_frames: 3
+  maximum_translation_spread_mm: 5.0
+  maximum_rotation_spread_deg: 2.0
+  calibration_validation_claim: false

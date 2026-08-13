@@ -1,0 +1,1162 @@
+format: g1_aprilcube_executable_grasp_shortlist
+format_version: 1
+shortlist_id: cube_right_executable_v1
+hand_side: right
+object_id: cube_head
+object_mesh: generated/aprilcube_parts/cube_head/grasp_mesh.obj
+object_mesh_sha256: ab0128b46dda5d1d9da6fa874baa75a14619eb8b636935c050a2c6661ee619c0
+candidate_count: 15
+runtime_policy:
+  candidate_grouping: none
+  candidate_submission: all_candidates_in_one_curobo_goalset
+  curobo_selection_role: reachability_and_collision_only
+  serialization_order_is_planner_cost: false
+execution_contract:
+  applicability: upright_cube_with_arbitrary_tabletop_yaw
+  source_retention_pass_required: true
+  initial_open_hand_object_collision_free: true
+  table_and_straight_pregrasp_corridor_clear: true
+  closed_hand_table_clear: true
+  closed_object_table_clear: true
+  approach_distance_m: 0.15
+  required_contact_groups_after_closure:
+  - thumb
+  - opposing
+  contact_force_numerical_epsilon_N: 1.0e-06
+  max_closure_translation_m: 0.0225
+  max_closure_translation_basis: half_of_smallest_object_extent
+  max_closure_rotation_deg: 45.0
+  max_closure_rotation_basis: half_of_90_degree_interval_to_adjacent_cube_face_orientation
+audit:
+  source_candidate_count: 2437
+  admitted_candidate_count: 15
+  rejection_counts_nonexclusive:
+    closed_hand_table_collision: 2147
+    closed_object_table_collision: 1669
+    closure_rotation_exceeds_half_face_turn: 710
+    closure_translation_exceeds_object_half_width: 897
+    initial_open_hand_object_collision: 103
+    missing_opposing_contact_after_closure: 96
+    missing_thumb_contact_after_closure: 97
+    table_or_pregrasp_corridor_collision: 2371
+source:
+  config: config/grasp_shortlists/cube_right_executable_v1.yaml
+  config_sha256: 4b4b1e7d1e0618fa4f3ba32820e620f5fd0b11b907b301162054edd35342fef1
+  arm_grasp_pool: artifacts/grasp_atlas/cube_viral_v1/right/arm_grasp_pool.yaml
+  arm_grasp_pool_sha256: e075d27d4d4d395bec6c593362a697ab386e8c684c6136165570209386df8847
+  contact_trace_globs:
+  - artifacts/grasp_atlas/cube_viral_v1/right/physics_outputs_body_scalar_v2/*.contact_trace.jsonl
+candidates:
+- candidate_id: cube_head__seed_0000000019__sample_178
+  candidate_content_sha256: a3a10bc736f56b7e83abb6f924d909ad4f6dfc5797553ea26937b53c6cc755db
+  source_pool_index: 2052
+  graspgenx_score: 0.2534523010253906
+  object_T_G:
+    position:
+    - -0.00476970481624947
+    - -0.09089956655441378
+    - 0.027459902215828298
+    orientation:
+      w: 0.7200316929777758
+      xyz:
+      - -0.6938907113264954
+      - 0.008083380156276743
+      - -0.0021681345938927496
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.009294515030616332
+    closure_translation_object_width_fraction: 0.20654477845814073
+    closure_rotation_deg: 14.157446574495046
+    closure_contact_group_max_force_N:
+      thumb: 2.605112314224243
+      opposing: 2.530757427215576
+    closure_contact_links:
+    - right_hand_index_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.009155325393111539
+    pregrasp_table_clearance_m: 0.0036202234830937235
+    closed_hand_table_clearance_m: 0.009155320476334067
+    closed_object_table_clearance_m: 0.005105784102278164
+    isaac_closed_object_T_G:
+    - - 0.9674847443595891
+      - 0.02179484276090087
+      - 0.25198861308762155
+      - -0.02055827895257245
+    - - -0.25292888264430763
+      - 0.08536297360684302
+      - 0.9637117495286437
+      - -0.08542422580581693
+    - - -0.0005065778296197867
+      - -0.9961116105559079
+      - 0.0880999162031047
+      - 0.016582490477467182
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9708642714586205
+      - -0.239466630264193
+      - 0.00884836997670405
+      - -0.005413385806043424
+    - - 0.2387228576413807
+      - 0.9697390824547697
+      - 0.051159707860458876
+      - -0.00400098047075112
+    - - -0.02083162930068721
+      - -0.04755682739073631
+      - 0.9986511894050144
+      - 0.006409010769373745
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.5375674962997437
+      right_hand_index_1_joint: 1.0182480812072754
+      right_hand_middle_0_joint: 0.9039037227630615
+      right_hand_middle_1_joint: 1.2011260986328125
+      right_hand_thumb_0_joint: 0.014303747564554214
+      right_hand_thumb_1_joint: -0.11960767954587936
+      right_hand_thumb_2_joint: -0.9029876589775085
+- candidate_id: cube_head__seed_0000000119__sample_160
+  candidate_content_sha256: 6643637ac494ff5de64e55efc8a1e672dd9d8067b6c2425f6be6dddc959af2fb
+  source_pool_index: 2267
+  graspgenx_score: 0.3979448676109314
+  object_T_G:
+    position:
+    - -0.0043080812779639766
+    - -0.0825597293609247
+    - 0.02166678522907674
+    orientation:
+      w: 0.22149648878802142
+      xyz:
+      - -0.22177481027485205
+      - 0.6738849640414275
+      - 0.6690547766969575
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.010667800041663095
+    closure_translation_object_width_fraction: 0.23706222314806877
+    closure_rotation_deg: 21.40451750938226
+    closure_contact_group_max_force_N:
+      thumb: 6.411320209503174
+      opposing: 6.368167400360107
+    closure_contact_links:
+    - right_hand_index_1_link
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.006226668804761085
+    pregrasp_table_clearance_m: 0.0072181721748297775
+    closed_hand_table_clearance_m: 0.008311486843081386
+    closed_object_table_clearance_m: 0.002923285036920395
+    isaac_closed_object_T_G:
+    - - -0.866962436594291
+      - -0.43357570717833227
+      - -0.2457410339826232
+      - 0.016227657807221796
+    - - -0.11028289809589933
+      - -0.3139593289026527
+      - 0.9430098170402441
+      - -0.08598027750663961
+    - - -0.4860187568660383
+      - 0.8446549229072866
+      - 0.22437469120235506
+      - -0.00723549505479415
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9542811056535111
+      - 0.2771761148710956
+      - -0.11189522842826505
+      - 0.003228233390474824
+    - - -0.2463139354802637
+      - 0.9412670627207521
+      - 0.23096664671986444
+      - 0.004038930187952913
+    - - 0.16934166787169788
+      - -0.1928455991990245
+      - 0.9665059198415535
+      - 0.009330997258727129
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.9030211567878723
+      right_hand_index_1_joint: 1.2007778882980347
+      right_hand_middle_0_joint: 0.543006956577301
+      right_hand_middle_1_joint: 1.0746231079101562
+      right_hand_thumb_0_joint: -0.001958356471732259
+      right_hand_thumb_1_joint: -0.0899936705827713
+      right_hand_thumb_2_joint: -0.8881867527961731
+- candidate_id: cube_head__seed_0000000149__sample_092
+  candidate_content_sha256: e63cbf79e51769367c3889fa27e083d53f5f9bd058edb90489b501b7344cbbb7
+  source_pool_index: 2091
+  graspgenx_score: 0.6587595343589783
+  object_T_G:
+    position:
+    - -0.06770779057344542
+    - 0.04129716531099226
+    - 0.04135470603786885
+    orientation:
+      w: 0.5997702832501121
+      xyz:
+      - 0.1546380204678779
+      - 0.7679353835147875
+      - -0.16321132528673526
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.010846084932901226
+    closure_translation_object_width_fraction: 0.24102410962002724
+    closure_rotation_deg: 23.333787483325057
+    closure_contact_group_max_force_N:
+      thumb: 2.7396602630615234
+      opposing: 1.596973180770874
+    closure_contact_links:
+    - right_hand_index_1_link
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.005093470853485237
+    pregrasp_table_clearance_m: 0.03918477204195351
+    closed_hand_table_clearance_m: 0.009554887724601897
+    closed_object_table_clearance_m: 0.00043922819385580625
+    isaac_closed_object_T_G:
+    - - -0.3307942485937353
+      - 0.1788936773084309
+      - 0.9265917434545718
+      - -0.06806291169173712
+    - - -0.30715706463057857
+      - 0.9079940527773149
+      - -0.28495848935070683
+      - 0.027376238763210825
+    - - -0.8923170649867919
+      - -0.3788718189897175
+      - -0.24541075639369822
+      - 0.03431230525162832
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9612719871539979
+      - 0.21679012619263582
+      - -0.17017099586408924
+      - -0.0023767593011362054
+    - - -0.25714318619920445
+      - 0.9276672772427439
+      - -0.2707596769874234
+      - 0.007689599148593601
+    - - 0.09916403976501337
+      - 0.3040320065945877
+      - 0.9474866703227781
+      - 0.0072703946612352535
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.7052958011627197
+      right_hand_index_1_joint: 1.0887718200683594
+      right_hand_middle_0_joint: 0.6408934593200684
+      right_hand_middle_1_joint: 1.0773717164993286
+      right_hand_thumb_0_joint: -0.01802976429462433
+      right_hand_thumb_1_joint: 0.01509811356663704
+      right_hand_thumb_2_joint: -0.816580057144165
+- candidate_id: cube_head__seed_0000000039__sample_107
+  candidate_content_sha256: 4c3d427aa29d799ded04fc77e61dfcd50a56625f0b8c7f46e6a7638db59a7fac
+  source_pool_index: 1688
+  graspgenx_score: 0.6213629245758057
+  object_T_G:
+    position:
+    - 0.08757663653293504
+    - 0.0011865630345925283
+    - 0.02479111169659078
+    orientation:
+      w: 0.4873440432080385
+      xyz:
+      - 0.5182145683023727
+      - -0.49917841280150677
+      - -0.4947427179270009
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.011111688452787214
+    closure_translation_object_width_fraction: 0.24692641006193808
+    closure_rotation_deg: 34.835905154565225
+    closure_contact_group_max_force_N:
+      thumb: 2.107879400253296
+      opposing: 2.119175672531128
+    closure_contact_links:
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.0021352144013277764
+    pregrasp_table_clearance_m: 0.007452842383681522
+    closed_hand_table_clearance_m: 0.0018706918006441836
+    closed_object_table_clearance_m: 0.00042890856897432467
+    isaac_closed_object_T_G:
+    - - 0.2785155844455586
+      - 0.43104318980383005
+      - -0.8582718983041023
+      - 0.07990374384783294
+    - - -0.9068344085699757
+      - -0.1763286712624985
+      - -0.38283057784466806
+      - 0.03740338211211203
+    - - -0.31635460851444935
+      - 0.8849348362580599
+      - 0.34177467322687244
+      - -0.018084360351837248
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.8459010761666632
+      - 0.3777892943116731
+      - -0.37646617421226874
+      - -0.0009527736654291047
+    - - -0.280294499481942
+      - 0.9154280004865063
+      - 0.28883691334723083
+      - -0.005433529551285588
+    - - 0.45374723054413324
+      - -0.1388060835133938
+      - 0.8802537288482979
+      - 0.009645651830207004
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.896018385887146
+      right_hand_index_1_joint: 1.1933231353759766
+      right_hand_middle_0_joint: 0.5531911849975586
+      right_hand_middle_1_joint: 1.026002287864685
+      right_hand_thumb_0_joint: -0.012977113015949726
+      right_hand_thumb_1_joint: -0.12492787092924118
+      right_hand_thumb_2_joint: -0.9075579047203064
+- candidate_id: cube_head__seed_0000000159__sample_170
+  candidate_content_sha256: e14501e41f2e171adeb3172a61849a49f0a6f3ec78a911324d625d857a556a9f
+  source_pool_index: 2373
+  graspgenx_score: 0.34561508893966675
+  object_T_G:
+    position:
+    - 0.006752830884101529
+    - 0.07656879500211622
+    - 0.052924999494184846
+    orientation:
+      w: 0.44755395151457333
+      xyz:
+      - 0.631701575219519
+      - 0.4887862837425654
+      - -0.40216482836518885
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.012158371660898075
+    closure_translation_object_width_fraction: 0.27018603690884613
+    closure_rotation_deg: 16.468538605067756
+    closure_contact_group_max_force_N:
+      thumb: 1.5506677627563477
+      opposing: 1.5613303184509277
+    closure_contact_links:
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.016706457326161675
+    pregrasp_table_clearance_m: 0.058094130719068465
+    closed_hand_table_clearance_m: 0.02381060928529733
+    closed_object_table_clearance_m: 0.003626248557606574
+    isaac_closed_object_T_G:
+    - - -0.05307957373405791
+      - 0.9974234274636731
+      - 0.04826117877736859
+      - 0.002752269263763818
+    - - 0.33281688809648297
+      - 0.06323610234197474
+      - -0.9408688442723689
+      - 0.0833911079609082
+    - - -0.9414964439806107
+      - -0.033878746601212914
+      - -0.3353159302736592
+      - 0.049065250171159036
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9610430224673946
+      - 0.1943523200169639
+      - -0.19652847349081823
+      - -0.0024567548711947815
+    - - -0.18118689783798556
+      - 0.9799346228985192
+      - 0.08306234288275983
+      - -0.008725838434075053
+    - - 0.20872839011605832
+      - -0.04421812733161511
+      - 0.9769734437063857
+      - 0.008102474965700837
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.9007837176322937
+      right_hand_index_1_joint: 1.1952886581420898
+      right_hand_middle_0_joint: 0.5471977591514587
+      right_hand_middle_1_joint: 0.99391770362854
+      right_hand_thumb_0_joint: -0.02152871899306774
+      right_hand_thumb_1_joint: -0.13356123864650726
+      right_hand_thumb_2_joint: -0.8971979022026062
+- candidate_id: cube_head__seed_0000000089__sample_163
+  candidate_content_sha256: 229170fe22f786789078b1ce45f3eaecf20380123b5f8166ca47446dbdd830bd
+  source_pool_index: 1998
+  graspgenx_score: 0.26618140935897827
+  object_T_G:
+    position:
+    - 0.09202177957692995
+    - -0.013228368380056362
+    - 0.04463435475908696
+    orientation:
+      w: 0.25202237238612474
+      xyz:
+      - -0.774721530737199
+      - -0.10033370181992618
+      - 0.5711605920476226
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.014080115304595773
+    closure_translation_object_width_fraction: 0.3128914512132394
+    closure_rotation_deg: 29.575788984590314
+    closure_contact_group_max_force_N:
+      thumb: 1.7475016117095947
+      opposing: 1.7464662790298462
+    closure_contact_links:
+    - right_hand_index_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.014002348025701487
+    pregrasp_table_clearance_m: 0.047080438598305054
+    closed_hand_table_clearance_m: 0.01291192557592602
+    closed_object_table_clearance_m: 0.003216544943461727
+    isaac_closed_object_T_G:
+    - - 0.32760036094382017
+      - -0.15042717567338987
+      - -0.9327646529703968
+      - 0.08302949463533932
+    - - 0.7939970826190406
+      - -0.49126462063697734
+      - 0.3580896735447417
+      - -0.03163168612321468
+    - - -0.512100445034478
+      - -0.8579226342309977
+      - -0.04149991991615305
+      - 0.020557858821816488
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9998340177050958
+      - -0.009985676255815406
+      - -0.015231514732056138
+      - 0.009003329920106981
+    - - 0.016199821394233083
+      - 0.8697777615161614
+      - 0.4931771139745592
+      - 0.0028004403023893093
+    - - 0.008323059775554252
+      - -0.4933420951483941
+      - 0.8697953665819761
+      - 0.01045692265693747
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.5546975135803223
+      right_hand_index_1_joint: 1.0006523132324219
+      right_hand_middle_0_joint: 0.9018054008483887
+      right_hand_middle_1_joint: 1.197543978691101
+      right_hand_thumb_0_joint: 0.02495317906141281
+      right_hand_thumb_1_joint: -0.1347334235906601
+      right_hand_thumb_2_joint: -0.895240843296051
+- candidate_id: cube_head__seed_0000000039__sample_136
+  candidate_content_sha256: a42ae3d371233f59642c265240da2d99f4adb34de734effbc6778780d8d2d4f4
+  source_pool_index: 1103
+  graspgenx_score: 0.4390106201171875
+  object_T_G:
+    position:
+    - -0.0022573896444787185
+    - -0.08815370722948168
+    - 0.029363261062731145
+    orientation:
+      w: 0.6885923673292803
+      xyz:
+      - -0.7250554223562131
+      - 0.0022178498804320546
+      - -0.011413470533488963
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.014208724329397897
+    closure_translation_object_width_fraction: 0.3157494295421755
+    closure_rotation_deg: 17.230687430378048
+    closure_contact_group_max_force_N:
+      thumb: 3.0344960689544678
+      opposing: 2.902846336364746
+    closure_contact_links:
+    - right_hand_index_0_link
+    - right_hand_index_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.00220762962737003
+    pregrasp_table_clearance_m: 0.009920714931241699
+    closed_hand_table_clearance_m: 0.0033638544270001985
+    closed_object_table_clearance_m: 0.0013711291147733527
+    isaac_closed_object_T_G:
+    - - 0.9698843206204399
+      - 0.007294302405424614
+      - -0.24345675762886865
+      - 0.030067827366653588
+    - - 0.2417702594373392
+      - 0.0923207035152771
+      - 0.9659316128527166
+      - -0.07795026201550845
+    - - 0.029521878909465893
+      - -0.9957025319888801
+      - 0.08777685951702321
+      - 0.013906675919874378
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9649402711381482
+      - 0.26179640387430453
+      - 0.01878619818541409
+      - -0.011125202429403638
+    - - -0.26182911304898204
+      - 0.9551198720932028
+      - 0.13853408921633054
+      - -0.007755779055463263
+    - - 0.01832467264933397
+      - -0.13859589278533624
+      - 0.9901795464826971
+      - 0.004238585756647196
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.5483518838882446
+      right_hand_index_1_joint: 1.061457872390747
+      right_hand_middle_0_joint: 0.9039037227630615
+      right_hand_middle_1_joint: 1.2011260986328125
+      right_hand_thumb_0_joint: 0.02275688387453556
+      right_hand_thumb_1_joint: -0.133877232670784
+      right_hand_thumb_2_joint: -0.9879388213157654
+- candidate_id: cube_head__seed_0000000099__sample_171
+  candidate_content_sha256: 460686cdb6a0706e7744160755d0862bbfa9304504adc053908a0b444eb90de8
+  source_pool_index: 2028
+  graspgenx_score: 0.28608018159866333
+  object_T_G:
+    position:
+    - 0.01602215082445993
+    - -0.08114898427663897
+    - 0.018592379514207242
+    orientation:
+      w: 0.7202943924032679
+      xyz:
+      - -0.6896001215466425
+      - 0.06505860116040063
+      - 0.03735022155643528
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.014234541320251315
+    closure_translation_object_width_fraction: 0.31632314045002924
+    closure_rotation_deg: 25.682452113273857
+    closure_contact_group_max_force_N:
+      thumb: 5.800470352172852
+      opposing: 5.965158939361572
+    closure_contact_links:
+    - right_hand_index_0_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.008328935671526764
+    pregrasp_table_clearance_m: 0.0022632204381544396
+    closed_hand_table_clearance_m: 0.006518440517938828
+    closed_object_table_clearance_m: 0.002262933608557241
+    isaac_closed_object_T_G:
+    - - 0.9452693579981465
+      - -0.3170045074652369
+      - -0.07729149955201753
+      - 0.02187885308877391
+    - - -0.04023833442511007
+      - -0.3483240864494833
+      - 0.9365100269181467
+      - -0.06450006661300223
+    - - -0.32380041707658436
+      - -0.8821441471337081
+      - -0.3420158149588902
+      - 0.03147143440527822
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.976868922815046
+      - 0.049740734919222415
+      - -0.20797349227026365
+      - 0.004402884010890493
+    - - -0.12573390707821427
+      - 0.9202919576356983
+      - -0.3704778950381657
+      - -0.00737970725218523
+    - - 0.1729684925716674
+      - 0.388057661597321
+      - 0.9052587098160461
+      - 0.011347982193175649
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.5843220949172974
+      right_hand_index_1_joint: 1.1320477724075317
+      right_hand_middle_0_joint: 0.8482934832572937
+      right_hand_middle_1_joint: 1.1682254076004028
+      right_hand_thumb_0_joint: -0.00041800111648626626
+      right_hand_thumb_1_joint: -0.057800792157649994
+      right_hand_thumb_2_joint: -0.98871910572052
+- candidate_id: cube_head__seed_0000000089__sample_136
+  candidate_content_sha256: cf7ba4aa8e67e9f13d9afc8978063d8c0357e2cb153a3b2f43935a68c0f7c271
+  source_pool_index: 2324
+  graspgenx_score: 0.40508973598480225
+  object_T_G:
+    position:
+    - -0.10517383976778136
+    - -0.004227703803168278
+    - 0.020582437042226193
+    orientation:
+      w: 0.6113620097426006
+      xyz:
+      - 0.3788278267457104
+      - 0.5724690349354139
+      - 0.3937069656060535
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.014437218257310301
+    closure_translation_object_width_fraction: 0.3208270723846734
+    closure_rotation_deg: 28.365342156648055
+    closure_contact_group_max_force_N:
+      thumb: 2.078833818435669
+      opposing: 2.078878879547119
+    closure_contact_links:
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.01559258880496088
+    pregrasp_table_clearance_m: 0.0069619842879895515
+    closed_hand_table_clearance_m: 0.013303074204604422
+    closed_object_table_clearance_m: 0.005172363449800384
+    isaac_closed_object_T_G:
+    - - -0.39955946949880816
+      - -0.07551730481012392
+      - 0.9135915778287664
+      - -0.08246826604769697
+    - - 0.8974351730663389
+      - 0.17105550819048923
+      - 0.406632812412589
+      - -0.04993225706549109
+    - - -0.18698273863870574
+      - 0.982363105303429
+      - -0.0005750521186294464
+      - 0.012806270518848306
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9018023943915852
+      - 0.42877972774721573
+      - -0.05385382489200037
+      - -0.008704153744259063
+    - - -0.4074371366282405
+      - 0.8851439967848481
+      - 0.22475528041648354
+      - 0.003490622681546292
+    - - 0.14403894297801773
+      - -0.18074271536996844
+      - 0.9729258366259365
+      - 0.010976635727789704
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.9039037227630615
+      right_hand_index_1_joint: 1.2011260986328125
+      right_hand_middle_0_joint: 0.5269995331764221
+      right_hand_middle_1_joint: 0.9680014848709106
+      right_hand_thumb_0_joint: -0.025718318298459053
+      right_hand_thumb_1_joint: -0.15624713897705078
+      right_hand_thumb_2_joint: -0.921633780002594
+- candidate_id: cube_head__seed_0000000079__sample_194
+  candidate_content_sha256: 512723be1578a9c975bdd8589a94e0cff1480ff7f39598ee015d469c78cc7780
+  source_pool_index: 1722
+  graspgenx_score: 0.18648570775985718
+  object_T_G:
+    position:
+    - -0.010895833884683709
+    - -0.08019525035558794
+    - 0.0294309421368736
+    orientation:
+      w: 0.3108751879779099
+      xyz:
+      - -0.3123423782079715
+      - 0.640926136592039
+      - 0.6285002336581036
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.014682882557501074
+    closure_translation_object_width_fraction: 0.32628627905557944
+    closure_rotation_deg: 20.709377697360484
+    closure_contact_group_max_force_N:
+      thumb: 2.30301833152771
+      opposing: 2.4244518280029297
+    closure_contact_links:
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.004641090332286272
+    pregrasp_table_clearance_m: 0.007144312469708772
+    closed_hand_table_clearance_m: 0.01928589056583488
+    closed_object_table_clearance_m: 0.0068804412343308405
+    isaac_closed_object_T_G:
+    - - -0.6931116128877178
+      - -0.65170241286526
+      - -0.3080254402421297
+      - 0.00933062407506835
+    - - -0.1711953195693018
+      - -0.2662678531345659
+      - 0.9485742750018693
+      - -0.08611406069253613
+    - - -0.700205590757689
+      - 0.7102006460876783
+      - 0.07298528960638923
+      - 0.013957859075218959
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9376868184766943
+      - 0.3209390908370039
+      - -0.13319970882402912
+      - 0.009851514023534513
+    - - -0.31100275107257974
+      - 0.9461141295553714
+      - 0.0902532619514627
+      - 0.0029205866641822675
+    - - 0.15498807886466862
+      - -0.04320406899869591
+      - 0.9869713809153335
+      - 0.010488321370861631
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.9039037227630615
+      right_hand_index_1_joint: 1.2011260986328125
+      right_hand_middle_0_joint: 0.5532382726669312
+      right_hand_middle_1_joint: 1.0421305894851685
+      right_hand_thumb_0_joint: -0.004188436083495617
+      right_hand_thumb_1_joint: -0.13239704072475433
+      right_hand_thumb_2_joint: -0.9151051044464111
+- candidate_id: cube_head__seed_0000000109__sample_178
+  candidate_content_sha256: d832fd659cc049370f154f26e97db4dc20122d2f69a9869396dd0203d2404402
+  source_pool_index: 1968
+  graspgenx_score: 0.17013110220432281
+  object_T_G:
+    position:
+    - -0.09655246003469573
+    - -0.029527744644270878
+    - 0.03297399868451535
+    orientation:
+      w: 0.5170122331681798
+      xyz:
+      - 0.43493168941201843
+      - 0.5738189156805553
+      - 0.46288727386573386
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.016099816330224774
+    closure_translation_object_width_fraction: 0.3577736962272172
+    closure_rotation_deg: 20.783622800700677
+    closure_contact_group_max_force_N:
+      thumb: 2.601900339126587
+      opposing: 2.610639810562134
+    closure_contact_links:
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.019973444971512717
+    pregrasp_table_clearance_m: 0.02550356170579285
+    closed_hand_table_clearance_m: 0.012464458988162393
+    closed_object_table_clearance_m: 0.011086357157530539
+    isaac_closed_object_T_G:
+    - - -0.3887970057309244
+      - -0.09286578190833084
+      - 0.9166311636689528
+      - -0.0821699833709022
+    - - 0.8604178995071561
+      - 0.31913181246253297
+      - 0.3972856070304001
+      - -0.04979375036488687
+    - - -0.32942037257315687
+      - 0.9431493847192894
+      - -0.04417405869865686
+      - 0.021223950232911015
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9449033586368406
+      - 0.32732483749286306
+      - 0.0040255712723302785
+      - -0.002696474046393074
+    - - -0.3233917629804267
+      - 0.9353147645426204
+      - -0.14354155627946985
+      - -0.006481491685601044
+    - - -0.050749927579993505
+      - 0.13433098271591323
+      - 0.9896361579753902
+      - 0.014488732833259969
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.9039037227630615
+      right_hand_index_1_joint: 1.2011260986328125
+      right_hand_middle_0_joint: 0.5363147258758545
+      right_hand_middle_1_joint: 0.978291928768158
+      right_hand_thumb_0_joint: -0.0364670604467392
+      right_hand_thumb_1_joint: -0.15288515388965607
+      right_hand_thumb_2_joint: -0.9076346158981323
+- candidate_id: cube_head__seed_0000000039__sample_154
+  candidate_content_sha256: 319bce11425ee318245089fb782ac8e9ef2a37e505bb69413dd83c9af5e0b23f
+  source_pool_index: 1951
+  graspgenx_score: 0.3425304591655731
+  object_T_G:
+    position:
+    - 0.1074865622917737
+    - 0.009219753189994354
+    - 0.021430866319765447
+    orientation:
+      w: 0.4700973758079656
+      xyz:
+      - 0.5494311999217416
+      - -0.44819371387543094
+      - -0.5256008073182233
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.01753892944890946
+    closure_translation_object_width_fraction: 0.3897539877535436
+    closure_rotation_deg: 24.45485244549043
+    closure_contact_group_max_force_N:
+      thumb: 2.247929096221924
+      opposing: 2.2591617107391357
+    closure_contact_links:
+    - right_hand_middle_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.00857737126703784
+    pregrasp_table_clearance_m: 0.009403045848506767
+    closed_hand_table_clearance_m: 0.004649363820592667
+    closed_object_table_clearance_m: 0.003710549621182651
+    isaac_closed_object_T_G:
+    - - 0.3976193308452518
+      - 0.01700461846404171
+      - -0.9173928938018828
+      - 0.08151529702382765
+    - - -0.8501336992443161
+      - -0.3693404493072749
+      - -0.37531366976631486
+      - 0.04404578522496838
+    - - -0.34521235791390065
+      - 0.9291385796829105
+      - -0.13240071070862422
+      - 0.02716170537121565
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9346441350007926
+      - 0.3354272779647107
+      - 0.1180206026287842
+      - 0.013318969335439843
+    - - -0.3532988735142581
+      - 0.9135660962735463
+      - 0.20143703523676504
+      - -0.007691093664536793
+    - - -0.040252154887044124
+      - -0.22996848509722903
+      - 0.9723652799654877
+      - 0.008430075936713657
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.9039037227630615
+      right_hand_index_1_joint: 1.2011260986328125
+      right_hand_middle_0_joint: 0.5232211351394653
+      right_hand_middle_1_joint: 0.9654300808906555
+      right_hand_thumb_0_joint: -0.03046761080622673
+      right_hand_thumb_1_joint: -0.14609980583190918
+      right_hand_thumb_2_joint: -0.9141216278076172
+- candidate_id: cube_head__seed_0000000159__sample_217
+  candidate_content_sha256: bfd6210163c96185eb34a1cab57fbf3b27b13451dc1e79b0704aa54dc8ebeffd
+  source_pool_index: 1858
+  graspgenx_score: 0.10799184441566467
+  object_T_G:
+    position:
+    - -0.007777580571678738
+    - -0.09571437760530566
+    - 0.04414648329101979
+    orientation:
+      w: 0.02241931759423555
+      xyz:
+      - -0.006346105708729307
+      - 0.7445857132587609
+      - 0.6671200917015501
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.01853815241145315
+    closure_translation_object_width_fraction: 0.4119589424767367
+    closure_rotation_deg: 13.648935747225158
+    closure_contact_group_max_force_N:
+      thumb: 3.650773048400879
+      opposing: 3.858940839767456
+    closure_contact_links:
+    - right_hand_middle_0_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.012089748979683727
+    pregrasp_table_clearance_m: 0.02842419621370084
+    closed_hand_table_clearance_m: 0.01281246214801473
+    closed_object_table_clearance_m: 0.0017869246341395417
+    isaac_closed_object_T_G:
+    - - -0.9976568400557247
+      - 0.06837258012691455
+      - 0.0022931621958014303
+      - -0.004677626912891419
+    - - -0.004598477337652877
+      - -0.10046754007986336
+      - 0.9949294990480934
+      - -0.08501228919398936
+    - - 0.06825629870013973
+      - 0.9925880537044074
+      - 0.10054695721357873
+      - 0.02012273660012953
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9939401242515775
+      - 0.03334087534846324
+      - -0.10474815647654795
+      - 0.0018139042025541157
+    - - -0.010626836255504275
+      - 0.9775747531691988
+      - 0.21032102341978462
+      - -0.01689045291115661
+    - - 0.10941142965198657
+      - -0.20793366085817153
+      - 0.9720047497563081
+      - 0.007421957075477062
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.9039037227630615
+      right_hand_index_1_joint: 1.2011260986328125
+      right_hand_middle_0_joint: 0.565234363079071
+      right_hand_middle_1_joint: 1.0606683492660522
+      right_hand_thumb_0_joint: -0.010310201905667782
+      right_hand_thumb_1_joint: -0.1048785075545311
+      right_hand_thumb_2_joint: -0.9239856600761414
+- candidate_id: cube_head__seed_0000000079__sample_178
+  candidate_content_sha256: a70645209b154b5e9ee15f905c5b30f3b496e1bf12630986ed0af41a49925778
+  source_pool_index: 1356
+  graspgenx_score: 0.28129246830940247
+  object_T_G:
+    position:
+    - -0.10990518941482649
+    - 0.009769037931276817
+    - 0.02066208002351701
+    orientation:
+      w: 0.5663922007554923
+      xyz:
+      - -0.3931490275782232
+      - 0.5594461005772889
+      - -0.4600584501848803
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.019515731919402562
+    closure_translation_object_width_fraction: 0.43368293154227916
+    closure_rotation_deg: 22.379746734994427
+    closure_contact_group_max_force_N:
+      thumb: 1.8193070888519287
+      opposing: 1.811215877532959
+    closure_contact_links:
+    - right_hand_index_1_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.019745663713908568
+    pregrasp_table_clearance_m: 0.01000949291495945
+    closed_hand_table_clearance_m: 0.013305796826855064
+    closed_object_table_clearance_m: 0.002500496465917112
+    isaac_closed_object_T_G:
+    - - -0.38917621568423977
+      - 0.004001772909882537
+      - 0.9211546855737529
+      - -0.08163656158087451
+    - - -0.843092944842282
+      - 0.40133969672860953
+      - -0.3579396254531532
+      - 0.044337066851352636
+    - - -0.37112835420925555
+      - -0.9159205614713279
+      - -0.15281802666023886
+      - 0.03425876768559366
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.9364851456072072
+      - -0.2821717661635066
+      - -0.20826564387721935
+      - -0.013808169385453609
+    - - 0.3111533080583015
+      - 0.9424691426484744
+      - 0.1222107248364857
+      - -0.01080258208813242
+    - - 0.1617995523672003
+      - -0.1792511318040546
+      - 0.9704070696460347
+      - 0.008573358198615665
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.5238831043243408
+      right_hand_index_1_joint: 0.9618085026741028
+      right_hand_middle_0_joint: 0.9039037227630615
+      right_hand_middle_1_joint: 1.2011260986328125
+      right_hand_thumb_0_joint: 0.023978818207979202
+      right_hand_thumb_1_joint: -0.14534509181976318
+      right_hand_thumb_2_joint: -0.90730220079422
+- candidate_id: cube_head__seed_0000000059__sample_196
+  candidate_content_sha256: a8bed84ddf02da5c57ac183590a3d5e6583634e519bad18c712b26554a74fd26
+  source_pool_index: 1497
+  graspgenx_score: 0.14087876677513123
+  object_T_G:
+    position:
+    - -0.011435987939444642
+    - 0.06957079992355253
+    - 0.023534431580533383
+    orientation:
+      w: 0.25815543244706346
+      xyz:
+      - 0.18906508307535308
+      - 0.7018416804240569
+      - -0.6364184336419828
+  execution_evidence:
+    intrinsic_retention_passed: true
+    closure_phase: closed_before_tug
+    closure_translation_m: 0.02184850469765339
+    closure_translation_object_width_fraction: 0.48552232661451983
+    closure_rotation_deg: 43.45428372041028
+    closure_contact_group_max_force_N:
+      thumb: 0.12793771922588348
+      opposing: 0.0676199346780777
+    closure_contact_links:
+    - right_hand_index_0_link
+    - right_hand_thumb_2_link
+    open_hand_object_collision_free: true
+    grasp_table_clearance_m: 0.0067929695832604185
+    pregrasp_table_clearance_m: 0.01529117458888684
+    closed_hand_table_clearance_m: 0.0037330555232285914
+    closed_object_table_clearance_m: 0.006442920737941352
+    isaac_closed_object_T_G:
+    - - -0.29664729146008467
+      - 0.7143355754847323
+      - 0.6338176146075527
+      - -0.059278237678629164
+    - - -0.24710852987293194
+      - 0.5836725616616939
+      - -0.7734750276694776
+      - 0.051213001812072334
+    - - -0.9224627133136332
+      - -0.38607114572466716
+      - 0.003373612655433948
+      - -0.005936778868381509
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_world_T_object:
+    - - 0.7373472117112183
+      - 0.4490470540510778
+      - 0.5046544611621298
+      - 0.012271629676085642
+    - - -0.524716227745674
+      - 0.8512273082794785
+      - 0.00922786315851457
+      - -0.005072575236991839
+    - - -0.4254318643468321
+      - -0.2716043256031975
+      - 0.8632722357943091
+      - 0.017350309596126913
+    - - 0.0
+      - 0.0
+      - 0.0
+      - 1.0
+    isaac_closed_q:
+      right_hand_index_0_joint: 0.5697417259216309
+      right_hand_index_1_joint: 1.0262560844421387
+      right_hand_middle_0_joint: 0.8638935089111328
+      right_hand_middle_1_joint: 1.1855714321136475
+      right_hand_thumb_0_joint: -0.009810961782932281
+      right_hand_thumb_1_joint: -0.05713799595832825
+      right_hand_thumb_2_joint: -0.9387930631637573

@@ -1,0 +1,21 @@
+shape:
+  type: voxel_cuboids
+  voxel_size_mm: 45
+  cuboids:
+    - name: head
+      origin: [0, 0, 0]
+      size: [1, 1, 1]
+dictionary: apriltag_36h11
+markers:
+  ids: 128-133
+size:
+  tag_size_mm: 36
+layout:
+  margin_cells: 1
+  border_cells: 1
+geometry:
+  edge_radius_mm: 3
+  edge_segments: 5
+material:
+  extruder: 1
+  invert: false
