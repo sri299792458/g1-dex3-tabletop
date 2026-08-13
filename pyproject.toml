@@ -23,6 +23,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+hardware = [
+  "unitree-sdk2py",
+]
 planner = [
   "nvidia-curobo[cu12-torch]",
 ]
@@ -46,6 +49,7 @@ package = true
 [tool.uv.sources]
 aprilcube = { path = "third_party/aprilcube", editable = true }
 nvidia-curobo = { path = "third_party/curobo", editable = true }
+unitree-sdk2py = { path = "third_party/unitree_sdk2_python", editable = true }
 torch = { index = "pytorch-cu128" }
 
 [[tool.uv.index]]

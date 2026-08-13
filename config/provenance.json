@@ -20,6 +20,10 @@
     "unitree_ros": {
       "repository": "unitreerobotics/unitree_ros",
       "commit": "f3772ce54c56ef2d34c6aee8100bc768896c7d19"
+    },
+    "unitree_sdk2_python": {
+      "repository": "lnotspotl/unitree_sdk2_python",
+      "commit": "7c661d27f4ae064ffd0dd633fd9d5b518ef0b508"
     }
   }
 }

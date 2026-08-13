@@ -2112,3 +2112,22 @@ the full two-color plate and check the marker with the detector.
 - Final local verification is `233 passed, 3 skipped` in the Python 3.10
   control environment and `229 passed, 1 skipped` in the Python 3.11 CuRobo
   environment; Ruff is clean for project source, tests, and tools.
+
+## 2026-08-13 — Focused-repository hardware runtime made self-contained
+
+- The first `run-tabletop` launcher attempt stopped before ROS initialization
+  because the new focused repository lacked its local
+  `deps/cyclonedds_python_prefix`; the equivalent commissioned shim still
+  existed only under the prototype repository. The same inspection also found
+  that the focused Python 3.10 environment lacked `cyclonedds` and
+  `unitree_sdk2py`. No DDS channel or robot command was created.
+- The exact commissioned `lnotspotl/unitree_sdk2_python` fork is now a pinned
+  submodule at `7c661d27f4ae064ffd0dd633fd9d5b518ef0b508`, rather than an undeclared
+  dependency on another working tree. It is isolated in the `hardware` project
+  extra so the Python 3.11 CUDA planner does not install robot transports.
+- `tools/setup_control_env.sh` now constructs the account-local ROS
+  CycloneDDS include/bin/lib shim before dependency resolution, installs the
+  hardware extra, and verifies the real 35-slot HG LowCmd, CRC, and raw
+  MotionSwitcher bindings without initializing DDS. ROS Humble `rclpy`,
+  CycloneDDS 0.10.2, and the pinned Unitree SDK all import through the hardware
+  launcher environment.
