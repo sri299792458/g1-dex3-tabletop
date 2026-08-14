@@ -104,3 +104,21 @@ def test_tabletop_model_reserves_attached_payload_spheres() -> None:
 
     assert len(reference) == 7
     assert robot["kinematics"]["extra_collision_spheres"]["right_attached_object"] == 32
+
+    ignore = robot["kinematics"]["self_collision_ignore"]
+    collision_links = robot["kinematics"]["collision_link_names"]
+    for side in ("left", "right"):
+        hand_links = sorted(name for name in collision_links if name.startswith(f"{side}_hand_"))
+        for index, link in enumerate(hand_links):
+            for other in hand_links[index + 1 :]:
+                assert other in ignore[link]
+                assert link in ignore[other]
+
+    assert "right_hip_yaw_link" not in ignore["right_hand_palm_link"]
+    assert "left_hand_palm_link" not in ignore["right_hand_palm_link"]
+    assert "right_shoulder_roll_link" in ignore["torso_link"]
+    assert "torso_link" in ignore["right_shoulder_roll_link"]
+    assert "right_shoulder_yaw_link" not in ignore["torso_link"]
+    assert robot["kinematics"]["self_collision_buffer"][
+        "right_shoulder_yaw_link"
+    ] == pytest.approx(-0.0015)

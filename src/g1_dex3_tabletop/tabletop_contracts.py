@@ -103,7 +103,7 @@ class TabletopTaskRequest:
     calibration_bundle_sha256: str
     grasp_shortlist_path: str
     grasp_shortlist_sha256: str
-    object_dimensions_m: tuple[float, ...] = (0.045, 0.045, 0.045)
+    object_dimensions_m: tuple[float, ...] = (0.040, 0.040, 0.040)
     supported_escape_m: float = 0.100
     lift_m: float = 0.100
     random_seed: int = 17

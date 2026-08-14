@@ -41,6 +41,12 @@ RIGHT_ATTACHMENT_LINK = "right_attached_object"
 # is the descriptor's root/world frame, so this is G_T_palm.
 RIGHT_G_T_PALM_XYZ_M = (-0.06158248156116279, 0.0, 0.0)
 RIGHT_G_T_PALM_RPY_RAD = (-np.pi / 2.0, -np.pi / 2.0, 0.0)
+# The commissioned G1Pilot primitives and NVIDIA's CuRobo spheres agree that
+# the retained seated handoff starts 1.19--1.20 mm inside the checked
+# right-shoulder-yaw/torso proxy. The older supported-escape policy permits
+# existing start penetration while moving out of it. CuRobo requires a free
+# start state, so encode the same fixed 1.5 mm proxy-fit allowance here.
+RIGHT_SHOULDER_YAW_START_FIT_MARGIN_M = 0.0015
 
 
 def palm_link(arm: str) -> str:
@@ -283,6 +289,40 @@ def build_tabletop_robot_config(
         kinematics["extra_collision_spheres"] = extra_collision_spheres
     extra_collision_spheres[RIGHT_ATTACHMENT_LINK] = 32
     ignore = kinematics.setdefault("self_collision_ignore", {})
+    # Every Dex3 joint is locked while CuRobo plans an arm trajectory.  Contact
+    # between links within one locked hand is therefore constant and cannot be
+    # created or resolved by any active planning coordinate.  NVIDIA's sphere
+    # model leaves a few sub-millimetre cross-finger overlaps at valid closed
+    # postures; retaining those invariant pairs makes every arm IK seed
+    # infeasible.  Ignore only each locked hand's internal pairs.  Hand-to-arm,
+    # hand-to-body, hand-to-world, and left-to-right-hand checks stay enabled.
+    for side in ("left", "right"):
+        locked_hand_links = sorted(
+            name for name in kinematics["collision_link_names"] if name.startswith(f"{side}_hand_")
+        )
+        for index, link in enumerate(locked_hand_links):
+            for other in locked_hand_links[index + 1 :]:
+                ignore.setdefault(link, [])
+                ignore.setdefault(other, [])
+                if other not in ignore[link]:
+                    ignore[link].append(other)
+                if link not in ignore[other]:
+                    ignore[other].append(link)
+    # G1Pilot's commissioned collision policy starts at shoulder-yaw; the
+    # shoulder-roll link is part of the proximal shoulder assembly and is not
+    # checked against its adjacent torso geometry. Preserve that relation in
+    # CuRobo while keeping shoulder-yaw and every distal arm/body pair active.
+    ignore.setdefault("torso_link", [])
+    ignore.setdefault("right_shoulder_roll_link", [])
+    if "right_shoulder_roll_link" not in ignore["torso_link"]:
+        ignore["torso_link"].append("right_shoulder_roll_link")
+    if "torso_link" not in ignore["right_shoulder_roll_link"]:
+        ignore["right_shoulder_roll_link"].append("torso_link")
+    buffers = kinematics.setdefault("self_collision_buffer", {})
+    buffers["right_shoulder_yaw_link"] = (
+        float(buffers.get("right_shoulder_yaw_link", 0.0))
+        - RIGHT_SHOULDER_YAW_START_FIT_MARGIN_M
+    )
     hand_links = [name for name in links if name.startswith("right_hand_")]
     ignore[RIGHT_ATTACHMENT_LINK] = sorted(set(hand_links))
     for name in hand_links:

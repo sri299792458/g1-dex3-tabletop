@@ -38,6 +38,8 @@ def observe_resting_cube(
     minimum_frames: int = 3,
     maximum_translation_spread_mm: float = 5.0,
     maximum_rotation_spread_deg: float = 2.0,
+    minimum_tag_short_side_px: float = 25.0,
+    maximum_reprojection_error_px: float = 3.0,
 ) -> TabletopObservation:
     """Estimate one robust cube pose; its bottom face becomes the table plane."""
 
@@ -60,9 +62,11 @@ def observe_resting_cube(
                 value,
                 camera_info,
                 detector,
+                target_label="tabletop AprilCube",
                 minimum_visible_faces=1,
-                minimum_tag_short_side_px=30.0,
-                maximum_reprojection_error_px=1.5,
+                minimum_tag_short_side_px=minimum_tag_short_side_px,
+                maximum_reprojection_error_px=maximum_reprojection_error_px,
+                single_best_face=True,
             )
         except ValueError as error:
             rejections.append(f"frame {index}: {error}")

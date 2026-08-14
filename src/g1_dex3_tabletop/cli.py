@@ -37,7 +37,7 @@ ROBOT_CALIBRATION = ROOT / "third_party/robot_calibration"
 ROBOT_CALIBRATION_RUNNER = ROOT / "tools/g1_robot_calibration.sh"
 DEFAULT_HARDWARE = ROOT / "config/hardware_dex3_aruco.yaml"
 DEFAULT_TASK_CONFIG = ROOT / "config/tabletop/task.yaml"
-DEFAULT_CUBE_CONFIG = ROOT / "generated/tabletop_cube/config.json"
+DEFAULT_CUBE_CONFIG = ROOT / "third_party/aprilcube/models/dex3_safe_cube/config.json"
 DEFAULT_GRASP_SHORTLIST = ROOT / "config/tabletop/cube_right_executable_v1/shortlist.yaml"
 DEFAULT_QUALITY = ROOT / "config/capture_quality_dex3_aruco.yaml"
 
@@ -149,6 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     tabletop.add_argument("--calibration-bundle", type=Path, default=DEFAULT_BUNDLE)
     tabletop.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
     tabletop.add_argument("--cube-config", type=Path, default=DEFAULT_CUBE_CONFIG)
+    tabletop.add_argument("--quality-config", type=Path, default=DEFAULT_QUALITY)
     tabletop.add_argument("--grasp-shortlist", type=Path, default=DEFAULT_GRASP_SHORTLIST)
     tabletop.add_argument("--output-root", type=Path, default=ROOT / "runs")
     tabletop.add_argument("--observation-frames", type=int, default=5)

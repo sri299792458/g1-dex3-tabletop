@@ -3,6 +3,7 @@ set -euo pipefail
 
 workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 command_args=("$@")
+hardware_command="${1:-}"
 network_interface=""
 domain_id="0"
 for ((index = 0; index < ${#command_args[@]}; index++)); do
@@ -64,4 +65,10 @@ if [[ -z "${CYCLONEDDS_URI:-}" ]]; then
 fi
 
 cd "${workspace_root}"
+case "${hardware_command}" in
+    collect-calibration|run-tabletop)
+        "${workspace_root}/tools/g1_realsense_pc2.sh" stop
+        "${workspace_root}/tools/g1_realsense_pc2.sh" start
+        ;;
+esac
 exec "${workspace_root}/.venv/bin/g1-tabletop" "$@"

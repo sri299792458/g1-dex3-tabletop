@@ -5,7 +5,7 @@ Focused Unitree G1 software for two connected operations:
 1. automatically collect dorsal-Dex3 calibration observations and solve the
    fixed-marker camera extrinsic with Mike Ferguson's Ceres optimizer;
 2. use a removable calibration bundle and official NVLabs CuRobo to plan and
-   execute a right-Dex3 45 mm AprilCube pick, 100 mm lift, exact replacement,
+   execute a right-Dex3 40 mm AprilCube pick, 100 mm lift, exact replacement,
    retreat, and controller handback.
 
 The repository contains no historical manual-teaching pipeline or custom IK.
@@ -52,7 +52,6 @@ git submodule update --init --recursive
 ./tools/setup_control_env.sh
 ./tools/setup_planner_env.sh
 ./tools/install_robot_calibration_local.sh
-./tools/generate_tabletop_cube.sh
 ./tools/g1_tabletop.sh inspect
 ```
 
@@ -118,10 +117,11 @@ to the repository default. It never rewrites the base URDF.
 ## Tabletop cube task
 
 Physical starting state: G1 seated in FSM 3, both arms supported and stationary
-on the table, the 45 mm AprilCube resting in the shortlist's canonical
-orientation (tag 132 / object +Z face upward) and visible, the complete
+on the table, the printed 40 mm `dex3_safe_cube` resting flat on any face and
+visible, the complete
 right-arm sweep clear, and the RealSense node running. Tabletop yaw is free;
-placing any other cube face downward is rejected during read-only preflight.
+the detected face identity is only a coordinate convention and does not limit
+which face may be on top.
 
 ```bash
 cd /home/kanth042/g1-dex3-tabletop

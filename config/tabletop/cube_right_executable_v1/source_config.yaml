@@ -4,7 +4,7 @@ hand_side: right
 
 object:
   id: cube_head
-  mesh: generated/aprilcube_parts/cube_head/grasp_mesh.obj
+  mesh: third_party/aprilcube/models/dex3_safe_cube/mujoco/cube.obj
 
 hand:
   descriptor: dex3_rev1_right
@@ -23,9 +23,9 @@ hand:
       - right_hand_middle_1_link
 
 source:
-  arm_grasp_pool: artifacts/grasp_atlas/cube_viral_v1/right/arm_grasp_pool.yaml
+  arm_grasp_pool: artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml
   contact_trace_globs:
-    - artifacts/grasp_atlas/cube_viral_v1/right/physics_outputs_body_scalar_v2/*.contact_trace.jsonl
+    - artifacts/grasp_atlas/cube40_viral_v1/right/physics_outputs_body_scalar_v2/*.contact_trace.jsonl
 
 execution_contract:
   closure_phase: closed_before_tug

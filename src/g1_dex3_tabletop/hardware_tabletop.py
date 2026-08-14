@@ -24,6 +24,7 @@ from aprilcube import CorrespondenceDetector
 from g1_aprilcube_calibration.activation_handoff import build_activation_handoff
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
 from g1_aprilcube_calibration.clock import SystemClock
+from g1_aprilcube_calibration.config import QualityThresholds
 from g1_aprilcube_calibration.executor_driver import (
     ExecutorControlDriver,
     SynchronizedPoseExecutor,
@@ -275,7 +276,11 @@ def _save_frames(directory: Path, frames: tuple[ROSImageFrame, ...]) -> None:
             {
                 "path": path.name,
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                "timing": frame.timing.to_dict(),
+                "timing": {
+                    "receipt_monotonic_s": frame.timing.receipt_monotonic_s,
+                    "receipt_utc": frame.timing.receipt_utc,
+                    "header_stamp_ns": frame.timing.header_stamp_ns,
+                },
             }
         )
     atomic_write_json(directory / "manifest.json", {"frames": manifest})
@@ -287,6 +292,7 @@ def run_tabletop(args) -> int:
     if args.confirm != MOTION_ACK:
         raise ValueError(f"--confirm must equal exactly: {MOTION_ACK}")
     hardware = load_hardware(args.hardware_config)
+    quality = QualityThresholds.from_yaml(args.quality_config)
     bundle = CalibrationBundle.load(args.calibration_bundle)
     model = URDFModel(resolve_hardware_path(args.hardware_config, hardware["robot"]["urdf"]))
     expected_camera = camera_info_from_hardware(hardware)
@@ -296,6 +302,7 @@ def run_tabletop(args) -> int:
     task_run.mkdir(parents=True)
     hardware_bytes = args.hardware_config.read_bytes()
     bundle_bytes = args.calibration_bundle.read_bytes()
+    quality_bytes = args.quality_config.read_bytes()
     detector = CorrespondenceDetector(args.cube_config)
     recording, _pairing = recording_configs(args.hardware_config)
     control_config, rate_hz = executor_config(args.hardware_config)
@@ -358,6 +365,8 @@ def run_tabletop(args) -> int:
                 camera_info=expected_camera,
                 detector=detector,
                 snapshot=_snapshot(activation.reference_state, hands),
+                minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
+                maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
             )
             print(
                 "READ-ONLY PREFLIGHT PASSED — seated stationary state, both Dex3 "
@@ -370,6 +379,8 @@ def run_tabletop(args) -> int:
                 raise RuntimeError("hardware configuration changed after preflight")
             if args.calibration_bundle.read_bytes() != bundle_bytes:
                 raise RuntimeError("calibration bundle changed after preflight")
+            if args.quality_config.read_bytes() != quality_bytes:
+                raise RuntimeError("capture quality configuration changed after preflight")
             activation = _wait_for_activation(observer, states, empty_pose_set, recording)
             gravity = gravity_feedforward(
                 args.hardware_config, activation.reference_state.position
@@ -436,6 +447,8 @@ def run_tabletop(args) -> int:
                 camera_info=expected_camera,
                 detector=detector,
                 snapshot=_snapshot(loaded_state, held_hands),
+                minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
+                maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
             )
             loaded_request = build_tabletop_request(
                 observation=loaded_observation,

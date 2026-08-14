@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
+from g1_aprilcube_calibration.timestamp_pairing import ImageTiming
+from g1_dex3_tabletop.hardware_tabletop import _save_frames
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
 from g1_dex3_tabletop.planning.tabletop_planner import (
     LOCAL_TABLE_PLANE_LINKS,
     _base_scene,
+    _canonical_resting_cube_pose,
     _cuboid_cover_spheres,
+    _load_shortlist,
     _local_plane_clearance,
     _plan_grasp_with_backtracking,
     _table_from_resting_object,
 )
 from g1_dex3_tabletop.tabletop_contracts import SupportedEscapePlan, TabletopObservation
+from g1_dex3_tabletop.tabletop_perception import observe_resting_cube
 from g1_dex3_tabletop.tabletop_workflow import (
     build_tabletop_request,
     request_at_clearance,
@@ -36,6 +43,42 @@ def _observation() -> TabletopObservation:
         0.1,
         0.1,
     )
+
+
+def test_failure_frames_preserve_explicit_image_timing(tmp_path: Path) -> None:
+    frame = SimpleNamespace(
+        image_bgr=np.zeros((8, 8, 3), dtype=np.uint8),
+        timing=ImageTiming(1.25, "2026-08-13T12:00:00Z", 123),
+    )
+    destination = tmp_path / "preflight"
+
+    _save_frames(destination, (frame,))
+
+    manifest = json.loads((destination / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["frames"][0]["timing"] == {
+        "receipt_monotonic_s": 1.25,
+        "receipt_utc": "2026-08-13T12:00:00Z",
+        "header_stamp_ns": 123,
+    }
+
+
+def test_tabletop_detection_names_the_cube_not_the_hand(monkeypatch) -> None:
+    def reject(_image, _camera_info, _detector, **kwargs):
+        assert kwargs["target_label"] == "tabletop AprilCube"
+        assert kwargs["minimum_tag_short_side_px"] == 25.0
+        assert kwargs["maximum_reprojection_error_px"] == 3.0
+        assert kwargs["single_best_face"] is True
+        raise ValueError("tabletop AprilCube was not detected")
+
+    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", reject)
+
+    with pytest.raises(ValueError, match="tabletop AprilCube was not detected"):
+        observe_resting_cube(
+            [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
+            camera_info=object(),
+            detector=object(),
+            snapshot=_observation().snapshot,
+        )
 
 
 def test_task_config_does_not_invent_unobserved_table_footprint() -> None:
@@ -59,6 +102,37 @@ def test_task_config_does_not_invent_unobserved_table_footprint() -> None:
     assert "physical_table_thickness_m" not in request.to_dict()
 
 
+def test_committed_task_shortlist_and_detector_share_the_40mm_cube_contract() -> None:
+    root = Path(__file__).resolve().parents[1]
+    bundle_path = root / "config/calibrations/dex3_shared_20260812_selected_free.json"
+    shortlist_path = root / "config/tabletop/cube_right_executable_v1/shortlist.yaml"
+    task_path = root / "config/tabletop/task.yaml"
+    detector_path = root / "third_party/aprilcube/models/dex3_safe_cube/config.json"
+    bundle = CalibrationBundle.load(bundle_path)
+    request = build_tabletop_request(
+        observation=_observation(),
+        calibration_bundle=bundle,
+        calibration_bundle_path=bundle_path,
+        grasp_shortlist_path=shortlist_path,
+        task_config_path=task_path,
+    )
+
+    shortlist, candidates = _load_shortlist(request)
+    detector = json.loads(detector_path.read_text(encoding="utf-8"))
+
+    assert request.object_dimensions_m == (0.040, 0.040, 0.040)
+    assert shortlist["object_mesh"] == (
+        "third_party/aprilcube/models/dex3_safe_cube/mujoco/cube.obj"
+    )
+    assert shortlist["object_mesh_sha256"] == (
+        "27c8460e40a85475e87c3cc0d6090c3c9500de4fa7f5728a2462fc099ef3d927"
+    )
+    assert len(candidates) == 15
+    assert detector["dict"] == "4x4_100"
+    assert detector["box_dims"] == [40.0, 40.0, 40.0]
+    assert detector["faces"]["+Z"] == [4]
+
+
 def test_cube_observation_defines_plane_but_no_table_box() -> None:
     from g1_dex3_tabletop.tabletop_contracts import TabletopTaskRequest
 
@@ -72,17 +146,28 @@ def test_cube_observation_defines_plane_but_no_table_box() -> None:
     )
     point, object_pose, down = _table_from_resting_object(loaded, _identity())
     np.testing.assert_allclose(object_pose, np.eye(4))
-    np.testing.assert_allclose(point, [0.0, 0.0, -0.0225])
+    np.testing.assert_allclose(point, [0.0, 0.0, -0.0200])
     np.testing.assert_allclose(down, [0.0, 0.0, -1.0])
     assert _base_scene(loaded, _identity(), include_cube=False) == {"cuboid": {}}
     assert set(_base_scene(loaded, _identity(), include_cube=True)["cuboid"]) == {"cube"}
 
 
-def test_cube_observation_rejects_a_noncanonical_support_face() -> None:
+@pytest.mark.parametrize(
+    "rotation",
+    (
+        np.eye(3),
+        np.diag([1.0, -1.0, -1.0]),
+        np.asarray(((0.0, 0.0, -1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0))),
+        np.asarray(((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 0.0, 0.0))),
+        np.asarray(((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0))),
+        np.asarray(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))),
+    ),
+)
+def test_cube_observation_accepts_every_physical_support_face(rotation) -> None:
     from g1_dex3_tabletop.tabletop_contracts import TabletopTaskRequest
 
     camera_T_object = np.eye(4)
-    camera_T_object[1:3, 1:3] = -np.eye(2)
+    camera_T_object[:3, :3] = rotation
     observation = TabletopObservation(
         _observation().snapshot,
         tuple(tuple(row) for row in camera_T_object),
@@ -100,8 +185,18 @@ def test_cube_observation_rejects_a_noncanonical_support_face() -> None:
         "f" * 64,
     )
 
-    with pytest.raises(RuntimeError, match="object \\+Z must point upward"):
-        _table_from_resting_object(loaded, _identity())
+    point, canonical, down = _table_from_resting_object(loaded, _identity())
+    np.testing.assert_allclose(canonical[:3, 3], camera_T_object[:3, 3])
+    np.testing.assert_allclose(canonical[:3, 2], [0.0, 0.0, 1.0])
+    np.testing.assert_allclose(point, [0.0, 0.0, -0.0200])
+    np.testing.assert_allclose(down, [0.0, 0.0, -1.0])
+
+
+def test_cube_observation_still_rejects_a_cube_not_resting_on_a_face() -> None:
+    tilted = np.eye(4)
+    tilted[:3, :3] = Rotation.from_euler("x", 30.0, degrees=True).as_matrix()
+    with pytest.raises(RuntimeError, match="not resting on a face"):
+        _canonical_resting_cube_pose(tilted)
 
 
 def test_grasp_planner_backtracks_selected_failed_approach(monkeypatch) -> None:
@@ -158,7 +253,7 @@ def test_local_plane_guard_excludes_unlocated_table_geometry() -> None:
 
 
 def test_attached_cube_spheres_conservatively_cover_every_subcell_corner() -> None:
-    dimensions = np.asarray([0.045, 0.045, 0.045])
+    dimensions = np.asarray([0.040, 0.040, 0.040])
     spheres = _cuboid_cover_spheres(tuple(dimensions))
 
     assert spheres.shape == (27, 4)

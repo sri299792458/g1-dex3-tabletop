@@ -1,7 +1,7 @@
 schema_version: 1
 object:
   type: aprilcube
-  dimensions_m: [0.045, 0.045, 0.045]
+  dimensions_m: [0.040, 0.040, 0.040]
 table:
   # A single resting cube determines only its supporting plane. It cannot
   # reveal unseen table edges, footprint, yaw, or thickness, so none are

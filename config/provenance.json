@@ -4,6 +4,13 @@
     "repository": "sri299792458/robot-calibration-aprilcube-prototype",
     "commit": "97a78a5c9c48701400820922f0966cc3d3a9b7bc"
   },
+  "imported_artifacts": {
+    "cube_right_executable_v1": {
+      "repository": "sri299792458/g1-aprilcube-demo",
+      "commit": "724ee07079c25765b3e630f5508bca3b7731eef5",
+      "source": "artifacts/grasp_shortlists/cube_right_executable_v1/shortlist.yaml"
+    }
+  },
   "upstream": {
     "aprilcube": {
       "repository": "sri299792458/aprilcube",

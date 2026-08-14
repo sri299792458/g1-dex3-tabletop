@@ -337,149 +337,66 @@ def detect_hand_target_pose(
     camera_info: RectifiedCameraInfo,
     detector: CorrespondenceDetector,
     *,
+    target_label: str = "hand target",
     minimum_visible_faces: int = 1,
     minimum_tag_short_side_px: float = 30.0,
     maximum_reprojection_error_px: float = 1.5,
+    single_best_face: bool = False,
 ) -> TargetPoseEstimate:
     result: CorrespondenceResult = detector.detect(image_bgr)
     if not result.valid:
         if result.duplicate_tag_ids:
             raise ValueError(
-                f"hand target has duplicate tag IDs: {list(result.duplicate_tag_ids)}"
+                f"{target_label} has duplicate tag IDs: {list(result.duplicate_tag_ids)}"
             )
-        raise ValueError("hand target was not detected")
+        raise ValueError(f"{target_label} was not detected")
     if len(result.visible_faces) < minimum_visible_faces:
         raise ValueError(
-            f"hand target has only {len(result.visible_faces)} visible face; need "
+            f"{target_label} has only {len(result.visible_faces)} visible face; need "
             f"{minimum_visible_faces}"
         )
-    minimum_side = min(item.shortest_side_px for item in result.observations)
+    observations = result.observations
+    if single_best_face:
+        observations = (max(observations, key=lambda item: item.shortest_side_px),)
+    minimum_side = min(item.shortest_side_px for item in observations)
     if minimum_side < minimum_tag_short_side_px:
         raise ValueError(
-            f"hand-target marker is only {minimum_side:.1f}px; need "
+            f"{target_label} marker is only {minimum_side:.1f}px; need "
             f"{minimum_tag_short_side_px:.1f}px"
         )
-    object_points = np.vstack([item.object_corners_mm for item in result.observations]).astype(
-        np.float64
+    pose_result = CorrespondenceResult(
+        image_size_wh=result.image_size_wh,
+        observations=tuple(observations),
+        ignored_tag_ids=result.ignored_tag_ids,
+        opencv_rejected_candidates=result.opencv_rejected_candidates,
+        quality_rejected_detections=result.quality_rejected_detections,
     )
-    image_points = np.vstack([item.image_corners_px for item in result.observations]).astype(
-        np.float64
+    diagnostic = estimate_pose_diagnostic(
+        pose_result,
+        camera_info.rectified_camera_matrix,
+        np.asarray(camera_info.d, dtype=np.float64),
     )
-    centered = object_points - np.mean(object_points, axis=0)
-    planar = np.linalg.matrix_rank(centered, tol=1e-8) <= 2
-    second_error: float | None = None
-    if planar:
-        transform, reprojection_error, second_error = _planar_target_pose(
-            object_points,
-            image_points,
-            camera_info,
-        )
-    else:
-        diagnostic = estimate_pose_diagnostic(
-            result,
-            camera_info.rectified_camera_matrix,
-            np.asarray(camera_info.d, dtype=np.float64),
-        )
-        if diagnostic is None:
-            raise ValueError("could not estimate a consistent hand-target pose")
-        transform = np.eye(4)
-        transform[:3, :3], _ = cv2.Rodrigues(diagnostic.rvec)
-        transform[:3, 3] = diagnostic.tvec_mm.reshape(3) / 1000.0
-        reprojection_error = diagnostic.reprojection_error_px
+    if diagnostic is None:
+        raise ValueError(f"could not estimate a consistent {target_label} pose")
+    transform = np.eye(4)
+    transform[:3, :3], _ = cv2.Rodrigues(diagnostic.rvec)
+    transform[:3, 3] = diagnostic.tvec_mm.reshape(3) / 1000.0
+    reprojection_error = diagnostic.reprojection_error_px
     if reprojection_error > maximum_reprojection_error_px:
         raise ValueError(
-            f"hand-target reprojection error is "
-            f"{reprojection_error:.3f}px; limit is "
+            f"{target_label} reprojection error is {reprojection_error:.3f}px; limit is "
             f"{maximum_reprojection_error_px:.3f}px"
         )
     return TargetPoseEstimate(
         camera_T_target=transform,
         reprojection_error_px=reprojection_error,
-        second_solution_error_px=second_error,
-        point_count=4 * len(result.observations),
-        marker_ids=result.tag_ids,
-        visible_faces=result.visible_faces,
+        second_solution_error_px=None,
+        point_count=4 * len(observations),
+        marker_ids=tuple(item.tag_id for item in observations),
+        visible_faces=tuple(
+            sorted({item.face_name for item in observations if item.face_name is not None})
+        ),
     )
-
-
-def _planar_target_pose(
-    object_points: np.ndarray,
-    image_points: np.ndarray,
-    camera_info: RectifiedCameraInfo,
-) -> tuple[np.ndarray, float, float | None]:
-    """Solve a planar hand target and reject a materially ambiguous mirror pose."""
-
-    square = len(object_points) == 4 and np.allclose(
-        np.linalg.norm(np.roll(object_points, -1, axis=0) - object_points, axis=1),
-        np.linalg.norm(object_points[1] - object_points[0]),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-    flag = cv2.SOLVEPNP_IPPE_SQUARE if square else cv2.SOLVEPNP_IPPE
-    count, rvecs, tvecs, _ = cv2.solvePnPGeneric(
-        object_points,
-        image_points,
-        camera_info.rectified_camera_matrix,
-        np.asarray(camera_info.d, dtype=np.float64),
-        flags=flag,
-    )
-    candidates: list[tuple[float, np.ndarray, np.ndarray, np.ndarray]] = []
-    if count:
-        for rvec, tvec in zip(rvecs, tvecs, strict=True):
-            rotation, _ = cv2.Rodrigues(rvec)
-            camera_points = (rotation @ object_points.T + np.asarray(tvec).reshape(3, 1)).T
-            if np.min(camera_points[:, 2]) <= 0:
-                continue
-            projected, _ = cv2.projectPoints(
-                object_points,
-                rvec,
-                tvec,
-                camera_info.rectified_camera_matrix,
-                np.asarray(camera_info.d, dtype=np.float64),
-            )
-            delta = projected.reshape(-1, 2) - image_points
-            rms = float(np.sqrt(np.mean(np.sum(np.square(delta), axis=1))))
-            transform = np.eye(4)
-            transform[:3, :3] = rotation
-            transform[:3, 3] = np.asarray(tvec).reshape(3) / 1000.0
-            candidates.append((rms, transform, np.asarray(rvec), np.asarray(tvec)))
-    if not candidates:
-        raise ValueError("could not obtain a positive-depth planar hand-target pose")
-    candidates.sort(key=lambda item: item[0])
-    _, transform, rvec, tvec = candidates[0]
-    rvec, tvec = cv2.solvePnPRefineLM(
-        object_points,
-        image_points,
-        camera_info.rectified_camera_matrix,
-        np.asarray(camera_info.d, dtype=np.float64),
-        rvec,
-        tvec,
-    )
-    projected, _ = cv2.projectPoints(
-        object_points,
-        rvec,
-        tvec,
-        camera_info.rectified_camera_matrix,
-        np.asarray(camera_info.d, dtype=np.float64),
-    )
-    delta = projected.reshape(-1, 2) - image_points
-    rms = float(np.sqrt(np.mean(np.sum(np.square(delta), axis=1))))
-    transform = np.eye(4)
-    transform[:3, :3], _ = cv2.Rodrigues(rvec)
-    transform[:3, 3] = np.asarray(tvec).reshape(3) / 1000.0
-    second_error = candidates[1][0] if len(candidates) > 1 else None
-    if second_error is not None and second_error - rms < 0.1:
-        second = candidates[1][1]
-        translation_delta_mm = 1000.0 * float(np.linalg.norm(second[:3, 3] - transform[:3, 3]))
-        rotation_delta_deg = _rotation_error_deg(transform, second)
-        if translation_delta_mm > 2.0 or rotation_delta_deg > 0.5:
-            raise ValueError(
-                "hand-target planar pose is ambiguous: two materially different "
-                "IPPE solutions have nearly equal reprojection error"
-            )
-    return validate_transform(transform), rms, second_error
-
-
 # Existing table-plan documents retain this callable name; new code uses the
 # target-neutral entry point above.
 detect_hand_cube_pose = detect_hand_target_pose

@@ -2131,3 +2131,134 @@ the full two-color plate and check the marker with the detector.
   MotionSwitcher bindings without initializing DDS. ROS Humble `rclpy`,
   CycloneDDS 0.10.2, and the pinned Unitree SDK all import through the hardware
   launcher environment.
+
+## 2026-08-13 — Restored the commissioned PC2 RealSense lifecycle
+
+- The first camera-enabled `run-tabletop` attempt reached the read-only frame
+  preflight but received `0/5` frames. Read-only PC2 status showed the cause:
+  Unitree's `video_hub_pc4` factory service was running and the temporary ROS
+  RealSense node was not. No robot publisher or arm ownership had been created.
+- The focused repository now carries the older prototype's commissioned
+  `tools/g1_realsense_pc2.sh` byte-for-byte. Its `start` action exclusively
+  locks camera lifecycle changes, releases `video_hub_pc4`, starts the pinned
+  D435i serial at RGB8 1280x720x15, and verifies serial, USB 3.2, stream
+  profile, launcher, and node process. A failed start rolls back to the factory
+  service; `stop` terminates only the tracked node and restores that service.
+- `g1_tabletop_hardware.sh` invokes this idempotent startup before the two
+  camera-dependent commands, `collect-calibration` and `run-tabletop`.
+  `inspect-hardware` remains read-only and does not change camera ownership.
+- The first started driver could be discovered over DDS but its PC2 log showed
+  continuous `Frames didn't arrived within 5 seconds`; a direct laptop probe
+  consequently received neither Image nor CameraInfo. USB enumeration itself
+  was healthy at 5 Gb/s. The older viewer's proven clean `stop` then `start`
+  lifecycle recovered the stream immediately, after which a reliable laptop
+  subscriber received 5/5 RGB8 1280x720 images and 5/5 matching CameraInfo
+  messages. Camera-dependent focused commands now perform that same clean
+  restart instead of reusing a tracked but potentially wedged driver process.
+- The next read-only tabletop preflight recovered a clear image but correctly
+  rejected the physical object before SPACE. The object on the table was the
+  existing 40 mm `4x4_100` ArUco cube (visible IDs 3 and 5), whereas the
+  imported tabletop grasp contract, detector, collision payload, and retained
+  physics-qualified shortlist all describe the 45 mm AprilTag-36h11 cube with
+  IDs 128–133. Substituting only the detector would leave grasp/contact and
+  payload geometry inconsistent, so no such shortcut was made.
+- The same failure exposed two diagnostic defects. Tabletop observations now
+  label the required object as `tabletop AprilCube`, rather than inheriting the
+  calibration helper's `hand target` wording, and failure-frame manifests
+  serialize `ImageTiming` explicitly. Consequently future preflight failures
+  retain all captured PNG evidence and a valid timing manifest.
+
+## 2026-08-13 — Qualified 40 mm cube grasps replace the mismatched object contract
+
+- Pulled `sri299792458/g1-aprilcube-demo` commit
+  `724ee07079c25765b3e630f5508bca3b7731eef5`, which regenerates the grasp
+  pipeline specifically for the printed 40 mm `dex3_safe_cube`; the poses were
+  inferred for this mesh rather than rescaled from the earlier 45 mm object.
+- The source retained 3178 of 4096 newly inferred grasps through Isaac VIRAL,
+  then admitted 15 right-Dex3 candidates through the complete open-hand,
+  support-plane, straight-pregrasp, closed-hand, moved-object, closure-pose,
+  and required-contact gates. The committed shortlist records every gate and
+  its non-exclusive rejection counts.
+- The focused runtime now uses one consistent object contract: the 40 mm
+  `dex3_safe_cube` mesh with SHA-256
+  `27c8460e40a85475e87c3cc0d6090c3c9500de4fa7f5728a2462fc099ef3d927`,
+  its `4x4_100` detector configuration, 40 mm task/payload geometry, and the
+  corresponding 15-grasp shortlist. Runtime loading verifies both the mesh
+  hash and its OBJ extents against the frozen task request.
+- The shortlist uses object +Z as its canonical support normal, but the
+  physical cube is symmetric. Runtime planning maps whichever detected face is
+  uppermost to canonical +Z before applying the same 15 grasps; no tag ID is a
+  physical setup restriction, and tabletop yaw remains free.
+- The earlier 45 mm/AprilTag-36h11 planning artifacts and numerical clearance
+  evidence remain historical evidence only. They are superseded for physical
+  execution and are not selected by the focused runtime defaults.
+- Offline reprocessing of the retained preflight frame with the correct cube
+  model detects faces `-Y` and `-Z` at `2.224 px` reprojection RMS. Tabletop
+  perception had incorrectly used the commissioned `1.5 px` preferred-quality
+  warning boundary as a hard gate; it now reuses the existing `3.0 px` reject
+  boundary. This frame therefore passes geometry quality; its tag-5-up pose is
+  canonicalized exactly like any other face-up resting pose.
+- A real-state, no-command CuRobo check reused the retained upright object pose.
+  The 100 mm supported escape passed with `185.8 mm` G-frame plane clearance.
+  The complete task did not pass at that old object placement: four candidates
+  reached grasp selection but failed respectively at two local hand-plane
+  guards, attached-lift planning, and approach planning; the remaining eleven
+  had no reachable final grasp. This does not validate a robot run and does not
+  justify changing any grasp or collision gate. The next live run must plan
+  from the newly observed, tag-4-up cube pose and may require relocating the
+  cube if CuRobo reports the same reachability result.
+- A subsequent live preflight decoded the tabletop cube in every frame, but a
+  tabletop-only `30 px` minimum rejected four markers measuring `26.0..28.3
+  px`. That duplicated and contradicted the commissioned capture policy, whose
+  hard minimum is `25 px` and preferred minimum is `40 px`. The tabletop
+  command now loads the same validated quality configuration and passes its
+  `25 px` hard tag-size and `3.0 px` hard reprojection limits to both preflight
+  and post-ownership observation; those values are no longer independently
+  chosen in the hardware workflow.
+- The next burst passed those hard per-frame gates but reported `3.859 deg`
+  orientation spread. The five saved frames span only `0.14 s`; offline corner
+  inspection showed the large top marker stable within `0.2 px`, while the
+  strongly foreshortened side marker jumped by as much as `8.9 px`, producing
+  about `9 mm` of false depth motion when both faces were forced into one PnP
+  solve. This is estimator noise, not evidence that the stationary cube rotated.
+- Tabletop pose estimation now deliberately uses the decoded face with the
+  largest shortest side in each current frame. This retains a stateless raw
+  image measurement and every existing burst-spread gate, while excluding a
+  lower-quality oblique face from corrupting a good face. Its selected
+  correspondences are passed directly to AprilCube's public stateless
+  `estimate_pose_diagnostic`, which delegates to AprilCube's SQPnP/RANSAC plus
+  LM implementation; the local planar-PnP implementation was deleted.
+  Reprocessing the exact saved burst remains below the unchanged `2.0 deg` and
+  `5.0 mm` burst gates.
+
+## 2026-08-13 — CuRobo supported escape preserves the G1Pilot pair policy
+
+- The first owned tabletop run stopped before any changing target because all
+  supported-escape IK seeds were marked infeasible. Detailed CuRobo pair
+  diagnostics found constant sub-millimetre collision-sphere overlaps inside
+  both locked Dex3 hands. G1Pilot's selected-pair policy likewise never checks
+  collisions internal to a fixed hand. Arm planning now omits only pairs
+  within each locked hand; hand-to-arm, hand-to-body, hand-to-world, payload,
+  and opposite-hand checks remain active.
+- Removing that masked rejection exposed the measured seated start geometry.
+  The older G1Pilot policy intentionally omits the adjacent
+  `torso_link/right_shoulder_roll_link` pair but explicitly retains
+  `torso_link/right_shoulder_yaw_link`. G1Pilot's exact primitive geometry and
+  NVIDIA's CuRobo spheres independently measure the latter start overlap as
+  `1.194 mm` and `1.203 mm`, respectively.
+- The focused CuRobo model therefore carries the same adjacent-pair omission
+  and a fixed `1.5 mm` proxy-fit allowance on the checked right shoulder-yaw
+  link. This is not derived afresh at runtime. Replanning the exact retained
+  hardware request passes the 100 mm supported escape. Across its 41 samples,
+  the exact G1Pilot shoulder-yaw/torso clearance is least at the starting
+  `-1.194 mm` state and improves to `+24.77 mm`; the route never deepens the
+  pre-existing overlap. The grasp frame finishes `144.6 mm` above the inferred
+  table plane. No robot command was sent during this diagnosis.
+- The same retained observation now advances to complete-task planning. Three
+  reachable open-hand approaches are rejected by the table-plane guard at
+  `-3.4`, `-2.1`, and `-3.2 mm`; a fourth fails approach planning and the
+  remaining eleven have no reachable final grasp. For the leading candidate,
+  NVIDIA's exact Dex3/wrist collision meshes independently give `-3.55 mm` at
+  the same terminal wrist-pitch sample as CuRobo's `-3.44 mm` sphere result.
+  This is not a sphere-fit false positive, so the table gate remains unchanged
+  and that retained observation is not a runnable complete task plan.

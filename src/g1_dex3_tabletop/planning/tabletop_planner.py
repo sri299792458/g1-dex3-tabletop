@@ -7,6 +7,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable
+from itertools import permutations, product
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,26 @@ def _load_shortlist(request: TabletopTaskRequest) -> tuple[dict[str, Any], list[
         raise ValueError("unsupported grasp shortlist format")
     if document.get("hand_side") != "right" or document.get("object_id") != "cube_head":
         raise ValueError("tabletop task requires the qualified right-hand cube shortlist")
+    mesh_path = (ROOT / str(document.get("object_mesh", ""))).resolve()
+    if not mesh_path.is_relative_to(ROOT) or not mesh_path.is_file():
+        raise ValueError("grasp shortlist object mesh must exist inside the repository")
+    mesh_content = mesh_path.read_bytes()
+    if hashlib.sha256(mesh_content).hexdigest() != document.get("object_mesh_sha256"):
+        raise ValueError("grasp shortlist object mesh SHA-256 does not match the repository")
+    vertices = []
+    for line in mesh_content.decode("utf-8").splitlines():
+        fields = line.split()
+        if fields[:1] == ["v"] and len(fields) == 4:
+            vertices.append(tuple(float(value) for value in fields[1:]))
+    if not vertices:
+        raise ValueError("grasp shortlist object mesh contains no OBJ vertices")
+    points = np.asarray(vertices, dtype=np.float64)
+    mesh_dimensions = points.max(axis=0) - points.min(axis=0)
+    if not np.allclose(mesh_dimensions, request.object_dimensions_m, atol=1.0e-6, rtol=0.0):
+        raise ValueError(
+            "task object dimensions differ from the qualified grasp mesh: "
+            f"task={list(request.object_dimensions_m)}, mesh={mesh_dimensions.tolist()}"
+        )
     candidates = list(document.get("candidates", ()))
     if len(candidates) != 15:
         raise ValueError("qualified cube shortlist must contain exactly 15 candidates")
@@ -109,6 +130,36 @@ def _candidate_transform(entry: dict[str, Any]) -> np.ndarray:
     return result
 
 
+def _canonical_resting_cube_pose(base_T_detected_object: np.ndarray) -> np.ndarray:
+    """Map the uppermost physical cube face to canonical object +Z."""
+
+    detected = np.asarray(base_T_detected_object, dtype=np.float64)
+    rotations = []
+    for permutation in permutations(range(3)):
+        for signs in product((-1.0, 1.0), repeat=3):
+            symmetry = np.zeros((3, 3), dtype=np.float64)
+            symmetry[list(permutation), range(3)] = signs
+            if np.linalg.det(symmetry) > 0.0:
+                rotations.append(symmetry)
+    candidates = [
+        symmetry
+        for symmetry in rotations
+        if float((detected[:3, :3] @ symmetry)[2, 2]) >= np.cos(np.deg2rad(20.0))
+    ]
+    if not candidates:
+        raise RuntimeError(
+            "AprilCube is not resting on a face: no face normal points upward "
+            "within 20 degrees"
+        )
+    # The four rotations about the upward face are physically equivalent.
+    # Select the smallest frame change deterministically; tabletop yaw remains
+    # exactly whatever the detector observed.
+    symmetry = max(candidates, key=lambda value: (float(np.trace(value)), *value.ravel()))
+    canonical = detected.copy()
+    canonical[:3, :3] = detected[:3, :3] @ symmetry
+    return canonical
+
+
 def _table_from_resting_object(
     request: TabletopTaskRequest, base_T_torso: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -120,18 +171,9 @@ def _table_from_resting_object(
     """
 
     base_T_camera = base_T_torso @ np.asarray(request.torso_T_camera)
-    base_T_object = base_T_camera @ np.asarray(request.observation.camera_T_object)
-    # The retained GraspGenX/Isaac shortlist was support-filtered against the
-    # cube mesh's minimum object-Z plane.  Its declared applicability is the
-    # canonical upright cube with arbitrary tabletop yaw, not an arbitrary
-    # one of the cube's six support faces.  Enforce that contract before using
-    # its table-clearance evidence.
+    detected_object = base_T_camera @ np.asarray(request.observation.camera_T_object)
+    base_T_object = _canonical_resting_cube_pose(detected_object)
     object_up = base_T_object[:3, 2]
-    if float(object_up[2]) < np.cos(np.deg2rad(20.0)):
-        raise RuntimeError(
-            "AprilCube is outside the grasp shortlist's canonical upright "
-            "orientation: object +Z must point upward within 20 degrees"
-        )
     down = -object_up
     extent = request.object_dimensions_m[2]
     top_origin = base_T_object[:3, 3] + 0.5 * extent * down
@@ -544,6 +586,9 @@ def plan_supported_escape(
             result = planner.plan_pose(goal, state, max_attempts=8)
         finally:
             planner.update_tool_pose_criteria({RIGHT_GRASP_FRAME: ToolPoseCriteria()})
+        if result is None or not bool(result.success.any()):
+            reason = _pose_failure_reason(planner, goal, state, result)
+            raise RuntimeError(f"CuRobo failed __handoff__->clearance: {reason}")
         outbound = _result_trajectory(
             planner,
             result,
@@ -700,10 +745,8 @@ def plan_tabletop_task(
         planner.destroy()
         planner = None
 
-        base_T_camera = base_T_torso @ np.asarray(request.torso_T_camera)
-        base_T_object = base_T_camera @ np.asarray(request.observation.camera_T_object)
+        plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
         grasp_matrices = [base_T_object @ _candidate_transform(item) for item in candidates]
-        plane_point, _plane_object, down = _table_from_resting_object(request, base_T_torso)
         approach_distance_m = float(shortlist["execution_contract"]["approach_distance_m"])
         remaining_indices = list(range(len(candidates)))
         grasp_rejections: list[dict[str, str]] = []
