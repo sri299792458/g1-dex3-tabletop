@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from g1_aprilcube_calibration.joint_map import validate_arm_side
 from g1_dex3_tabletop.planning.contracts import (
     PLANNER_SCHEMA_VERSION,
     PlannedTrajectory,
@@ -95,17 +96,21 @@ class TabletopObservation:
 
 @dataclass(frozen=True, slots=True)
 class TabletopTaskRequest:
-    """Complete scene, calibration, and robot state for one right-hand task."""
+    """Complete scene, calibration, and robot state for one selected-arm task."""
 
     observation: TabletopObservation
+    arm: str
     torso_T_camera: tuple[tuple[float, ...], ...]
     joint_position_offsets_rad: dict[str, float]
     calibration_bundle_sha256: str
     grasp_shortlist_path: str
     grasp_shortlist_sha256: str
     object_dimensions_m: tuple[float, ...] = (0.040, 0.040, 0.040)
+    open_transit_table_patch_dimensions_m: tuple[float, ...] = (0.400, 0.400, 0.020)
     supported_escape_m: float = 0.100
+    retention_test_lift_m: float = 0.010
     lift_m: float = 0.100
+    maximum_arm_velocity_rad_s: float = 0.100
     random_seed: int = 17
     schema_version: int = PLANNER_SCHEMA_VERSION
     operation: str = "plan_tabletop_pick_lift_replace"
@@ -115,6 +120,7 @@ class TabletopTaskRequest:
             raise ValueError("unsupported tabletop request schema version")
         if self.operation != "plan_tabletop_pick_lift_replace":
             raise ValueError("unsupported tabletop request operation")
+        object.__setattr__(self, "arm", validate_arm_side(self.arm))
         object.__setattr__(
             self,
             "observation",
@@ -134,12 +140,27 @@ class TabletopTaskRequest:
         )
         if any(value <= 0 for value in self.object_dimensions_m):
             raise ValueError("object dimensions must be positive")
+        object.__setattr__(
+            self,
+            "open_transit_table_patch_dimensions_m",
+            _finite_vector(
+                self.open_transit_table_patch_dimensions_m,
+                3,
+                "open_transit_table_patch_dimensions_m",
+            ),
+        )
+        if any(value <= 0 for value in self.open_transit_table_patch_dimensions_m):
+            raise ValueError("open-transit table patch dimensions must be positive")
         for name in (
             "supported_escape_m",
+            "retention_test_lift_m",
             "lift_m",
+            "maximum_arm_velocity_rad_s",
         ):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive and finite")
+        if self.retention_test_lift_m >= self.lift_m:
+            raise ValueError("retention test lift must be smaller than the complete payload lift")
         for name in ("calibration_bundle_sha256", "grasp_shortlist_sha256"):
             if len(getattr(self, name)) != 64:
                 raise ValueError(f"{name} must contain 64 characters")
@@ -157,14 +178,20 @@ class TabletopTaskRequest:
             "schema_version": self.schema_version,
             "operation": self.operation,
             "observation": self.observation.to_dict(),
+            "arm": self.arm,
             "torso_T_camera": [list(row) for row in self.torso_T_camera],
             "joint_position_offsets_rad": self.joint_position_offsets_rad,
             "calibration_bundle_sha256": self.calibration_bundle_sha256,
             "grasp_shortlist_path": self.grasp_shortlist_path,
             "grasp_shortlist_sha256": self.grasp_shortlist_sha256,
             "object_dimensions_m": list(self.object_dimensions_m),
+            "open_transit_table_patch_dimensions_m": list(
+                self.open_transit_table_patch_dimensions_m
+            ),
             "supported_escape_m": self.supported_escape_m,
+            "retention_test_lift_m": self.retention_test_lift_m,
             "lift_m": self.lift_m,
+            "maximum_arm_velocity_rad_s": self.maximum_arm_velocity_rad_s,
             "random_seed": self.random_seed,
         }
         if include_hash:
@@ -193,11 +220,12 @@ class TabletopTaskPlan:
     """Frozen task from an elevated clearance state and back to that state."""
 
     request_sha256: str
+    arm: str
     selected_candidate_id: str
     object_T_grasp: tuple[tuple[float, ...], ...]
-    open_right_dex3_q_rad: tuple[float, ...]
-    closed_right_dex3_q_rad: tuple[float, ...]
-    initial_right_dex3_q_rad: tuple[float, ...]
+    open_active_dex3_q_rad: tuple[float, ...]
+    closed_active_dex3_q_rad: tuple[float, ...]
+    initial_active_dex3_q_rad: tuple[float, ...]
     trajectories: tuple[PlannedTrajectory, ...]
     phase_order: tuple[str, ...]
     planner_provenance: dict[str, Any]
@@ -207,13 +235,14 @@ class TabletopTaskPlan:
     def __post_init__(self) -> None:
         if len(self.request_sha256) != 64:
             raise ValueError("request SHA-256 must contain 64 characters")
+        object.__setattr__(self, "arm", validate_arm_side(self.arm))
         object.__setattr__(
             self, "object_T_grasp", _finite_transform(self.object_T_grasp, "object_T_grasp")
         )
         for name in (
-            "open_right_dex3_q_rad",
-            "closed_right_dex3_q_rad",
-            "initial_right_dex3_q_rad",
+            "open_active_dex3_q_rad",
+            "closed_active_dex3_q_rad",
+            "initial_active_dex3_q_rad",
         ):
             object.__setattr__(self, name, _finite_vector(getattr(self, name), 7, name))
         object.__setattr__(
@@ -229,14 +258,16 @@ class TabletopTaskPlan:
         expected = (
             "move_to_pregrasp",
             "grasp_approach",
+            "retention_test_lift",
             "payload_lift",
+            "payload_lower",
             "payload_replace",
             "grasp_retreat",
             "return_to_clearance",
         )
         object.__setattr__(self, "phase_order", tuple(self.phase_order))
         if self.phase_order != expected or len(self.trajectories) != len(expected):
-            raise ValueError("tabletop plan must contain the complete six-motion lifecycle")
+            raise ValueError("tabletop plan must contain the complete eight-motion lifecycle")
         if tuple(item.to_pose_id for item in self.trajectories) != expected:
             raise ValueError("trajectory endpoints differ from tabletop phase order")
         if self.trajectories[0].from_pose_id != "clearance":
@@ -253,11 +284,12 @@ class TabletopTaskPlan:
             "schema_version": self.schema_version,
             "kind": self.kind,
             "request_sha256": self.request_sha256,
+            "arm": self.arm,
             "selected_candidate_id": self.selected_candidate_id,
             "object_T_grasp": [list(row) for row in self.object_T_grasp],
-            "open_right_dex3_q_rad": list(self.open_right_dex3_q_rad),
-            "closed_right_dex3_q_rad": list(self.closed_right_dex3_q_rad),
-            "initial_right_dex3_q_rad": list(self.initial_right_dex3_q_rad),
+            "open_active_dex3_q_rad": list(self.open_active_dex3_q_rad),
+            "closed_active_dex3_q_rad": list(self.closed_active_dex3_q_rad),
+            "initial_active_dex3_q_rad": list(self.initial_active_dex3_q_rad),
             "trajectories": [item.to_dict() for item in self.trajectories],
             "phase_order": list(self.phase_order),
             "planner_provenance": self.planner_provenance,
@@ -277,6 +309,156 @@ class TabletopTaskPlan:
 
     @classmethod
     def from_json(cls, path: str | Path) -> TabletopTaskPlan:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionRouteValidationRequest:
+    """Collision-check the frozen payload route at the measured stalled hand posture."""
+
+    tabletop_request: TabletopTaskRequest
+    task_plan: TabletopTaskPlan
+    measured_active_dex3_q_rad: tuple[float, ...]
+    blocked_motor_ids: tuple[int, ...]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    operation: str = "validate_retention_route"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PLANNER_SCHEMA_VERSION:
+            raise ValueError("unsupported retention-route request schema version")
+        if self.operation != "validate_retention_route":
+            raise ValueError("unsupported retention-route request operation")
+        if not isinstance(self.tabletop_request, TabletopTaskRequest):
+            object.__setattr__(
+                self,
+                "tabletop_request",
+                TabletopTaskRequest.from_dict(self.tabletop_request),
+            )
+        if not isinstance(self.task_plan, TabletopTaskPlan):
+            object.__setattr__(self, "task_plan", TabletopTaskPlan.from_dict(self.task_plan))
+        if self.task_plan.request_sha256 != self.tabletop_request.content_sha256:
+            raise ValueError("retention-route task belongs to a different tabletop request")
+        if self.task_plan.arm != self.tabletop_request.arm:
+            raise ValueError("retention-route task and request select different arms")
+        object.__setattr__(
+            self,
+            "measured_active_dex3_q_rad",
+            _finite_vector(
+                self.measured_active_dex3_q_rad,
+                7,
+                "measured_active_dex3_q_rad",
+            ),
+        )
+        blocked = tuple(int(value) for value in self.blocked_motor_ids)
+        if (
+            not blocked
+            or len(set(blocked)) != len(blocked)
+            or any(value < 0 or value >= 7 for value in blocked)
+        ):
+            raise ValueError("retention-route blocked motor IDs are invalid")
+        object.__setattr__(self, "blocked_motor_ids", blocked)
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "operation": self.operation,
+            "tabletop_request": self.tabletop_request.to_dict(),
+            "task_plan": self.task_plan.to_dict(),
+            "measured_active_dex3_q_rad": list(self.measured_active_dex3_q_rad),
+            "blocked_motor_ids": list(self.blocked_motor_ids),
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RetentionRouteValidationRequest:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        request = cls(**values)
+        if expected_hash is not None and expected_hash != request.content_sha256:
+            raise ValueError("retention-route request SHA-256 mismatch")
+        return request
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> RetentionRouteValidationRequest:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class RetentionRouteValidationResult:
+    """Proof that measured stalled fingers do not invalidate the payload arm route."""
+
+    request_sha256: str
+    arm: str
+    selected_candidate_id: str
+    route_sample_count: int
+    minimum_hand_plane_clearance_m: float
+    minimum_hand_plane_link: str
+    minimum_hand_plane_sample: int
+    planner_provenance: dict[str, Any]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    kind: str = "g1_retention_route_validation"
+
+    def __post_init__(self) -> None:
+        if len(self.request_sha256) != 64:
+            raise ValueError("retention-route request SHA-256 must contain 64 characters")
+        object.__setattr__(self, "arm", validate_arm_side(self.arm))
+        if not self.selected_candidate_id:
+            raise ValueError("retention-route candidate ID must be non-empty")
+        if self.route_sample_count < 2:
+            raise ValueError("retention route must contain at least two samples")
+        if not np.isfinite(self.minimum_hand_plane_clearance_m):
+            raise ValueError("retention-route hand clearance must be finite")
+        if not self.minimum_hand_plane_link or self.minimum_hand_plane_sample < 0:
+            raise ValueError("retention-route minimum hand location is invalid")
+        provenance = json.loads(
+            json.dumps(self.planner_provenance, sort_keys=True, allow_nan=False)
+        )
+        object.__setattr__(self, "planner_provenance", provenance)
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "request_sha256": self.request_sha256,
+            "arm": self.arm,
+            "selected_candidate_id": self.selected_candidate_id,
+            "route_sample_count": self.route_sample_count,
+            "minimum_hand_plane_clearance_m": self.minimum_hand_plane_clearance_m,
+            "minimum_hand_plane_link": self.minimum_hand_plane_link,
+            "minimum_hand_plane_sample": self.minimum_hand_plane_sample,
+            "planner_provenance": self.planner_provenance,
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RetentionRouteValidationResult:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        result = cls(**values)
+        if expected_hash is not None and expected_hash != result.content_sha256:
+            raise ValueError("retention-route result SHA-256 mismatch")
+        return result
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> RetentionRouteValidationResult:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     def write_json(self, path: str | Path) -> None:
@@ -355,6 +537,7 @@ class TabletopExecutionPlan:
     supported_escape: SupportedEscapePlan
     task: TabletopTaskPlan
     trajectories: tuple[PlannedTrajectory, ...]
+    recovery_trajectories: tuple[PlannedTrajectory, ...]
     schema_version: int = PLANNER_SCHEMA_VERSION
     kind: str = "g1_tabletop_complete_execution_plan"
 
@@ -386,8 +569,10 @@ class TabletopExecutionPlan:
             ("__handoff__", "clearance"),
             ("clearance", "move_to_pregrasp"),
             ("move_to_pregrasp", "grasp_approach"),
-            ("grasp_approach", "payload_lift"),
-            ("payload_lift", "payload_replace"),
+            ("grasp_approach", "retention_test_lift"),
+            ("retention_test_lift", "payload_lift"),
+            ("payload_lift", "payload_lower"),
+            ("payload_lower", "payload_replace"),
             ("payload_replace", "grasp_retreat"),
             ("grasp_retreat", "return_to_clearance"),
             ("return_to_clearance", "__handoff__"),
@@ -397,8 +582,55 @@ class TabletopExecutionPlan:
             raise ValueError("complete tabletop trajectory lifecycle is disconnected")
         if self.trajectories[0] != self.supported_escape.outbound:
             raise ValueError("complete lifecycle does not start with the supported escape")
-        if self.trajectories[1:7] != self.task.trajectories:
+        if self.trajectories[1:9] != self.task.trajectories:
             raise ValueError("complete lifecycle task motions differ from the task plan")
+        object.__setattr__(
+            self,
+            "recovery_trajectories",
+            tuple(
+                item if isinstance(item, PlannedTrajectory) else PlannedTrajectory.from_dict(item)
+                for item in self.recovery_trajectories
+            ),
+        )
+        recovery_edges = tuple(
+            (item.from_pose_id, item.to_pose_id) for item in self.recovery_trajectories
+        )
+        if recovery_edges != (
+            ("grasp_approach", "grasp_retreat"),
+            ("retention_test_lift", "payload_replace"),
+        ):
+            raise ValueError("tabletop recovery trajectory endpoints are invalid")
+        for recovery, normal in zip(
+            self.recovery_trajectories,
+            (self.trajectories[7], self.trajectories[6]),
+            strict=True,
+        ):
+            if (
+                recovery.sample_time_s != normal.sample_time_s
+                or recovery.command_q_rad != normal.command_q_rad
+                or recovery.model_q_rad != normal.model_q_rad
+            ):
+                raise ValueError("tabletop recovery motion differs from its frozen reverse path")
+        recovery_start_errors = (
+            float(
+                np.max(
+                    np.abs(
+                        np.asarray(self.recovery_trajectories[0].command_q_rad[0])
+                        - np.asarray(self.trajectories[2].command_q_rad[-1])
+                    )
+                )
+            ),
+            float(
+                np.max(
+                    np.abs(
+                        np.asarray(self.recovery_trajectories[1].command_q_rad[0])
+                        - np.asarray(self.trajectories[3].command_q_rad[-1])
+                    )
+                )
+            ),
+        )
+        if max(recovery_start_errors) > 1e-8:
+            raise ValueError("tabletop recovery motion does not start at its rejection state")
         inbound = self.trajectories[-1]
         if (
             inbound.sample_time_s != self.supported_escape.inbound.sample_time_s
@@ -417,8 +649,8 @@ class TabletopExecutionPlan:
         return_error = float(
             np.max(
                 np.abs(
-                    np.asarray(self.trajectories[6].command_q_rad[-1])
-                    - np.asarray(self.trajectories[7].command_q_rad[0])
+                    np.asarray(self.trajectories[8].command_q_rad[-1])
+                    - np.asarray(self.trajectories[9].command_q_rad[0])
                 )
             )
         )
@@ -438,6 +670,7 @@ class TabletopExecutionPlan:
             "supported_escape": self.supported_escape.to_dict(),
             "task": self.task.to_dict(),
             "trajectories": [item.to_dict() for item in self.trajectories],
+            "recovery_trajectories": [item.to_dict() for item in self.recovery_trajectories],
         }
         if include_hash:
             result["content_sha256"] = self.content_sha256
@@ -469,6 +702,9 @@ def combine_tabletop_plans(
 ) -> TabletopExecutionPlan:
     """Bind the two isolated CuRobo results into one connected execution."""
 
+    if not (loaded_request.arm == clearance_request.arm == task.arm):
+        raise ValueError("loaded request, clearance request, and task select different arms")
+
     inbound = PlannedTrajectory(
         from_pose_id="return_to_clearance",
         to_pose_id="__handoff__",
@@ -477,10 +713,27 @@ def combine_tabletop_plans(
         model_q_rad=supported_escape.inbound.model_q_rad,
         planning_time_s=supported_escape.inbound.planning_time_s,
     )
+    contact_retreat = PlannedTrajectory(
+        from_pose_id="grasp_approach",
+        to_pose_id="grasp_retreat",
+        sample_time_s=task.trajectories[6].sample_time_s,
+        command_q_rad=task.trajectories[6].command_q_rad,
+        model_q_rad=task.trajectories[6].model_q_rad,
+        planning_time_s=0.0,
+    )
+    test_lift_replace = PlannedTrajectory(
+        from_pose_id="retention_test_lift",
+        to_pose_id="payload_replace",
+        sample_time_s=task.trajectories[5].sample_time_s,
+        command_q_rad=task.trajectories[5].command_q_rad,
+        model_q_rad=task.trajectories[5].model_q_rad,
+        planning_time_s=0.0,
+    )
     return TabletopExecutionPlan(
         loaded_request_sha256=loaded_request.content_sha256,
         clearance_request_sha256=clearance_request.content_sha256,
         supported_escape=supported_escape,
         task=task,
         trajectories=(supported_escape.outbound, *task.trajectories, inbound),
+        recovery_trajectories=(contact_retreat, test_lift_replace),
     )

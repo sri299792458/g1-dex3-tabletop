@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -13,6 +14,7 @@ from scipy.spatial.transform import Rotation
 from g1_aprilcube_calibration.joint_map import (
     G1_29_JOINT_NAMES,
     arm_joint_names,
+    opposite_arm,
     validate_arm_side,
 )
 from g1_aprilcube_calibration.transports.unitree_dex3 import (
@@ -35,22 +37,19 @@ VIRTUAL_BASE_JOINT_NAMES = (
     "base_j_ytheta",
     "base_j_ztheta",
 )
-RIGHT_GRASP_FRAME = "right_hand_grasp_frame"
-RIGHT_ATTACHMENT_LINK = "right_attached_object"
-# Exact GraspGenX dex3_rev1_right descriptor joint.  The shortlist's G frame
-# is the descriptor's root/world frame, so this is G_T_palm.
-RIGHT_G_T_PALM_XYZ_M = (-0.06158248156116279, 0.0, 0.0)
-RIGHT_G_T_PALM_RPY_RAD = (-np.pi / 2.0, -np.pi / 2.0, 0.0)
-# The commissioned G1Pilot primitives and NVIDIA's CuRobo spheres agree that
-# the retained seated handoff starts 1.19--1.20 mm inside the checked
-# right-shoulder-yaw/torso proxy. The older supported-escape policy permits
-# existing start penetration while moving out of it. CuRobo requires a free
-# start state, so encode the same fixed 1.5 mm proxy-fit allowance here.
-RIGHT_SHOULDER_YAW_START_FIT_MARGIN_M = 0.0015
+DEX3_CANONICAL_PROFILE = Path("config/tabletop/dex3_rev1_canonical_profile.json")
 
 
 def palm_link(arm: str) -> str:
     return f"{validate_arm_side(arm)}_hand_palm_link"
+
+
+def grasp_frame(arm: str) -> str:
+    return f"{validate_arm_side(arm)}_hand_grasp_frame"
+
+
+def attachment_link(arm: str) -> str:
+    return f"{validate_arm_side(arm)}_attached_object"
 
 
 def curobo_checkout_root() -> Path:
@@ -65,6 +64,9 @@ def model_source_hashes() -> dict[str, str]:
         "curobo_commit": CUROBO_COMMIT,
         "robot_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "urdf_sha256": hashlib.sha256(urdf.read_bytes()).hexdigest(),
+        "dex3_canonical_profile_sha256": hashlib.sha256(
+            (Path(__file__).resolve().parents[3] / DEX3_CANONICAL_PROFILE).read_bytes()
+        ).hexdigest(),
     }
     repository = Path(__file__).resolve().parents[3]
     for side, relative in MOUNT_MANIFESTS.items():
@@ -219,43 +221,59 @@ def build_robot_config_for_active_joints(
     return robot, reference
 
 
-def right_grasp_T_palm() -> np.ndarray:
+def grasp_T_palm(arm: str) -> np.ndarray:
+    """Return the selected GraspGenX descriptor's exact G_T_palm."""
+
+    selected = validate_arm_side(arm)
+    repository = Path(__file__).resolve().parents[3]
+    profile = json.loads((repository / DEX3_CANONICAL_PROFILE).read_text(encoding="utf-8"))
+    adapter = profile["side_adapter"][selected]
     result = np.eye(4, dtype=np.float64)
-    result[:3, :3] = Rotation.from_euler("xyz", RIGHT_G_T_PALM_RPY_RAD).as_matrix()
-    result[:3, 3] = RIGHT_G_T_PALM_XYZ_M
+    result[:3, :3] = Rotation.from_euler("xyz", adapter["G_T_palm_rpy_rad"]).as_matrix()
+    result[:3, 3] = np.asarray(adapter["G_T_palm_xyz_m"], dtype=np.float64)
     return result
 
 
 def build_tabletop_robot_config(
     *,
+    arm: str,
     snapshot: RobotSnapshot,
     joint_position_offsets_rad: dict[str, float],
-    right_finger_q_rad: tuple[float, ...],
+    active_finger_q_rad: tuple[float, ...],
 ) -> tuple[dict[str, Any], tuple[float, ...]]:
-    """Right-arm G1/Dex3 model with GraspGenX G and attachment frames.
+    """Selected-arm G1/Dex3 model with GraspGenX G and attachment frames.
 
-    All legs, waist, the left arm, and both hands are locked to the measured
-    snapshot except the seven right-arm joints.  The right finger posture is
-    explicit because each motion stage is planned against its actual hand
+    All legs, waist, the opposite arm, and both hands are locked to the measured
+    snapshot except the seven selected-arm joints. The selected finger posture
+    is explicit because each motion stage is planned against its actual hand
     geometry (initial, open, or closed).
     """
 
-    finger = np.asarray(right_finger_q_rad, dtype=np.float64).reshape(-1)
+    selected = validate_arm_side(arm)
+    finger = np.asarray(active_finger_q_rad, dtype=np.float64).reshape(-1)
     if finger.shape != (7,) or not np.all(np.isfinite(finger)):
-        raise ValueError("right Dex3 posture must contain seven finite values")
+        raise ValueError(f"{selected} Dex3 posture must contain seven finite values")
+    left_fingers = snapshot.left_dex3_q_rad
+    right_fingers = snapshot.right_dex3_q_rad
+    if selected == "left":
+        left_fingers = tuple(float(value) for value in finger)
+    else:
+        right_fingers = tuple(float(value) for value in finger)
     adjusted = RobotSnapshot(
         measured_q29_rad=snapshot.measured_q29_rad,
-        left_dex3_q_rad=snapshot.left_dex3_q_rad,
-        right_dex3_q_rad=tuple(float(value) for value in finger),
+        left_dex3_q_rad=left_fingers,
+        right_dex3_q_rad=right_fingers,
     )
+    selected_grasp_frame = grasp_frame(selected)
+    selected_attachment_link = attachment_link(selected)
     robot, reference = build_robot_config_for_active_joints(
-        active_joint_names=tuple(arm_joint_names("right")),
+        active_joint_names=tuple(arm_joint_names(selected)),
         snapshot=adjusted,
         joint_position_offsets_rad=joint_position_offsets_rad,
-        tool_frames=(RIGHT_GRASP_FRAME, "torso_link"),
+        tool_frames=(selected_grasp_frame, "torso_link"),
     )
     kinematics = robot["kinematics"]
-    palm_T_grasp = np.linalg.inv(right_grasp_T_palm())
+    palm_T_grasp = np.linalg.inv(grasp_T_palm(selected))
     quaternion_xyzw = Rotation.from_matrix(palm_T_grasp[:3, :3]).as_quat()
     palm_T_grasp_pose = [
         *palm_T_grasp[:3, 3].tolist(),
@@ -263,23 +281,23 @@ def build_tabletop_robot_config(
         *quaternion_xyzw[:3].tolist(),
     ]
     extra_links = kinematics.setdefault("extra_links", {})
-    extra_links[RIGHT_GRASP_FRAME] = {
-        "link_name": RIGHT_GRASP_FRAME,
-        "joint_name": "right_hand_palm_to_grasp_frame",
+    extra_links[selected_grasp_frame] = {
+        "link_name": selected_grasp_frame,
+        "joint_name": f"{selected}_hand_palm_to_grasp_frame",
         "joint_type": "FIXED",
-        "parent_link_name": palm_link("right"),
+        "parent_link_name": palm_link(selected),
         "fixed_transform": palm_T_grasp_pose,
     }
-    extra_links[RIGHT_ATTACHMENT_LINK] = {
-        "link_name": RIGHT_ATTACHMENT_LINK,
-        "joint_name": "right_attachment_joint",
+    extra_links[selected_attachment_link] = {
+        "link_name": selected_attachment_link,
+        "joint_name": f"{selected}_attachment_joint",
         "joint_type": "FIXED",
-        "parent_link_name": RIGHT_GRASP_FRAME,
+        "parent_link_name": selected_grasp_frame,
         "fixed_transform": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
     }
     links = kinematics["collision_link_names"]
-    if RIGHT_ATTACHMENT_LINK not in links:
-        links.append(RIGHT_ATTACHMENT_LINK)
+    if selected_attachment_link not in links:
+        links.append(selected_attachment_link)
     # NVIDIA's G1 YAML carries this optional field explicitly as null.  Python
     # ``setdefault`` does not replace an existing None value, so normalize it
     # before reserving the payload spheres used after grasp closure.
@@ -287,7 +305,7 @@ def build_tabletop_robot_config(
     if extra_collision_spheres is None:
         extra_collision_spheres = {}
         kinematics["extra_collision_spheres"] = extra_collision_spheres
-    extra_collision_spheres[RIGHT_ATTACHMENT_LINK] = 32
+    extra_collision_spheres[selected_attachment_link] = 32
     ignore = kinematics.setdefault("self_collision_ignore", {})
     # Every Dex3 joint is locked while CuRobo plans an arm trajectory.  Contact
     # between links within one locked hand is therefore constant and cannot be
@@ -312,22 +330,80 @@ def build_tabletop_robot_config(
     # shoulder-roll link is part of the proximal shoulder assembly and is not
     # checked against its adjacent torso geometry. Preserve that relation in
     # CuRobo while keeping shoulder-yaw and every distal arm/body pair active.
+    # Both shoulder-roll links are part of their adjacent proximal shoulder
+    # assemblies, independent of which arm is active.
     ignore.setdefault("torso_link", [])
-    ignore.setdefault("right_shoulder_roll_link", [])
-    if "right_shoulder_roll_link" not in ignore["torso_link"]:
-        ignore["torso_link"].append("right_shoulder_roll_link")
-    if "torso_link" not in ignore["right_shoulder_roll_link"]:
-        ignore["right_shoulder_roll_link"].append("torso_link")
-    buffers = kinematics.setdefault("self_collision_buffer", {})
-    buffers["right_shoulder_yaw_link"] = (
-        float(buffers.get("right_shoulder_yaw_link", 0.0))
-        - RIGHT_SHOULDER_YAW_START_FIT_MARGIN_M
-    )
-    hand_links = [name for name in links if name.startswith("right_hand_")]
-    ignore[RIGHT_ATTACHMENT_LINK] = sorted(set(hand_links))
+    for side in ("left", "right"):
+        shoulder_roll_link = f"{side}_shoulder_roll_link"
+        ignore.setdefault(shoulder_roll_link, [])
+        if shoulder_roll_link not in ignore["torso_link"]:
+            ignore["torso_link"].append(shoulder_roll_link)
+        if "torso_link" not in ignore[shoulder_roll_link]:
+            ignore[shoulder_roll_link].append("torso_link")
+    # The opposite arm and torso are both locked at the measured takeover
+    # state. Their relative geometry is invariant under every active planning
+    # coordinate, just like each locked hand's internal geometry above. Keep
+    # the selected shoulder-yaw/torso pair strict; exclude only the invariant
+    # opposite pair so a measured-start sphere-proxy overlap cannot make every
+    # selected-arm IK seed infeasible.
+    fixed_shoulder_yaw_link = f"{opposite_arm(selected)}_shoulder_yaw_link"
+    ignore.setdefault(fixed_shoulder_yaw_link, [])
+    if fixed_shoulder_yaw_link not in ignore["torso_link"]:
+        ignore["torso_link"].append(fixed_shoulder_yaw_link)
+    if "torso_link" not in ignore[fixed_shoulder_yaw_link]:
+        ignore[fixed_shoulder_yaw_link].append("torso_link")
+    hand_links = [name for name in links if name.startswith(f"{selected}_hand_")]
+    ignore[selected_attachment_link] = sorted(set(hand_links))
     for name in hand_links:
         ignore.setdefault(name, [])
-        if RIGHT_ATTACHMENT_LINK not in ignore[name]:
-            ignore[name].append(RIGHT_ATTACHMENT_LINK)
-    kinematics.setdefault("self_collision_buffer", {})[RIGHT_ATTACHMENT_LINK] = 0.0
+        if selected_attachment_link not in ignore[name]:
+            ignore[name].append(selected_attachment_link)
+    kinematics.setdefault("self_collision_buffer", {})[selected_attachment_link] = 0.0
     return robot, reference
+
+
+def build_tabletop_route_validation_robot_config(
+    *,
+    arm: str,
+    snapshot: RobotSnapshot,
+    joint_position_offsets_rad: dict[str, float],
+) -> tuple[dict[str, Any], tuple[str, ...], tuple[float, ...]]:
+    """Expose one arm and its fingers for cached measured-contact checking.
+
+    The structural model is independent of the eventual contact posture. The
+    worker can therefore parse and upload it once while planning, then insert
+    the seven measured finger coordinates after physical contact.
+    """
+
+    selected = validate_arm_side(arm)
+    finger_names = tuple(
+        f"{selected}_hand_{suffix}_joint" for suffix in DEX3_MOTOR_JOINT_SUFFIXES[selected]
+    )
+    active_names = (*arm_joint_names(selected), *finger_names)
+    robot, reference = build_robot_config_for_active_joints(
+        active_joint_names=active_names,
+        snapshot=snapshot,
+        joint_position_offsets_rad=joint_position_offsets_rad,
+        tool_frames=(grasp_frame(selected), "torso_link"),
+    )
+    # Reuse the exact task model additions and collision policy. Only the set
+    # of active coordinates differs from arm-trajectory planning.
+    task_robot, _ = build_tabletop_robot_config(
+        arm=selected,
+        snapshot=snapshot,
+        joint_position_offsets_rad=joint_position_offsets_rad,
+        active_finger_q_rad=(
+            snapshot.left_dex3_q_rad if selected == "left" else snapshot.right_dex3_q_rad
+        ),
+    )
+    target = robot["kinematics"]
+    source = task_robot["kinematics"]
+    for key in (
+        "extra_links",
+        "collision_link_names",
+        "extra_collision_spheres",
+        "self_collision_ignore",
+        "self_collision_buffer",
+    ):
+        target[key] = copy.deepcopy(source[key])
+    return robot, active_names, reference

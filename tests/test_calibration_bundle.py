@@ -11,6 +11,7 @@ from g1_aprilcube_calibration.camera_initialization import (
 )
 from g1_aprilcube_calibration.joint_map import G1_29_JOINT_NAMES
 from g1_aprilcube_calibration.urdf_model import URDFModel
+from g1_dex3_tabletop import cli
 from g1_dex3_tabletop.cli import main
 
 ROOT = Path(__file__).parents[1]
@@ -69,3 +70,15 @@ def test_focused_inspect_cli_is_read_only_by_default(capsys) -> None:
     assert result["calibration_bundle_id"] == "dex3_shared_20260812_selected_free"
     assert result["calibration_bundle_sha256"] == CalibrationBundle.load(BUNDLE).content_sha256
     assert result["commands_robot"] is False
+
+
+def test_cli_reports_operator_interrupt_without_traceback(monkeypatch, capsys) -> None:
+    def interrupt(_args) -> int:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_inspect", interrupt)
+
+    assert main(["inspect"]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "interrupted by operator\n"

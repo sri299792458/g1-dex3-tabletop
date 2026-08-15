@@ -10,7 +10,7 @@ import numpy as np
 import yaml
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
-from g1_aprilcube_calibration.joint_map import RIGHT_ARM_INDICES
+from g1_aprilcube_calibration.joint_map import arm_indices, validate_arm_side
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.tabletop_contracts import (
     SupportedEscapePlan,
@@ -32,11 +32,15 @@ def load_task_config(path: str | Path) -> dict[str, Any]:
         raise ValueError("unsupported tabletop task configuration")
     if document.get("table", {}).get("collision_policy") != ("local_manipulation_geometry_plane"):
         raise ValueError("unsupported tabletop collision policy")
+    maximum_velocity = float(document.get("motion", {}).get("maximum_arm_velocity_rad_s", 0.0))
+    if not np.isfinite(maximum_velocity) or maximum_velocity <= 0.0:
+        raise ValueError("tabletop maximum arm velocity must be positive and finite")
     return document
 
 
 def build_tabletop_request(
     *,
+    arm: str,
     observation: TabletopObservation,
     calibration_bundle: CalibrationBundle,
     calibration_bundle_path: str | Path,
@@ -56,6 +60,7 @@ def build_tabletop_request(
         raise ValueError("grasp shortlist must be inside the repository") from error
     return TabletopTaskRequest(
         observation=observation,
+        arm=validate_arm_side(arm),
         torso_T_camera=tuple(
             tuple(float(value) for value in row) for row in calibration_bundle.torso_T_camera
         ),
@@ -64,8 +69,13 @@ def build_tabletop_request(
         grasp_shortlist_path=str(relative_shortlist),
         grasp_shortlist_sha256=file_sha256(shortlist),
         object_dimensions_m=tuple(task["object"]["dimensions_m"]),
+        open_transit_table_patch_dimensions_m=tuple(
+            task["table"]["open_transit_patch_dimensions_m"]
+        ),
         supported_escape_m=float(task["motion"]["supported_escape_m"]),
+        retention_test_lift_m=float(task["motion"]["retention_test_lift_m"]),
         lift_m=float(task["motion"]["payload_lift_m"]),
+        maximum_arm_velocity_rad_s=float(task["motion"]["maximum_arm_velocity_rad_s"]),
     )
 
 
@@ -78,7 +88,9 @@ def request_at_clearance(
     if escape.request_sha256 != loaded_request.content_sha256:
         raise ValueError("supported escape belongs to a different loaded request")
     q29 = np.asarray(loaded_request.observation.snapshot.measured_q29_rad).copy()
-    q29[np.asarray(RIGHT_ARM_INDICES)] = np.asarray(escape.outbound.command_q_rad[-1])
+    q29[np.asarray(arm_indices(loaded_request.arm))] = np.asarray(
+        escape.outbound.command_q_rad[-1]
+    )
     snapshot = RobotSnapshot(
         measured_q29_rad=tuple(q29),
         left_dex3_q_rad=loaded_request.observation.snapshot.left_dex3_q_rad,
@@ -95,14 +107,20 @@ def request_at_clearance(
     )
     return TabletopTaskRequest(
         observation=observation,
+        arm=loaded_request.arm,
         torso_T_camera=loaded_request.torso_T_camera,
         joint_position_offsets_rad=loaded_request.joint_position_offsets_rad,
         calibration_bundle_sha256=loaded_request.calibration_bundle_sha256,
         grasp_shortlist_path=loaded_request.grasp_shortlist_path,
         grasp_shortlist_sha256=loaded_request.grasp_shortlist_sha256,
         object_dimensions_m=loaded_request.object_dimensions_m,
+        open_transit_table_patch_dimensions_m=(
+            loaded_request.open_transit_table_patch_dimensions_m
+        ),
         supported_escape_m=loaded_request.supported_escape_m,
+        retention_test_lift_m=loaded_request.retention_test_lift_m,
         lift_m=loaded_request.lift_m,
+        maximum_arm_velocity_rad_s=loaded_request.maximum_arm_velocity_rad_s,
         random_seed=loaded_request.random_seed,
     )
 

@@ -100,6 +100,31 @@ def test_laptop_watchdog_can_disarm_cleanly(tmp_path: Path) -> None:
     assert watchdog.terminal_action == "disarmed"
 
 
+def test_startup_interrupt_disarms_remote_watchdog_before_reraising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    watchdog = _subject(tmp_path, required_initial_fsm_id=4)
+    wait_for_marker = watchdog._wait_for_marker
+    interrupted = False
+
+    def interrupt_first_ready_wait(marker: str, *, timeout_s: float) -> str:
+        nonlocal interrupted
+        if marker == "WATCHDOG_READY" and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt
+        return wait_for_marker(marker, timeout_s=timeout_s)
+
+    monkeypatch.setattr(watchdog, "_wait_for_marker", interrupt_first_ready_wait)
+
+    with pytest.raises(KeyboardInterrupt):
+        watchdog.start()
+
+    assert not watchdog.armed
+    assert watchdog.terminal_action == "disarmed"
+    assert watchdog._process is not None
+    assert watchdog._process.poll() == 0
+
+
 def test_laptop_watchdog_can_request_and_confirm_damping(tmp_path: Path) -> None:
     watchdog = _subject(tmp_path)
     watchdog.start()

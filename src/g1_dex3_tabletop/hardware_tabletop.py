@@ -30,6 +30,7 @@ from g1_aprilcube_calibration.executor_driver import (
     SynchronizedPoseExecutor,
 )
 from g1_aprilcube_calibration.executor_state_machine import ExecutorState, PoseExecutor
+from g1_aprilcube_calibration.joint_map import validate_arm_side
 from g1_aprilcube_calibration.pose_schema import PoseSet
 from g1_aprilcube_calibration.process_lock import CommandOwnerLock
 from g1_aprilcube_calibration.readiness import StateSampleBuffer
@@ -39,6 +40,8 @@ from g1_aprilcube_calibration.transports.unitree_debug_lowcmd import (
     UnitreeDebugLowCmdTransport,
 )
 from g1_aprilcube_calibration.transports.unitree_dex3 import (
+    Dex3GraspNotAcquiredError,
+    Dex3RetentionLostError,
     UnitreeDex3PostureController,
     UnitreeDex3StateObserver,
 )
@@ -56,20 +59,30 @@ from g1_dex3_tabletop.hardware_config import (
     transport_config,
     watchdog,
 )
+from g1_dex3_tabletop.persistent_planner import (
+    PersistentTabletopPlanner,
+    PlannerRequestRejected,
+)
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot, atomic_write_json
+from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
 from g1_dex3_tabletop.tabletop_contracts import (
-    SupportedEscapePlan,
-    TabletopTaskPlan,
+    RetentionRouteValidationRequest,
+    RetentionRouteValidationResult,
+    TabletopExecutionPlan,
 )
 from g1_dex3_tabletop.tabletop_perception import observe_resting_cube
 from g1_dex3_tabletop.tabletop_workflow import (
-    assemble_execution_plan,
     build_tabletop_request,
+    load_task_config,
     request_at_clearance,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
 MOTION_ACK = "I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR"
+
+
+class TabletopTaskRejected(RuntimeError):
+    """The controller is healthy, but this pick attempt should return and stop."""
 
 
 def _run_id() -> str:
@@ -161,12 +174,19 @@ def _collect_frames(
     return tuple(selected)
 
 
-def _wait_for_space_with_preview(rclpy, node, camera, *, no_window: bool) -> None:
+def _wait_for_space_with_preview(
+    rclpy,
+    node,
+    camera,
+    *,
+    arm: str,
+    no_window: bool,
+) -> None:
     if not sys.stdin.isatty():
         raise RuntimeError("operator approval requires an interactive terminal")
     print(
         "START — G1 seated; both arms supported and still; AprilCube resting "
-        "upright and visible; complete right-arm sweep clear. Press SPACE once: ",
+        f"upright and visible; complete {arm}-arm sweep clear. Press SPACE once: ",
         end="",
         flush=True,
     )
@@ -220,17 +240,47 @@ def _wait_ready(executor, driver, *, timeout_s: float, label: str) -> None:
 
 
 def _invoke_planner(command: str, request_path: Path, output_path: Path, driver=None) -> None:
+    """Run a one-shot worker for the separate calibration workflow."""
+
     worker = ROOT / ".venv-planner/bin/g1-curobo-worker"
     if not worker.is_file():
         raise FileNotFoundError("planner environment missing; run ./tools/setup_planner_env.sh")
-    completed = subprocess.run(
+    log_path = output_path.with_suffix(".planner.log")
+    process = subprocess.Popen(
         [str(worker), command, "--request", str(request_path), "--output", str(output_path)],
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
     )
+    tail: list[str] = []
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+                if line.strip():
+                    tail.append(line.strip())
+                    tail = tail[-3:]
+        returncode = process.wait()
+    except BaseException:
+        process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        raise
     if driver is not None:
         driver.check()
-    if completed.returncode != 0:
-        raise RuntimeError(f"CuRobo worker {command} exited with {completed.returncode}")
+    if returncode != 0:
+        detail = tail[-1] if tail else "no diagnostic output"
+        raise RuntimeError(
+            f"CuRobo worker {command} exited with {returncode}: {detail}; "
+            f"full planner log: {log_path}"
+        )
 
 
 def _finger_heartbeat(watchdog_value, controller):
@@ -265,6 +315,82 @@ def _command_fingers(
     driver.safety_heartbeat = _finger_heartbeat(watchdog_value, controller)
 
 
+def _command_grasp_fingers(
+    controller,
+    driver,
+    watchdog_value,
+    *,
+    active_side: str,
+    left,
+    right,
+    label: str,
+):
+    driver.safety_heartbeat = watchdog_value.pulse
+
+    def check() -> None:
+        driver.check()
+        watchdog_value.pulse()
+
+    try:
+        return controller.command_grasp_until_stall(
+            active_side=active_side,
+            left_target_q_rad=left,
+            right_target_q_rad=right,
+            label=label,
+            safety_heartbeat=check,
+        )
+    finally:
+        driver.safety_heartbeat = _finger_heartbeat(watchdog_value, controller)
+
+
+def _trajectory_maps(execution: TabletopExecutionPlan):
+    normal = {trajectory.to_pose_id: trajectory for trajectory in execution.trajectories}
+    recovery = {
+        (trajectory.from_pose_id, trajectory.to_pose_id): trajectory
+        for trajectory in execution.recovery_trajectories
+    }
+    if len(normal) != len(execution.trajectories):
+        raise ValueError("tabletop execution plan has duplicate phase names")
+    return normal, recovery
+
+
+def _execute_trajectory(
+    synchronized,
+    driver,
+    trajectory,
+    *,
+    plan_sha256: str,
+    control_config,
+) -> None:
+    synchronized.start_trajectory(
+        from_pose_id=trajectory.from_pose_id,
+        to_pose_id=trajectory.to_pose_id,
+        sample_time_s=trajectory.sample_time_s,
+        command_q_rad=trajectory.command_q_rad,
+        plan_sha256=plan_sha256,
+        operator_confirmed=True,
+    )
+    _wait_ready(
+        synchronized,
+        driver,
+        timeout_s=max(control_config.motion_timeout_s, trajectory.sample_time_s[-1] + 5),
+        label=trajectory.to_pose_id,
+    )
+    print(f"completed phase: {trajectory.to_pose_id}", flush=True)
+
+
+def _restore_seated_control(*, driver, dex_controller, guard, synchronized) -> None:
+    """Cleanly return a healthy held controller to Unitree seated FSM 3."""
+
+    if driver.is_alive:
+        driver.close()
+    driver.check()
+    if not dex_controller.timed_out:
+        dex_controller.timeout()
+    guard.restore_seated()
+    synchronized.confirm_external_takeover("PC2 verified AI FSM 0 -> 1 -> seated FSM 3")
+
+
 def _save_frames(directory: Path, frames: tuple[ROSImageFrame, ...]) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     manifest = []
@@ -287,13 +413,24 @@ def _save_frames(directory: Path, frames: tuple[ROSImageFrame, ...]) -> None:
 
 
 def run_tabletop(args) -> int:
-    """Run one complete seated right-Dex3 task after a single SPACE."""
+    """Run one complete seated selected-Dex3 task after a single SPACE."""
 
     if args.confirm != MOTION_ACK:
         raise ValueError(f"--confirm must equal exactly: {MOTION_ACK}")
+    arm = validate_arm_side(args.arm)
     hardware = load_hardware(args.hardware_config)
+    configured_arms = {
+        str(hardware["robot"]["calibration_arm"]),
+        str(hardware["control"]["calibration_arm"]),
+    }
+    if configured_arms != {arm}:
+        raise ValueError(
+            f"hardware configuration selects {sorted(configured_arms)}, not requested {arm}"
+        )
     quality = QualityThresholds.from_yaml(args.quality_config)
     bundle = CalibrationBundle.load(args.calibration_bundle)
+    task_config = load_task_config(args.task_config)
+    patch_dimensions = tuple(task_config["table"]["open_transit_patch_dimensions_m"])
     model = URDFModel(resolve_hardware_path(args.hardware_config, hardware["robot"]["urdf"]))
     expected_camera = camera_info_from_hardware(hardware)
     task_run = (args.output_root / _run_id()).resolve()
@@ -303,22 +440,31 @@ def run_tabletop(args) -> int:
     hardware_bytes = args.hardware_config.read_bytes()
     bundle_bytes = args.calibration_bundle.read_bytes()
     quality_bytes = args.quality_config.read_bytes()
+    task_config_bytes = args.task_config.read_bytes()
     detector = CorrespondenceDetector(args.cube_config)
     recording, _pairing = recording_configs(args.hardware_config)
     control_config, rate_hz = executor_config(args.hardware_config)
     control_config = replace(control_config, require_motion_endpoint_tolerance=False)
+    task_velocity = float(task_config["motion"]["maximum_arm_velocity_rad_s"])
+    if task_velocity > control_config.maximum_joint_velocity_rad_s:
+        raise ValueError(
+            f"tabletop arm velocity {task_velocity:.4f}rad/s exceeds the commissioned "
+            f"controller ceiling {control_config.maximum_joint_velocity_rad_s:.4f}rad/s"
+        )
     empty_pose_set = PoseSet(
         robot_model=model.name,
         mode_machine=5,
         urdf_sha256=model.sha256,
-        calibration_arm="right",
+        calibration_arm=arm,
     )
     preflight_frames: tuple[ROSImageFrame, ...] = ()
     loaded_frames: tuple[ROSImageFrame, ...] = ()
-    status: dict = {"status": "started", "commands_robot": False}
+    status: dict = {"status": "started", "commands_robot": False, "arm": arm}
     primary_error: BaseException | None = None
+    rejection_return_completed = False
     camera = observer = dex_observer = transport = dex_controller = None
-    guard = synchronized = driver = None
+    raw_recorder = None
+    guard = synchronized = driver = planner = None
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
@@ -374,13 +520,48 @@ def run_tabletop(args) -> int:
                 "no command publisher exists",
                 flush=True,
             )
-            _wait_for_space_with_preview(rclpy, node, camera, no_window=args.no_window)
+            planner = PersistentTabletopPlanner(
+                executable=ROOT / ".venv-planner/bin/g1-curobo-worker",
+                log_path=task_run / "planner.log",
+            )
+            planner.start()
+            print(
+                "PLANNER READY — one isolated CUDA worker is warm and will remain alive "
+                "for lifecycle planning and measured-contact validation; no robot command "
+                "publisher exists",
+                flush=True,
+            )
+            _wait_for_space_with_preview(
+                rclpy,
+                node,
+                camera,
+                arm=arm,
+                no_window=args.no_window,
+            )
             if args.hardware_config.read_bytes() != hardware_bytes:
                 raise RuntimeError("hardware configuration changed after preflight")
             if args.calibration_bundle.read_bytes() != bundle_bytes:
                 raise RuntimeError("calibration bundle changed after preflight")
             if args.quality_config.read_bytes() != quality_bytes:
                 raise RuntimeError("capture quality configuration changed after preflight")
+            if args.task_config.read_bytes() != task_config_bytes:
+                raise RuntimeError("tabletop task configuration changed after preflight")
+            raw_recorder = RawEpisodeRecorder(
+                task_run / "raw_episode",
+                repository=ROOT,
+                topics=tabletop_raw_topics(record_camera=not args.skip_camera_recording),
+            )
+            raw_recorder.start()
+            recording_content = (
+                "state/command plus raw RGB and CameraInfo"
+                if not args.skip_camera_recording
+                else "state/command only; camera topics intentionally excluded"
+            )
+            print(
+                "RAW EPISODE RECORDING — plain MCAP is active before command publisher "
+                f"creation ({recording_content}); compression and conversion remain offline",
+                flush=True,
+            )
             activation = _wait_for_activation(observer, states, empty_pose_set, recording)
             gravity = gravity_feedforward(
                 args.hardware_config, activation.reference_state.position
@@ -451,6 +632,7 @@ def run_tabletop(args) -> int:
                 maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
             )
             loaded_request = build_tabletop_request(
+                arm=arm,
                 observation=loaded_observation,
                 calibration_bundle=bundle,
                 calibration_bundle_path=args.calibration_bundle,
@@ -458,25 +640,35 @@ def run_tabletop(args) -> int:
                 task_config_path=args.task_config,
             )
             loaded_request_path = task_run / "loaded_request.json"
-            escape_path = task_run / "supported_escape.json"
-            loaded_request.write_json(loaded_request_path)
-            _invoke_planner("plan-supported-escape", loaded_request_path, escape_path, driver)
-            escape = SupportedEscapePlan.from_json(escape_path)
-            clearance_request = request_at_clearance(loaded_request, escape)
-            clearance_request_path = task_run / "clearance_request.json"
-            task_path = task_run / "task_plan.json"
-            clearance_request.write_json(clearance_request_path)
-            _invoke_planner("plan-tabletop-task", clearance_request_path, task_path, driver)
-            task = TabletopTaskPlan.from_json(task_path)
-            _clearance, execution = assemble_execution_plan(
-                loaded_request=loaded_request,
-                supported_escape=escape,
-                task=task,
-            )
             execution_path = task_run / "execution_plan.json"
-            execution.write_json(execution_path)
+            loaded_request.write_json(loaded_request_path)
+            try:
+                planner.request(
+                    "plan-tabletop-lifecycle",
+                    request_path=loaded_request_path,
+                    output_path=execution_path,
+                    control_check=driver.check,
+                )
+            except (PlannerRequestRejected, RuntimeError) as error:
+                driver.check()
+                raise TabletopTaskRejected(
+                    f"complete lifecycle planning failed: {error}"
+                ) from error
+            execution = TabletopExecutionPlan.from_json(execution_path)
+            escape = execution.supported_escape
+            task = execution.task
+            # Keep the component artifacts independently inspectable even though the
+            # worker planned them as one transaction.
+            clearance_request = request_at_clearance(loaded_request, escape)
+            clearance_request.write_json(task_run / "clearance_request.json")
+            escape.write_json(task_run / "supported_escape.json")
+            task.write_json(task_run / "task_plan.json")
+            retention_test_lift_mm = 1000.0 * float(
+                task.planner_provenance["retention_test_lift_actual_m"]
+            )
+            payload_lift_mm = 1000.0 * float(clearance_request.lift_m)
             pose_set = pose_set_from_trajectories(
-                arm="right",
+                arm=arm,
                 trajectories=execution.trajectories,
                 reference_full_q=loaded_state.position,
                 robot_model=model.name,
@@ -489,82 +681,198 @@ def run_tabletop(args) -> int:
                 validated_reference_state=loaded_state,
             )
             print(
-                f"COMPLETE PLAN FROZEN — grasp {task.selected_candidate_id}; eight "
+                f"COMPLETE PLAN FROZEN — grasp {task.selected_candidate_id}; ten "
                 "connected CuRobo trajectories return exactly to the supported handoff",
                 flush=True,
             )
             initial_left = held_hands.left.position
             initial_right = held_hands.right.position
-            for index, trajectory in enumerate(execution.trajectories):
-                synchronized.start_trajectory(
-                    from_pose_id=trajectory.from_pose_id,
-                    to_pose_id=trajectory.to_pose_id,
-                    sample_time_s=trajectory.sample_time_s,
-                    command_q_rad=trajectory.command_q_rad,
-                    plan_sha256=execution.content_sha256,
-                    operator_confirmed=True,
-                )
-                _wait_ready(
+            grasp_stall = None
+            retention_evidence = None
+            retention_route = None
+            normal_routes, recovery_routes = _trajectory_maps(execution)
+
+            def execute_phase(name: str) -> None:
+                _execute_trajectory(
                     synchronized,
                     driver,
-                    timeout_s=max(
-                        control_config.motion_timeout_s, trajectory.sample_time_s[-1] + 5
-                    ),
-                    label=trajectory.to_pose_id,
+                    normal_routes[name],
+                    plan_sha256=execution.content_sha256,
+                    control_config=control_config,
                 )
-                if index == 0:
-                    _command_fingers(
-                        dex_controller,
-                        driver,
-                        guard,
-                        left=initial_left,
-                        right=task.open_right_dex3_q_rad,
-                        label="right-hand pregrasp open",
-                    )
-                elif index == 2:
-                    _command_fingers(
-                        dex_controller,
-                        driver,
-                        guard,
-                        left=initial_left,
-                        right=task.closed_right_dex3_q_rad,
-                        label="selected qualified cube grasp",
-                    )
-                elif index == 4:
-                    _command_fingers(
-                        dex_controller,
-                        driver,
-                        guard,
-                        left=initial_left,
-                        right=task.open_right_dex3_q_rad,
-                        label="cube release after exact replacement",
-                    )
-                elif index == 6:
-                    _command_fingers(
-                        dex_controller,
-                        driver,
-                        guard,
-                        left=initial_left,
-                        right=initial_right,
-                        label="initial finger posture restoration",
-                    )
-                print(f"completed {index + 1}/8: {trajectory.to_pose_id}", flush=True)
-            driver.close()
-            driver.check()
-            dex_controller.timeout()
-            guard.restore_seated()
-            synchronized.confirm_external_takeover("PC2 verified AI FSM 0 -> 1 -> seated FSM 3")
+
+            def execute_recovery(source: str, target: str) -> None:
+                _execute_trajectory(
+                    synchronized,
+                    driver,
+                    recovery_routes[(source, target)],
+                    plan_sha256=execution.content_sha256,
+                    control_config=control_config,
+                )
+
+            active_open = task.open_active_dex3_q_rad
+
+            def open_active_hand(label: str) -> None:
+                _command_fingers(
+                    dex_controller,
+                    driver,
+                    guard,
+                    left=active_open if arm == "left" else initial_left,
+                    right=active_open if arm == "right" else initial_right,
+                    label=label,
+                )
+
+            def return_after_task_rejection(*, from_test_lift: bool) -> None:
+                nonlocal rejection_return_completed
+                if from_test_lift:
+                    execute_recovery("retention_test_lift", "payload_replace")
+                    open_active_hand("release after failed retention test")
+                    execute_phase("grasp_retreat")
+                else:
+                    open_active_hand("open after rejected grasp attempt")
+                    execute_recovery("grasp_approach", "grasp_retreat")
+                execute_phase("return_to_clearance")
+                _command_fingers(
+                    dex_controller,
+                    driver,
+                    guard,
+                    left=initial_left,
+                    right=initial_right,
+                    label="initial finger posture restoration after task rejection",
+                )
+                execute_phase("__handoff__")
+                rejection_return_completed = True
+
+            execute_phase("clearance")
+            open_active_hand(f"{arm}-hand pregrasp open")
+            execute_phase("move_to_pregrasp")
+            execute_phase("grasp_approach")
+            active_closed = task.closed_active_dex3_q_rad
+            try:
+                grasp_stall = _command_grasp_fingers(
+                    dex_controller,
+                    driver,
+                    guard,
+                    active_side=arm,
+                    left=active_closed if arm == "left" else initial_left,
+                    right=active_closed if arm == "right" else initial_right,
+                    label=f"selected qualified {arm}-hand cube grasp",
+                )
+            except Dex3GraspNotAcquiredError as error:
+                driver.check()
+                print(f"TASK REJECTED — no stable cube contact: {error}", flush=True)
+                return_after_task_rejection(from_test_lift=False)
+                raise TabletopTaskRejected(f"no stable cube contact: {error}") from error
+            atomic_write_json(task_run / "grasp_stall.json", grasp_stall.to_dict())
+            dex_controller.begin_retention_test()
+            retention_request = RetentionRouteValidationRequest(
+                tabletop_request=clearance_request,
+                task_plan=task,
+                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+                blocked_motor_ids=grasp_stall.blocked_motor_ids,
+            )
+            retention_request_path = task_run / "retention_route_request.json"
+            retention_route_path = task_run / "retention_route_validation.json"
+            retention_request.write_json(retention_request_path)
+            try:
+                planner.request(
+                    "validate-retention-route",
+                    request_path=retention_request_path,
+                    output_path=retention_route_path,
+                    control_check=driver.check,
+                )
+            except (PlannerRequestRejected, RuntimeError) as error:
+                # If this was actually a controller fault, preserve the fail-closed
+                # path. Otherwise the frozen open-hand reverse route remains valid.
+                driver.check()
+                print(
+                    f"TASK REJECTED — measured contact route is unavailable: {error}",
+                    flush=True,
+                )
+                return_after_task_rejection(from_test_lift=False)
+                raise TabletopTaskRejected(
+                    f"measured contact route is unavailable: {error}"
+                ) from error
+            retention_route = RetentionRouteValidationResult.from_json(retention_route_path)
+            if retention_route.request_sha256 != retention_request.content_sha256:
+                raise RuntimeError("retention-route validation belongs to another request")
+            try:
+                dex_controller.check_retention_test()
+            except Dex3RetentionLostError as error:
+                print(f"TASK REJECTED — cube contact was lost before test lift: {error}")
+                return_after_task_rejection(from_test_lift=False)
+                raise TabletopTaskRejected(
+                    f"cube contact was lost before test lift: {error}"
+                ) from error
+            print(
+                "GRASP STALL ACQUIRED — measured stalled fingers passed the frozen "
+                "payload-route collision recheck; beginning the "
+                f"{retention_test_lift_mm:.1f} mm test lift",
+                flush=True,
+            )
+            execute_phase("retention_test_lift")
+            try:
+                retention_evidence = dex_controller.verify_grasp_stall_persistence(
+                    safety_heartbeat=lambda: (driver.check(), guard.pulse()),
+                )
+                dex_controller.finish_retention_test()
+            except Dex3RetentionLostError as error:
+                driver.check()
+                print(f"TASK REJECTED — cube contact did not survive test lift: {error}")
+                return_after_task_rejection(from_test_lift=True)
+                raise TabletopTaskRejected(
+                    f"cube contact did not survive test lift: {error}"
+                ) from error
+            atomic_write_json(
+                task_run / "retention_evidence.json",
+                retention_evidence.to_dict(),
+            )
+            print(
+                "RETENTION TEST PASSED — the same blocked finger posture persisted "
+                "through the test lift; continuing the full payload lift",
+                flush=True,
+            )
+            execute_phase("payload_lift")
+            execute_phase("payload_lower")
+            execute_phase("payload_replace")
+            open_active_hand("cube release after exact replacement")
+            execute_phase("grasp_retreat")
+            execute_phase("return_to_clearance")
+            _command_fingers(
+                dex_controller,
+                driver,
+                guard,
+                left=initial_left,
+                right=initial_right,
+                label="initial finger posture restoration",
+            )
+            execute_phase("__handoff__")
+            if grasp_stall is None or retention_evidence is None or retention_route is None:
+                raise RuntimeError("tabletop lifecycle ended without retention evidence")
+            _restore_seated_control(
+                driver=driver,
+                dex_controller=dex_controller,
+                guard=guard,
+                synchronized=synchronized,
+            )
             status = {
                 "status": "completed",
                 "commands_robot": True,
+                "arm": arm,
                 "selected_candidate_id": task.selected_candidate_id,
                 "execution_plan_sha256": execution.content_sha256,
+                "grasp_stall": grasp_stall.to_dict(),
+                "retention_evidence": retention_evidence.to_dict(),
+                "retention_route_validation_sha256": retention_route.content_sha256,
                 "terminal_action": guard.terminal_action,
                 "table_collision_policy": "local_manipulation_geometry_plane",
+                "open_transit_table_patch_dimensions_m": list(patch_dimensions),
                 "calibration_validation_claim": False,
             }
             print(
-                "TABLETOP TASK PASSED — cube picked, lifted 100 mm, replaced, arm "
+                "TABLETOP TASK PASSED — grasp stall survived a "
+                f"{retention_test_lift_mm:.1f} mm test lift; cube then completed the "
+                f"{payload_lift_mm:.1f} mm lift, was replaced, and the arm "
                 "returned to its supported start, and seated FSM 3 restored",
                 flush=True,
             )
@@ -578,17 +886,61 @@ def run_tabletop(args) -> int:
                 node.destroy_node()
             if "rclpy" in locals() and rclpy.ok():
                 rclpy.shutdown()
+    except TabletopTaskRejected as rejection:
+        try:
+            _restore_seated_control(
+                driver=driver,
+                dex_controller=dex_controller,
+                guard=guard,
+                synchronized=synchronized,
+            )
+        except BaseException as error:
+            primary_error = error
+            status = {
+                "status": "failed",
+                "commands_robot": bool(transport is not None and transport.command_count),
+                "arm": arm,
+                "error_type": type(error).__name__,
+                "error": f"task rejection recovery failed after {rejection}: {error}",
+            }
+            raise
+        status = {
+            "status": "task_rejected",
+            "commands_robot": bool(transport is not None and transport.command_count),
+            "arm": arm,
+            "reason": str(rejection),
+            "terminal_action": guard.terminal_action,
+            "frozen_reverse_return_completed": rejection_return_completed,
+            "calibration_validation_claim": False,
+        }
+        return_description = (
+            "the arm returned through the frozen reverse route"
+            if rejection_return_completed
+            else "the arm remained at the supported ownership pose"
+        )
+        print(
+            f"TABLETOP TASK REJECTED — {return_description} and seated FSM 3 was "
+            "restored; no emergency zero-torque transition was requested. Reason: "
+            f"{rejection}",
+            flush=True,
+        )
     except BaseException as error:
         primary_error = error
         status = {
             "status": "failed",
             "commands_robot": bool(transport is not None and transport.command_count),
+            "arm": arm,
             "error_type": type(error).__name__,
             "error": str(error),
         }
         raise
     finally:
         cleanup_errors: list[str] = []
+        if planner is not None:
+            try:
+                planner.close()
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(f"planner: {error}")
         if driver is not None and driver.is_alive:
             try:
                 driver.close()
@@ -627,6 +979,17 @@ def run_tabletop(args) -> int:
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(f"{name}: {error}")
         command_lock.release()
+        if raw_recorder is not None and (raw_recorder.started or raw_recorder.summary is not None):
+            try:
+                status["recording"] = raw_recorder.stop()
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(f"raw episode recorder: {error}")
+                status["recording"] = {
+                    "state": "finalization_failed",
+                    "complete": False,
+                    "episode_directory": str(raw_recorder.episode_directory),
+                    "error": str(error),
+                }
         status["cleanup_errors"] = cleanup_errors
         try:
             if preflight_frames:

@@ -150,22 +150,25 @@ class PC2DampingWatchdog:
                 stderr=subprocess.STDOUT,
                 bufsize=0,
             )
+            startup_timeout_s = (
+                self.config.connect_timeout_s
+                + (
+                    self.config.client_timeout_s * pc2_watchdog_agent.FSM_QUERY_ATTEMPTS
+                    if self.config.query_initial_fsm_id
+                    else 0.0
+                )
+                + (
+                    pc2_watchdog_agent.FSM_QUERY_RETRY_DELAY_S
+                    * (pc2_watchdog_agent.FSM_QUERY_ATTEMPTS - 1)
+                    if self.config.query_initial_fsm_id
+                    else 0.0
+                )
+                + 2.0
+            )
             try:
                 ready = self._wait_for_marker(
                     pc2_watchdog_agent.READY_MARKER,
-                    timeout_s=self.config.connect_timeout_s
-                    + (
-                        self.config.client_timeout_s * pc2_watchdog_agent.FSM_QUERY_ATTEMPTS
-                        if self.config.query_initial_fsm_id
-                        else 0.0
-                    )
-                    + (
-                        pc2_watchdog_agent.FSM_QUERY_RETRY_DELAY_S
-                        * (pc2_watchdog_agent.FSM_QUERY_ATTEMPTS - 1)
-                        if self.config.query_initial_fsm_id
-                        else 0.0
-                    )
-                    + 2.0,
+                    timeout_s=startup_timeout_s,
                 )
                 self._initial_fsm_id = (
                     self._parse_fsm_id(ready) if self.config.query_initial_fsm_id else None
@@ -187,7 +190,20 @@ class PC2DampingWatchdog:
                 self._armed = True
                 self._send_ping(self._clock())
             except BaseException:
-                self._terminate_local_process()
+                if self._terminal_action is None and self._process.poll() is None:
+                    try:
+                        self._send("DISARM")
+                        self._wait_for_marker(
+                            pc2_watchdog_agent.DISARMED_MARKER,
+                            timeout_s=startup_timeout_s,
+                        )
+                        self._armed = False
+                        self._terminal_action = "disarmed"
+                        self._finish_local_process()
+                    except (KeyboardInterrupt, OSError, RuntimeError):
+                        self._terminate_local_process()
+                else:
+                    self._terminate_local_process()
                 raise
 
     @staticmethod

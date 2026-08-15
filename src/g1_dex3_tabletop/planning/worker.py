@@ -19,8 +19,15 @@ from g1_dex3_tabletop.planning.curobo_backend import (
 from g1_dex3_tabletop.planning.tabletop_planner import (
     plan_supported_escape,
     plan_tabletop_task,
+    validate_retention_route,
 )
-from g1_dex3_tabletop.tabletop_contracts import TabletopTaskRequest
+from g1_dex3_tabletop.planning.tabletop_session import TabletopPlanningSession
+from g1_dex3_tabletop.tabletop_contracts import (
+    RetentionRouteValidationRequest,
+    TabletopTaskRequest,
+)
+
+EVENT_PREFIX = "G1_PLANNER_EVENT "
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,35 +57,138 @@ def build_parser() -> argparse.ArgumentParser:
             "plan-tabletop-task",
             "plan the qualified cube pick, lift, replace, retreat, and return",
         ),
+        (
+            "validate-retention-route",
+            "recheck the frozen payload route at the measured contact-stalled hand posture",
+        ),
+        (
+            "plan-tabletop-lifecycle",
+            "plan the complete supported escape, task, and exact return in one process",
+        ),
     ):
         tabletop = subparsers.add_parser(command, help=help_text)
         tabletop.add_argument("--request", type=Path, required=True)
         tabletop.add_argument("--output", type=Path, required=True)
+    subparsers.add_parser(
+        "serve-tabletop",
+        help="serve lifecycle planning and retention validation over stdin/stdout",
+    )
     return parser
+
+
+def _emit(event: dict) -> None:
+    print(EVENT_PREFIX + json.dumps(event, separators=(",", ":")), flush=True)
+
+
+def _serve_tabletop() -> int:
+    """Keep Python, CuRobo imports, and the CUDA context alive for one run."""
+
+    import torch
+
+    cuda_available = bool(torch.cuda.is_available())
+    if cuda_available:
+        torch.cuda.init()
+    session = TabletopPlanningSession()
+    _emit(
+        {
+            "type": "ready",
+            "cuda_available": cuda_available,
+            "device": torch.cuda.get_device_name(0) if cuda_available else None,
+        }
+    )
+    for line in sys.stdin:
+        request_id = None
+        try:
+            message = json.loads(line)
+            if message.get("command") == "shutdown":
+                _emit({"type": "stopped"})
+                return 0
+            request_id = int(message["id"])
+            command = str(message["command"])
+            request_path = Path(message["request"])
+            output_path = Path(message["output"])
+            if output_path.exists():
+                raise FileExistsError(f"planner output already exists: {output_path}")
+
+            def progress(text: str, *, event_id: int = request_id) -> None:
+                _emit({"type": "progress", "id": event_id, "message": text})
+
+            if command == "plan-tabletop-lifecycle":
+                request = TabletopTaskRequest.from_json(request_path)
+                result = session.plan_lifecycle(request, progress=progress)
+            elif command == "validate-retention-route":
+                request = RetentionRouteValidationRequest.from_json(request_path)
+                result = session.validate_retention_route(request, progress=progress)
+            else:
+                raise ValueError(f"unsupported persistent planner command: {command}")
+            result.write_json(output_path)
+            _emit(
+                {
+                    "type": "result",
+                    "id": request_id,
+                    "ok": True,
+                    "operation": command,
+                    "output": str(output_path.resolve()),
+                    "plan_sha256": result.content_sha256,
+                }
+            )
+        except (FileNotFoundError, FileExistsError, RuntimeError, TypeError, ValueError) as error:
+            _emit(
+                {
+                    "type": "result",
+                    "id": locals().get("request_id"),
+                    "ok": False,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command == "serve-tabletop":
+            return _serve_tabletop()
         if args.command == "inspect-model":
             request = CalibrationPlanRequest.from_json(args.request)
             print(json.dumps(inspect_model(request), indent=2, sort_keys=True))
             return 0
         if args.output.exists():
             raise FileExistsError(f"planner output already exists: {args.output}")
-        if args.command in {"plan-supported-escape", "plan-tabletop-task"}:
-            request = TabletopTaskRequest.from_json(args.request)
-            result = (
-                plan_supported_escape(
-                    request,
-                    progress=lambda message: print(message, file=sys.stderr, flush=True),
-                )
-                if args.command == "plan-supported-escape"
-                else plan_tabletop_task(
-                    request,
-                    progress=lambda message: print(message, file=sys.stderr, flush=True),
-                )
+        if args.command == "validate-retention-route":
+            request = RetentionRouteValidationRequest.from_json(args.request)
+            result = validate_retention_route(
+                request,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
             )
+            summary = {
+                "commands_robot": False,
+                "output": str(args.output.resolve()),
+                "plan_sha256": result.content_sha256,
+                "operation": args.command,
+            }
+        elif args.command in {
+            "plan-supported-escape",
+            "plan-tabletop-task",
+            "plan-tabletop-lifecycle",
+        }:
+            request = TabletopTaskRequest.from_json(args.request)
+            if args.command == "plan-supported-escape":
+                result = plan_supported_escape(
+                    request,
+                    progress=lambda message: print(message, file=sys.stderr, flush=True),
+                )
+            elif args.command == "plan-tabletop-task":
+                result = plan_tabletop_task(
+                    request,
+                    progress=lambda message: print(message, file=sys.stderr, flush=True),
+                )
+            else:
+                result = TabletopPlanningSession().plan_lifecycle(
+                    request,
+                    progress=lambda message: print(message, file=sys.stderr, flush=True),
+                )
             summary = {
                 "commands_robot": False,
                 "output": str(args.output.resolve()),

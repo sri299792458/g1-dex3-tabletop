@@ -12,6 +12,7 @@ from g1_dex3_tabletop.planning.g1_model import (
     build_tabletop_robot_config,
     command_from_model_q,
     corrected_joint_positions,
+    grasp_T_palm,
     model_source_hashes,
 )
 
@@ -92,18 +93,20 @@ def test_collision_only_model_preserves_nvidia_tool_frames() -> None:
     ]
 
 
-def test_tabletop_model_reserves_attached_payload_spheres() -> None:
+@pytest.mark.parametrize("arm", ("left", "right"))
+def test_tabletop_model_reserves_attached_payload_spheres(arm: str) -> None:
     pytest.importorskip("curobo")
     snapshot = RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7)
 
     robot, reference = build_tabletop_robot_config(
+        arm=arm,
         snapshot=snapshot,
         joint_position_offsets_rad={},
-        right_finger_q_rad=(0.0,) * 7,
+        active_finger_q_rad=(0.0,) * 7,
     )
 
     assert len(reference) == 7
-    assert robot["kinematics"]["extra_collision_spheres"]["right_attached_object"] == 32
+    assert robot["kinematics"]["extra_collision_spheres"][f"{arm}_attached_object"] == 32
 
     ignore = robot["kinematics"]["self_collision_ignore"]
     collision_links = robot["kinematics"]["collision_link_names"]
@@ -114,11 +117,25 @@ def test_tabletop_model_reserves_attached_payload_spheres() -> None:
                 assert other in ignore[link]
                 assert link in ignore[other]
 
-    assert "right_hip_yaw_link" not in ignore["right_hand_palm_link"]
-    assert "left_hand_palm_link" not in ignore["right_hand_palm_link"]
-    assert "right_shoulder_roll_link" in ignore["torso_link"]
-    assert "torso_link" in ignore["right_shoulder_roll_link"]
-    assert "right_shoulder_yaw_link" not in ignore["torso_link"]
+    assert f"{arm}_hip_yaw_link" not in ignore[f"{arm}_hand_palm_link"]
+    opposite = "right" if arm == "left" else "left"
+    assert f"{opposite}_hand_palm_link" not in ignore[f"{arm}_hand_palm_link"]
+    for side in ("left", "right"):
+        assert f"{side}_shoulder_roll_link" in ignore["torso_link"]
+        assert "torso_link" in ignore[f"{side}_shoulder_roll_link"]
+    assert f"{arm}_shoulder_yaw_link" not in ignore["torso_link"]
+    assert f"{opposite}_shoulder_yaw_link" in ignore["torso_link"]
+    assert "torso_link" in ignore[f"{opposite}_shoulder_yaw_link"]
     assert robot["kinematics"]["self_collision_buffer"][
-        "right_shoulder_yaw_link"
-    ] == pytest.approx(-0.0015)
+        f"{arm}_shoulder_yaw_link"
+    ] == pytest.approx(0.0)
+
+
+def test_graspgenx_g_to_palm_transform_is_side_specific() -> None:
+    left = grasp_T_palm("left")
+    right = grasp_T_palm("right")
+
+    np.testing.assert_allclose(left[:3, 3], right[:3, 3], atol=1e-15)
+    assert not np.allclose(left[:3, :3], right[:3, :3])
+    assert np.linalg.det(left[:3, :3]) == pytest.approx(1.0)
+    assert np.linalg.det(right[:3, :3]) == pytest.approx(1.0)

@@ -31,6 +31,8 @@ else
     ros_prefix="/opt/ros/humble"
 fi
 cyclone_prefix="${workspace_root}/deps/cyclonedds_python_prefix"
+local_mcap_prefix="${workspace_root}/deps/rosbag2_mcap_prefix${ros_prefix}"
+unitree_ros_setup="${G1_TABLETOP_UNITREE_ROS_SETUP:-${workspace_root}/../g1pilot_ws/install/setup.bash}"
 
 if [[ ! -f "${ros_prefix}/setup.bash" || ! -d "${cyclone_prefix}/lib" ]]; then
     echo "hardware environment is unavailable; retain/install the commissioned account-local CycloneDDS runtime" >&2
@@ -52,16 +54,47 @@ fi
 
 set +u
 source "${ros_prefix}/setup.bash"
+if [[ "${hardware_command}" == "run-tabletop" ]]; then
+    if [[ ! -f "${local_mcap_prefix}/lib/librosbag2_storage_mcap.so" ]]; then
+        echo "account-local MCAP plugin is unavailable; run ./tools/setup_recording_benchmark.sh once" >&2
+        exit 1
+    fi
+    if [[ ! -f "${unitree_ros_setup}" ]]; then
+        echo "official Unitree ROS message installation is unavailable: ${unitree_ros_setup}" >&2
+        exit 1
+    fi
+    source "${unitree_ros_setup}"
+fi
 set -u
 export CYCLONEDDS_HOME="${cyclone_prefix}"
-export CMAKE_PREFIX_PATH="${cyclone_prefix}:${ros_prefix}:${CMAKE_PREFIX_PATH:-}"
-export LD_LIBRARY_PATH="${cyclone_prefix}/lib:${ros_prefix}/lib:${ros_prefix}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+export AMENT_PREFIX_PATH="${local_mcap_prefix}:${AMENT_PREFIX_PATH:-}"
+export CMAKE_PREFIX_PATH="${local_mcap_prefix}:${cyclone_prefix}:${ros_prefix}:${CMAKE_PREFIX_PATH:-}"
+export LD_LIBRARY_PATH="${local_mcap_prefix}/lib:${cyclone_prefix}/lib:${ros_prefix}/lib:${ros_prefix}/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
 export LIBRARY_PATH="${cyclone_prefix}/lib:${LIBRARY_PATH:-}"
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
 export ROS_DOMAIN_ID="${domain_id}"
 export ROS_LOCALHOST_ONLY=0
 if [[ -z "${CYCLONEDDS_URI:-}" ]]; then
     export CYCLONEDDS_URI="<CycloneDDS><Domain Id=\"any\"><General><Interfaces><NetworkInterface name=\"${network_interface}\" priority=\"default\" multicast=\"default\" /></Interfaces></General></Domain></CycloneDDS>"
+fi
+
+if [[ "${hardware_command}" == "run-tabletop" ]]; then
+    storage_plugins="$(ros2 bag list storage)"
+    if ! grep -qx mcap <<<"${storage_plugins}"; then
+        echo "account-local MCAP storage plugin was not discovered" >&2
+        exit 1
+    fi
+    for message_type in \
+        unitree_hg/msg/LowState \
+        unitree_hg/msg/LowCmd \
+        unitree_hg/msg/HandState \
+        unitree_hg/msg/HandCmd
+    do
+        if ! ros2 interface show "${message_type}" >/dev/null 2>&1; then
+            echo "official Unitree ROS type support is unavailable: ${message_type}" >&2
+            exit 1
+        fi
+    done
 fi
 
 cd "${workspace_root}"

@@ -2262,3 +2262,588 @@ the full two-color plate and check the marker with the detector.
   the same terminal wrist-pitch sample as CuRobo's `-3.44 mm` sphere result.
   This is not a sphere-fit false positive, so the table gate remains unchanged
   and that retained observation is not a runnable complete task plan.
+
+## 2026-08-14 — Shoulder-yaw overlap is a start-only CuRobo recovery
+
+- This section supersedes the fixed `1.5 mm` shoulder-yaw buffer described
+  above. A negative per-link buffer was too broad because it relaxed every
+  later CuRobo plan involving that link. The general tabletop robot model is
+  strict again: `right_shoulder_yaw_link` has its upstream zero buffer and the
+  torso pair remains enabled.
+- An offline diagnostic at the retained measured start found `+5.706 mm`
+  clearance between the official Unitree torso and right-shoulder-yaw URDF
+  collision meshes. The existing NVIDIA spheres report `-1.203 mm` for the
+  same configuration because one `78.04 mm` torso sphere fills the physical
+  shoulder recess. This mesh comparison established the cause; it is not a
+  second runtime collision stack, and the upstream sphere geometry is not
+  modified.
+- Only a deep-copied model used to generate the supported escape excludes the
+  known `torso_link/right_shoulder_yaw_link` pair. The resulting trajectory is
+  immediately evaluated again with the strict CuRobo sphere model. The exact
+  measured-start overlap is the baseline: no other pair may exist or appear,
+  the overlap may never increase from one sample to the next, it may not
+  reappear after clearing, and it must be absent at the escape endpoint. The
+  task planner then starts from that clear endpoint with the strict model. The
+  supported return is the exact reversed escape.
+- CuRobo's stored per-pair kernel value is a squared overlap score, despite the
+  old diagnostic helper treating it as metres. The helper now calculates true
+  linear sphere penetration from the transformed sphere centers, effective
+  radii, and configured padding. Replanning retained request
+  `runs/tabletop_20260814T001909Z/loaded_request.json` passes all `41` recovery
+  samples with `1.203 mm` initial penetration and `144.6 mm` terminal G-frame
+  table-plane clearance. This was offline-only; no robot command was sent.
+
+## 2026-08-14 — Local table obstacle steers the open-hand transit
+
+- The existing table policy was only a post-planning guard. It correctly
+  checks the complete right wrist, Dex3, and attached-payload route against the
+  infinite plane inferred from the resting cube while ignoring unrelated
+  torso, leg, left-arm, shoulder, and elbow geometry. CuRobo therefore had no
+  table obstacle during optimization and could generate a route that the
+  independent guard subsequently rejected.
+- On retained live request `runs/tabletop_20260814T001909Z/loaded_request.json`,
+  all three reachable grasp endpoints and their straight approach segments
+  were above the plane. Their unconstrained clearance-to-pregrasp trajectories
+  nevertheless dipped `3.441`, `2.131`, and `3.174 mm` below it at intermediate
+  samples. The failure was therefore the open transit, not the GraspGenX grasp
+  endpoints or the final straight approach.
+- `config/tabletop/task.yaml` now explicitly supplies a `400 x 400 x 20 mm`
+  open-transit planning patch centred under the detected cube, with its top
+  face coincident with the inferred plane. The patch is used only while the
+  open hand moves from clearance through grasp approach. Supported escape and
+  attached-payload planning do not include it. The patch may extend beyond the
+  actual table edge: that only invents extra obstacle space and cannot weaken
+  the independent infinite-plane validation, so no cube-to-edge setup distance
+  is required or claimed.
+- The patch is a planner steering aid, not the safety authority. The unchanged
+  infinite-plane guard still validates every right-wrist/hand/payload sample,
+  including motion outside the finite patch. Full-robot self-collision also
+  remains active. No table collision tolerance or robot collision sphere was
+  relaxed.
+- The production CuRobo worker, without monkey patches, replanned the retained
+  observation and selected
+  `cube_head__seed_0000000109__sample_213` for a complete
+  pick/lift/replace/return lifecycle. Its open-route minimum plane clearance is
+  `+4.775 mm` and its closed-hand minimum is `+2.898 mm`. The conservative
+  attached-cube sphere cover begins at `-1.813 mm` relative to the inferred
+  plane and never deepens that initial support-contact proxy overlap, preserving
+  the existing payload policy. The first two candidates remain correctly
+  rejected for closed-finger clearances of `-3.8` and `-5.0 mm`. The verified
+  task-plan SHA-256 is
+  `890e08c3e89e1825259bbcaef9f74d4602ecee58c25b98e8ea9a4d112f94fe44`.
+- The isolated CuRobo task worker initially reproduced the supported-escape
+  endpoint with one `2.98e-8 rad` float32 rounding difference. This is
+  physically meaningless but exceeded the immutable execution contract's
+  `1e-8 rad` exact-join threshold. The task planner now accepts only a start
+  state within a scale-aware float32 numerical bound and then preserves the
+  exact serialized request state as sample zero; a real discontinuity still
+  fails. The downstream controller adapter now assembles all eight trajectories
+  (`41, 62, 22, 41, 41, 22, 62, 41` samples) with exact clearance, return, and
+  handoff joins. The complete execution-plan SHA-256 is
+  `3edd0c46b22f25e5b1638b8b75f6fdaeb40309b32edec040b1d43a3e93fd3838`.
+  This verification was offline-only; no robot command was sent.
+
+## 2026-08-14 — One canonical Dex3 grasp atlas now serves either arm
+
+- The tabletop command now requires `--arm left|right`. The selected hardware
+  configuration, seven active arm joints, grasp/attachment frames, collision
+  links, table-plane guard, trajectory records, and Dex3 commands all follow
+  that one value. The opposite arm and hand remain locked at their measured
+  takeover state, and the opposite fingers are never commanded by the task.
+- A second GraspGenX/PhysX qualification run is not needed for the left hand.
+  Direct inspection of GraspGenX commit `e45a6f6` showed that the left and right
+  canonical open meshes agree within about `2 um`; applying the descriptor's
+  exact mirror mapping makes articulated FK agree to numerical precision
+  (`1.16e-15 m`). The retained `object_T_G` poses are therefore side-independent.
+- The former right-only shortlist is stored once as
+  `config/tabletop/cube_dex3_executable_v1/shortlist.yaml`. Its original
+  right-descriptor joint values and source paths remain immutable qualification
+  evidence. Runtime adapts only the Dex3 posture and fixed `G_T_palm` frame:
+  every left joint changes sign, and the canonical index/middle chains exchange
+  physical motor names. This adapter is centralized in `dex3_handedness.py` and
+  is hash-bound through the canonical profile.
+- A fixed opposite shoulder-yaw/torso sphere overlap was exposed when the exact
+  retained right-arm request was mirrored into a left-arm offline test. Those
+  two links are both locked during left planning, so their relative pose cannot
+  change. The model now excludes only that invariant fixed-arm pair, while the
+  selected shoulder-yaw/torso pair remains strict. Both proximal shoulder-roll
+  adjacency omissions remain the existing G1Pilot policy, independent of the
+  selected arm.
+- Complete production-worker replays passed without robot commands for both
+  sides using the same retained live cube observation. The right arm selected
+  `cube_head__seed_0000000109__sample_213`. Under the final scoped-patch policy,
+  the left arm strictly rejected three generated wrist/shoulder-to-torso routes
+  and selected `cube_head__seed_0000000149__sample_203`. The left supported
+  escape ended with `145.5 mm` G-frame plane clearance, and its final complete
+  task plan SHA-256 is
+  `14b3f7d4fd5182ab30e4e7ff6d5a43daab8cfdc8b749880cb97a0bac3f7e9e49`.
+
+## 2026-08-14 — Exact diagnosis of the corrected-tilt right-arm IK failure
+
+- Frozen run `runs/tabletop_20260814T130028Z` placed the cube about `43.4 mm`
+  farther robot-left than the earlier solvable observation. The final-grasp
+  goal set returned no valid right-arm IK, but the original status did not name
+  which constraint rejected the solutions.
+- Replaying the exact production goal-set call and its subsequent diagnostic
+  pass identified the first blocker as a scene collision, not the right hand:
+  the fixed, table-resting `left_wrist_pitch_link` sphere penetrated the local
+  `400 x 400 mm` open-transit table patch by `0.213 mm`. The left middle-finger
+  and palm spheres were also within the configured `10 mm` collision activation
+  zone. The local patch was intended to steer the selected arm, but CuRobo's
+  world checker applied it to the complete locked robot model.
+- Removing that scene blocker for diagnosis exposed secondary Cartesian-exact
+  right-arm branches for `cube_head__seed_0000000119__sample_205` that strict
+  self-collision correctly rejects. One branch penetrated the sphere model at
+  `right_shoulder_yaw_link/torso_link` by `80.214 mm` and
+  `right_elbow_link/torso_link` by `36.379 mm`; its secondary
+  `right_hand_palm_link/left_hand_thumb_1_link` overlap was `2.249 mm`.
+  The alternate exact branch still penetrated
+  `right_shoulder_yaw_link/torso_link` by `12.919 mm` (plus a `6.498 mm`
+  logo/shoulder-yaw overlap). These are genuine cross-torso alternatives, but
+  they must not be confused with the fixed-left-wrist/table-patch blocker that
+  terminated the unmodified production goal set.
+- No collision exception was added for either finding. Moving the selected arm
+  through the torso or opposite hand remains invalid. The finite patch policy
+  also must not silently reject an unrelated supported arm; the new selected-arm
+  path is the clean immediate test when the object lies on that side.
+
+## 2026-08-14 — Tabletop failure logging policy
+
+- A terminal failure must identify its pipeline stage and the lowest useful
+  physical cause already available: IK pose error for unreachable targets,
+  named self-collision links and penetration for converged-but-colliding IK,
+  named link/sample/clearance for the independent table-plane guards, and the
+  existing measured joint/error diagnostics for execution faults. Successful
+  per-frame internals and optimizer tensors are not dumped.
+- A final-grasp goal-set failure now performs one read-only diagnostic IK pass.
+  Cartesian-converged branches are mapped back to the exact shortlist candidate;
+  enabled CuRobo self-collision pairs report penetration in millimetres, while
+  named robot-link/scene-object pairs report signed clearance. If no branch
+  converges, the error instead reports the best translation and rotation
+  residual and does not claim a collision.
+- Each isolated CuRobo worker is now streamed unchanged to the terminal and to
+  a stage-specific `*.planner.log` beside its request/output artifacts. On
+  failure the retained top-level `status.json` error includes the worker's final
+  diagnostic line and the complete log path, rather than only an exit code.
+
+## 2026-08-14 — Local patch steering is scoped without weakening self-collision
+
+- The corrected-tilt failure proved that a local planning patch cannot be
+  applied as an ordinary full-robot world obstacle: an unrelated supported arm
+  may legitimately occupy the same inferred table region. The patch now acts
+  only on the selected wrist and Dex3 links used by the independent table-plane
+  guard.
+- This does not delete the rest of the robot from CuRobo. The steering model
+  uses CuRobo's per-link `collision_sphere_buffer` to make unrelated radii
+  negative for world collisions; CuRobo compensates those same offsets in its
+  self-collision padding, preserving the original full-robot self geometry.
+  After trajectory generation, every sample is independently rechecked against
+  the strict full-robot self model and the strict full-robot cube scene (with
+  only the commissioned fingertip contact links exempt at contact), followed by
+  the existing selected wrist/hand infinite-plane check.
+- Replanning frozen corrected-tilt right request
+  `runs/tabletop_20260814T130028Z/clearance_request.json` now proceeds past the
+  unrelated left wrist. The strict recheck rejects two generated alternatives
+  for `right thumb/right hip` penetration (`0.470 mm` and `2.008 mm`), then two
+  closed grasps for below-plane finger clearance (`-5.0 mm` and `-3.8 mm`), and
+  selects `cube_head__seed_0000000109__sample_213` for the complete lifecycle.
+  Its offline task-plan SHA-256 is
+  `8cdb9a371378c4e46a32f81f608f38523688fbbb8a94f1f8427ef35c0a4ed1db`.
+- The same frozen placement does not produce a complete left-arm task: two
+  alternatives fail strict wrist/torso self-collision, one attached lift is
+  outside pose tolerance, one approach fails, and the remaining goal set has
+  no Cartesian-converged branch (`22.328 mm`, `1.999 deg` best residuals).
+  This is a clean reachability result, not a handedness-adapter or table-patch
+  failure. All checks were offline; no robot command was sent.
+
+## 2026-08-14 — Raw MCAP control-contention benchmark
+
+- Cloned `RPM-lab-UMN/spark-data-collection` at commit `be284c2` as a separate
+  read-only reference checkout. Its `generate_dummy_episode.py` validates
+  synthetic bag-to-LeRobot data, while its live recorder delegates to a separate
+  `ros2 bag record` process. It contains no concurrent controller-jitter test;
+  the documented claim that plain MCAP is low overhead was therefore not treated
+  as evidence for this G1's 250 Hz command loop.
+- Added a no-robot benchmark that reuses the production
+  `ExecutorControlDriver` scheduling loop and production ROS image conversion.
+  Separate synthetic publishers provide 29-joint measured/command streams at
+  250 Hz and RGB8 1280x720 at 15 Hz. The benchmark rotates baseline,
+  state-only-MCAP, and state-plus-camera-MCAP conditions and reports p99/p99.9/max
+  tick gaps, threshold counts, camera receipt rate, recorded topic rates, disk
+  throughput, and child-process CPU time.
+- The launcher enforces `ROS_LOCALHOST_ONLY=1`, ROS domain 221 by default, and
+  creates only `/g1_recording_benchmark/...` topics. It cannot discover the G1
+  and contains no Unitree transport or robot command publisher. The Humble MCAP
+  plugin and vendor library are extracted account-locally into ignored `deps/`;
+  no sudo or system package mutation is required.
+- Three 15-second trials per condition completed on this laptop. State-only
+  capture wrote `0.54 MiB/s`. Raw RGB capture sustained a mean `39.86 MiB/s`
+  and recorded `14.81-15.04 Hz`. Worst observed control gaps were `9.272 ms`
+  with no recorder, `7.387 ms` with state-only recording, and `7.603 ms` with
+  state plus raw RGB. None of the nine trials produced a gap above `10 ms`, and
+  none approached the old `50 ms` failure.
+- This evidence does not show the bursty failure mode seen when PNG/manifest
+  persistence ran alongside the old calibration controller. Plain MCAP uses a
+  buffered sequential external writer instead. It also does not prove physical
+  safety: the synthetic publishers consume laptop CPU unlike PC2 producers, and
+  the run does not include a live Unitree transport. The next adoption boundary
+  remains a stationary robot-connected A/B timing run before enabling recording
+  during motion.
+
+## 2026-08-14 — SPARK-style raw episode recording integrated
+
+- `run-tabletop` now owns one adjacent `raw_episode/` artifact containing a
+  plain untrimmed MCAP, `episode_manifest.json`, `notes.md`, and
+  `recorder.log`. The implementation reuses SPARK commit `be284c2`'s central
+  pattern—a separate `ros2 bag record` process and per-episode manifest—rather
+  than adding serialization or image encoding to the controller.
+- The stable tabletop profile records only general source streams: official
+  complete G1 LowState (including IMU), complete debug LowCmd, both Dex3 state
+  and command pairs, raw head RGB, and CameraInfo. Cube detections, table
+  estimates, grasp decisions, CuRobo plans, and derived success remain the
+  existing run JSON artifacts and are not republished as invented bag topics.
+- Recording starts after SPACE and immutable-config rechecks but before
+  activation reacquisition or any command publisher. It remains active through
+  control, Dex3, and PC2 cleanup, then receives SIGINT. A start failure blocks
+  command creation. A finalization failure is recorded separately and cannot
+  issue a robot-mode request.
+- Completion is audited from rosbag's `metadata.yaml`: clean recorder exit,
+  MCAP storage, non-empty required topics, and exact message types. An
+  incomplete bag is retained and named as such; it does not silently become a
+  valid learning episode. Full behavior and the capture/archive/published-data
+  boundary are documented in `docs/data-recording.md`.
+- The hardware launcher reuses the account-local MCAP plugin and the existing
+  official `unitree_hg` install from `g1pilot_ws` strictly for ROS type support.
+  It verifies both before RealSense startup. No G1Pilot node or controller is
+  launched.
+- A final localhost-only smoke test exercised the production recorder class,
+  actual Humble `ros2 bag record`, and the account-local MCAP plugin against two
+  synthetic 250 Hz JointState streams. Graceful SIGINT produced a complete
+  1.96-second bag with 981 messages and an audited manifest. No Unitree topic or
+  robot transport was present.
+- Camera capture remains the default profile. `--skip-camera-recording` removes
+  raw RGB and CameraInfo together from the recorder and its completeness audit,
+  while the live RealSense perception path remains unchanged. The selected
+  mode is explicit in the manifest rather than inferred from missing messages.
+
+## 2026-08-14 — Supported escape now requires a strictly clear live start
+
+- Removed the selected shoulder-yaw/torso start-recovery exception. The earlier
+  `1.203 mm` NVIDIA sphere-proxy overlap belonged to one retained measured state;
+  it is not a fixed property of every Ready or seated posture. Two later retained
+  hardware starts both measured zero penetration for that pair.
+- Every supported-escape run now checks the exact live state with the strict
+  CuRobo self-collision model before planning. Any enabled overlap stops before
+  changing motion and reports every physical link pair and penetration in
+  millimetres. The operator can reposition the arm and rerun.
+- The complete generated escape is independently checked with the same strict
+  model. There is no allowed baseline penetration, monotonic-recovery rule, or
+  optimizer-only pair omission. Successful plan provenance records that the
+  start was clear and the number of strictly checked trajectory samples.
+
+## 2026-08-14 — Ctrl+C during watchdog startup exits cleanly
+
+- A Ctrl+C received while the laptop was waiting for PC2's initial
+  `WATCHDOG_READY` marker previously terminated only the local SSH process. The
+  remote watchdog could remain alive briefly with its exclusive lock, causing
+  the next run to report that another watchdog was already armed.
+- Startup exception handling now sends the watchdog's existing `DISARM` command,
+  waits for `WATCHDOG_DISARMED` and remote process exit, and then reraises the
+  original interruption. No new recovery mode or protocol was added.
+- The top-level CLI converts `KeyboardInterrupt` into one
+  `interrupted by operator` message and exit status 130 after normal cleanup,
+  instead of printing a Python traceback.
+
+## 2026-08-14 — Raw Unitree rosbag topic mapping corrected
+
+- Run `tabletop_20260814T170502Z` retained a 6.88 GB MCAP containing only RGB
+  and CameraInfo. Its manifest correctly marked all six requested Unitree
+  streams empty. The recorder had been given SDK channel strings such as
+  `/rt/lowstate`, but the live ROS graph exposes that DDS channel as
+  `/lowstate`; `rt` is the Unitree DDS partition, not part of the ROS name.
+- The recording profile now uses `/lowstate`, `/lowcmd`, and
+  `/dex3/{left,right}/{state,cmd}`. A read-only recorder probe against the live
+  graph subscribed to all six exact names without publishing any robot command.
+- Startup no longer treats the generic `Recording...` line as sufficient. The
+  recorder uses rosbag's `--include-unpublished-topics` support and requires a
+  `Subscribed to topic` confirmation for every selected stream. A missing
+  subscription therefore blocks before activation reacquisition, watchdog
+  arming, or command publisher creation instead of yielding another camera-only
+  episode.
+- `tools/delete_mcap.sh` provides explicit local space reclamation without a
+  recursive-delete surface. It accepts exactly one resolved `.mcap` under a
+  tabletop run's `raw_episode/bag/`, reports its size, and requires `DELETE`.
+
+## 2026-08-14 — Tabletop planning now preserves arm IK branches
+
+- Frozen run `tabletop_20260814T170502Z` did not prove that its retained
+  GraspGenX candidates were unreachable. The old selection layer let CuRobo
+  choose one final arm configuration for a grasp, then removed the complete
+  grasp candidate when that configuration failed the closed-hand attached-cube
+  lift. Other IK configurations for the same Cartesian grasp were never tested.
+- The task planner now asks CuRobo for its finite collision-valid pregrasp IK
+  branch pool. Each branch is evaluated through the existing joint-space route,
+  straight Cartesian grasp approach, strict full-robot self/cube rechecks,
+  infinite-plane hand guard, closed-Dex3 model, attached-cube lift, and payload
+  guard. A candidate is removed only after every returned branch for it has
+  failed. Collision geometry, table policies, lift distance, approach distance,
+  tolerances, and the exact-reverse return remain unchanged.
+- Branch failures are retained with candidate ID, pool/solver branch indices,
+  exact failure stage, and concise physical reason. The selected solver branch,
+  number of branches tested, and search round are stored in plan provenance.
+- The unmodified production worker replayed the exact frozen request and found
+  a complete route on the first preserved branch for
+  `cube_head__seed_0000000119__sample_205`. The six trajectory sample counts are
+  `61, 41, 41, 41, 41, 61`, and every serialized join is exact. Existing guards
+  measured `+1.918 mm` open-route hand clearance and `+0.206 mm` closed-lift
+  hand clearance. The conservative payload cover began at `-4.880 mm` relative
+  to the inferred support plane and never deepened that initial contact proxy
+  overlap. Plan SHA-256:
+  `ad6c75c6d88584022eb978f12c9a744fd480bb58fcc2332f14aa58cc8869363f`.
+  This was offline-only; no robot command was sent.
+
+## 2026-08-14 — Conservative tabletop commissioning speed
+
+- The successful frozen branch-search plan showed that every arm phase reached
+  the former `0.200 rad/s` planner ceiling. Tabletop motion now carries a
+  task-specific, hash-bound `maximum_arm_velocity_rad_s` value; the initial
+  commissioning configuration sets it to `0.100 rad/s`.
+- CuRobo path geometry is unchanged. Only the serialized timestamps are scaled,
+  so the supported escape, pregrasp, grasp approach, payload lift, exact reverse
+  replacement, retreat, and final supported return all obey the same limit.
+  The executor still independently rejects any trajectory above the hardware
+  controller's `0.200 rad/s` ceiling.
+- Dex3 opening, closure, release, and restoration remain on the physically
+  commissioned two-second smooth posture ramp. They are separate from the
+  seven-joint arm trajectory and were not silently retuned.
+- Offline replanning of the frozen `170502` geometry preserved candidate
+  `cube_head__seed_0000000119__sample_205` and the complete route. The six task
+  phases now last `16.178, 14.146, 13.526, 13.526, 14.146, 16.178 s`; each
+  measured exactly `0.100000 rad/s` maximum serialized joint velocity. The
+  supported escape and exact reverse each last `10.968 s` and also measure
+  exactly `0.100000 rad/s`. Task-plan SHA-256:
+  `b401ea3d5072513121ca1de9a5f398d84774688eabb4585471826e0ed90917ad`;
+  supported-escape SHA-256:
+  `fd0f32ea04bd2a4be28821b63f0e7d4633a20f2cb8190a51fd7704d431eb79db`.
+  No robot command was sent.
+
+## 2026-08-14 — MCAP launcher false negative removed
+
+- Run `tabletop_20260814T180638Z` correctly refused ownership from zero-torque
+  FSM 0 instead of the commissioned seated FSM 3. It sent no robot command and
+  still finalized a complete 290 MB MCAP with all eight required topics, which
+  independently proves that the account-local MCAP plugin is installed and
+  functional.
+- The next launch nevertheless printed `BrokenPipeError` followed by
+  `account-local MCAP storage plugin was not discovered`. The precheck piped
+  Python's `ros2 bag list storage` into `grep -q` while Bash `pipefail` was
+  active. Once `grep` found `mcap`, it exited early; Python then wrote to the
+  closed pipe, and `pipefail` converted the successful match into failure.
+- The launcher now captures the complete plugin listing before applying the
+  exact-line check. A read-only replay discovered `mcap`, `sqlite3`, and both
+  ROS test plugins, and all four official Unitree message-type checks passed.
+  No camera process, watchdog, publisher, or robot command was started.
+
+## 2026-08-14 — CuRobo branch start-state isolation
+
+- Run `tabletop_20260814T181113Z` passed perception and supported-escape
+  planning, then rejected its first pregrasp IK branch for a real
+  `1.096 mm` left-shoulder-yaw/torso sphere overlap. The second branch aborted
+  at the exact serialized-start guard with a `0.969315350 rad` discontinuity.
+- Offline instrumentation proved that CuRobo had mutated the `JointState`
+  supplied to the rejected branch: the next attempt received the preceding
+  branch's pregrasp configuration instead of the frozen clearance state. The
+  warmed planner itself did not need to be rebuilt.
+- Every branch attempt now receives a newly constructed seven-joint start
+  state from the immutable serialized clearance reference. The frozen failed
+  request proceeded through normal physical rejection of branches 1–4 and
+  selected branch 5 of `cube_head__seed_0000000119__sample_205`, producing a
+  complete pick/lift/replace/return plan with SHA-256
+  `c438787ed85fef7a2cb4e97eabf86b982e4f36e28f5cab5af49424af83235f23`.
+  This verification was offline-only; no robot command was sent.
+
+## 2026-08-14 — Strict self-collision audit restored to the GPU
+
+- The strict post-plan audit had been calculating linear penetration by moving
+  all robot spheres and all `216,578` enabled sphere pairs to NumPy, then
+  iterating every pair for every route sample in Python. The exact millimetre
+  value is diagnostic only; route acceptance requires only whether any enabled
+  pair overlaps.
+- CuRobo's native CUDA self-collision kernel now identifies the sparse set of
+  overlapping sphere pairs. Only actual hits are copied to Python for physical
+  link names. Linear penetration is calculated for those hits alone, so the
+  existing useful rejection text remains without participating in the
+  collision-free critical path. Collision geometry and rejection policy are
+  unchanged.
+- Offline replay of retained real request `tabletop_20260814T183817Z`
+  reproduced the same six rejected branches, link pairs, penetration values,
+  selected candidate, and bit-identical joint trajectories. Complete task
+  planning fell from the recorded `295.81 s` to `39.05 s`. The full account
+  environment suite passes (`270 passed, 4 skipped`). No robot command was
+  sent.
+
+## 2026-08-14 — Supported escape begins at the exact acquired command
+
+- Physical run `tabletop_20260814T183817Z` completed all planning but stopped
+  before changing motion because CuRobo's float32-supported-escape sample zero
+  differed from the loaded Unitree command by `1.8852615e-8 rad`. The executor's
+  deliberately exact `1e-9 rad` trajectory-join contract correctly rejected
+  it; its old six-decimal diagnostic misleadingly displayed `0.000000 rad`.
+- The existing float32-boundary anchoring helper is now also applied to the
+  supported escape, not only to later task phases. It first rejects a real
+  discontinuity and only then replaces sample zero with the exact serialized
+  loaded model and command coordinates. The executor tolerance was not relaxed.
+- Offline replay of the retained loaded request produced a supported escape
+  whose first command exactly equals the measured active-arm handoff (`0.0 rad`
+  error). Future executor boundary failures are printed with nine decimals. No
+  robot command was sent.
+
+## 2026-08-15 — Retained MCAP isolates the failed physical closure
+
+- Physical run `tabletop_20260814T190430Z` completed the supported escape,
+  pregrasp route, and straight grasp approach, then stopped during left-Dex3
+  closure. The complete 5.68 GB MCAP contains synchronized raw RGB, LowState,
+  LowCmd, and both Dex3 state/command pairs. This analysis was offline-only; no
+  robot connection or command was used.
+- Five open-hand endpoint frames immediately before closure put the measured
+  `object_T_G` only `3.61 mm / 2.99 deg` from selected GraspGenX candidate
+  `cube_head__seed_0000000119__sample_205`. The measured seven arm joints were
+  all within `0.0291 rad` of the frozen grasp-approach command. The camera/FK
+  placement therefore did not miss the grasp by anything comparable to the
+  reported `0.5003 rad` finger error.
+- Six valid frames at the stalled closed-hand endpoint put measured
+  `object_T_G` `4.80 mm / 4.07 deg` from the candidate's initial grasp frame.
+  From the pre-closure burst to that endpoint, the physical cube moved only
+  `1.48 mm / 0.91 deg` in the camera observation. The retained images visibly
+  show the cube between the thumb and opposing finger at the timeout.
+- The selected PhysX evidence tells a materially different closure story. Its
+  cube moved `14.87 mm / 14.52 deg` during closure, within the shortlist's very
+  permissive `20 mm / 45 deg` retention gates. Its final
+  `isaac_closed_object_T_G` is `31.87 mm / 14.52 deg` from the candidate's
+  initial `object_T_G`, and `33.23 mm / 10.49 deg` from the physical stalled
+  endpoint. The production controller then required the exact
+  `isaac_closed_q` from that displaced simulated cube state while the real
+  table-supported cube had barely shifted.
+- The stalled joint is exactly the planned opposing contact chain after the
+  commissioned right-to-left mirror: left `middle_0` measured `-0.0618 rad`
+  against the mirrored simulated target `-0.5620 rad`; thumb and the other
+  finger largely reached their targets. There were no Dex3 hardware error bits.
+  This is evidence of real object contact followed by an inapplicable exact
+  simulated-posture endpoint, not a missing hand command or a gross arm/camera
+  placement miss.
+- The other retained grasps do not repair this automatically. All 15 qualified
+  candidates rely on `7.50-19.80 mm` and `5.7-42.8 deg` of simulated cube
+  movement during closure. The least-moving candidate changes
+  `object_T_G` by `12.80 mm / 5.7 deg`. For this physical cube placement,
+  CuRobo found collision-valid pregrasp IK branches for only the selected
+  candidate and one alternative; the alternative has still worse simulated
+  closure motion (`19.54 mm / 36.5 deg`, `66.57 mm` relative-frame shift).
+- Conclusion: accepting the `0.5003 rad` residual as an endpoint tolerance
+  would hide a mismatch in the grasp qualification/execution contract. The
+  next design must either qualify grasps with near-static tabletop closure or
+  terminate physical closure on validated contact/retention evidence instead
+  of requiring every finger to reproduce an exact post-PhysX joint vector.
+
+## 2026-08-15 — Dex3 pressure evidence corrected and applied to the failed grasp
+
+- The local `/home/kanth042/dex3_pressure_tools` repository contains physical
+  right-hand evidence from Dex3-1 hand `214-R-T`; the pressure fields are not
+  arbitrary or generally unusable. Its untouched audit identified exactly 33
+  active taxels and 75 slots fixed at the `30000` invalid sentinel. Active
+  baseline noise had a 99th-percentile absolute drift of only `16-24` raw
+  counts. Deliberate free touches produced repeatable multi-sample responses
+  up to `13,800` counts, with 22 of 33 active taxels exceeding the repo's
+  conservative `500`-count definite-touch threshold.
+- Applying that repository's unchanged validity and baseline rules to the
+  retained left-hand MCAP from `tabletop_20260814T190430Z` recovered the same
+  33 active slots, the same 75 sentinel slots, and the same `16-24`-count idle
+  band. This independently confirms that the recorded left pressure matrix was
+  decoded correctly; the message's cumulative `lost` field is not a reason to
+  discard these samples.
+- The physical closure itself produced no sustained tactile response. During
+  both the closing and fully stalled windows, no active taxel remained even
+  `50` counts above its local baseline. One approximately one-sample outlier at
+  `t=106.242038 s` appeared at group 0, cell 9 (`+297,016` counts), then
+  immediately disappeared. A dwell or median contact test must reject such an
+  isolated spike.
+- Therefore the earlier broad statement that Dex3 pressure is unreliable was
+  wrong. The narrower result is that this particular cube grasp stalled a
+  finger without loading a mapped tactile surface. It may have contacted a
+  nonsensing edge or shell surface; the retained data cannot distinguish that
+  from a left-hand spatial-map mismatch because the local pressure study
+  physically mapped only the right hand.
+- For this grasp family, finger position stall is the available primary
+  closure evidence and pressure can only corroborate it when a sustained
+  taxel response is present. Making pressure a primary retention test first
+  requires a short left-hand taxel mapping/validation and grasp contacts that
+  deliberately land on the validated finger pads. Camera visibility is then
+  optional during a small retention lift rather than a prerequisite.
+
+## 2026-08-15 — Contact-stall and small-lift retention contract
+
+- The production close command now ramps toward the selected qualified Dex3
+  posture but no longer requires the exact post-PhysX endpoint. It accepts only
+  after at least one commanded finger has visibly moved in the closing
+  direction by the existing `0.01 rad` stability band and at least one finger
+  remains more than the existing `0.08 rad` endpoint tolerance short of its
+  empty-hand target while the complete hand settles within `0.01 rad` for the
+  commissioned `0.5 s` dwell.
+- No finger is required to reach the empty-hand target. That earlier proposed
+  gate was removed because object contact can validly block every closing
+  finger; observed commanded-direction motion is the direct evidence that the
+  hand command executed. A test covers this all-fingers-stalled case.
+- Raw Dex3 velocity, effort, and pressure do not decide the live result. Both
+  official Dex3 state topics, including their pressure matrices, were already
+  part of the plain MCAP contract and remain available for offline analysis;
+  no duplicate pressure recorder was added.
+- CuRobo still produces one complete payload lift and exact reverse. The plan
+  is split at its first sample at least `10 mm` above contact, preserving every
+  original joint sample and duplicating only the exact shared boundary. After
+  physical closure, an isolated read-only worker checks that same frozen route
+  once with the measured stalled finger angles. It does not replan the arm or
+  introduce a new geometric tolerance.
+- After the small test lift, the blocked joints must remain within the existing
+  `0.01 rad` stability band of the contact posture and remain short of the
+  empty-hand target. Only then does the unchanged controller continue the full
+  configured lift. CPU tests cover stable contact, empty-hand closure, contact
+  loss, exact trajectory splitting, and the new hash-bound planner contracts.
+- Offline CuRobo verification reused retained physical run
+  `tabletop_20260814T190430Z`; it generated all eight task phases, split the
+  requested `10 mm` boundary at the unchanged trajectory's `10.158 mm` sample,
+  and checked all 81 payload-route samples with the final measured left-Dex3
+  posture from the MCAP (`middle_0=-0.0580 rad`). The measured-posture route
+  passed strict self-collision and table-plane checks; its minimum hand-plane
+  clearance was `1.552 mm` at `left_hand_middle_1_link`. No robot connection or
+  command was used for this verification.
+- Repository verification after the change: `276 passed, 4 skipped`; Ruff
+  formatting and lint checks both pass.
+
+## 2026-08-15 — One planner session and explicit task-rejection return
+
+- The tabletop runtime previously started a fresh Python/CUDA process for the
+  supported escape, complete task, and post-contact route check. It also chose
+  finger actions by trajectory list index. Both were orchestration defects,
+  not CuRobo requirements.
+- A single isolated planner now starts and initializes CUDA before SPACE. After
+  loaded settling it receives one request that freezes the supported escape,
+  eight task phases, exact supported return, and two exact-reverse rejection
+  edges. The controller addresses every action by phase name; no `index == 2`
+  or equivalent task semantics remain.
+- The planner retains a 14-coordinate selected-arm-plus-Dex3 collision checker.
+  The seven measured contact angles are inserted into the unchanged frozen arm
+  payload route after closure. No IK, trajectory optimization, process startup,
+  or robot interface participates in that check.
+- Offline replay of retained real run `tabletop_20260814T190430Z` produced a
+  complete lifecycle in `30.96 s` on the laptop GPU, down from `43.96 s` before
+  reusing strict route kinematics. The retained physical contact posture checked
+  all 81 payload samples in `0.010 s` wall time after a one-time `1.81 s` cache
+  build, with the same `1.552 mm` minimum hand-plane clearance as the earlier
+  standalone validation. No robot connection or command was used.
+- No stable grasp, measured-contact route rejection, and contact loss during
+  the 10 mm test are now explicit task outcomes. The first two open at contact
+  and reverse the frozen grasp/approach routes. Test-lift loss first follows the
+  exact frozen 10 mm reverse, then opens and returns. Both restore seated FSM 3.
+  State freshness, transport, fixed-rate controller, or unexpected Dex3 hold
+  faults—and Ctrl+C—still retain the PC2 zero-torque path.
+- Repository verification after the refactor: `278 passed, 4 skipped`; Ruff
+  formatting and lint checks both pass.

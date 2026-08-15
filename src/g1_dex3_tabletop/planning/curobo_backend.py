@@ -307,56 +307,114 @@ def _monotonic_collision_recovery_trajectory(
     )
 
 
-def _self_collision_pair_penetrations(
-    *, robot: dict, q_samples: np.ndarray, device_cfg
-) -> list[dict[tuple[str, str], float]]:
-    """Return positive CuRobo sphere penetration grouped by physical links."""
+class CuroboKinematicCollisionChecker:
+    """Reusable CuRobo FK and strict self-collision state for one robot model."""
 
-    import torch
-    from curobo._src.cost.cost_self_collision import SelfCollisionCost
-    from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
-    from curobo._src.robot.kinematics.kinematics import Kinematics
-    from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
-    from curobo._src.state.state_joint import JointState
+    def __init__(self, *, robot: dict, device_cfg) -> None:
+        from curobo._src.cost.cost_self_collision import SelfCollisionCost
+        from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
+        from curobo._src.robot.kinematics.kinematics import Kinematics
+        from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
 
-    values = np.asarray(q_samples, dtype=np.float64)
-    config = KinematicsCfg.from_data_dict(robot["kinematics"], device_cfg=device_cfg)
-    kinematics = Kinematics(config)
-    state = JointState.from_position(
-        device_cfg.to_device(values), joint_names=kinematics.joint_names
-    )
-    spheres = kinematics.compute_kinematics(state).robot_spheres
-    cost = SelfCollisionCost(
-        SelfCollisionCostCfg(
-            weight=device_cfg.to_device([1.0]),
-            device_cfg=device_cfg,
-            self_collision_kin_config=config.self_collision_config,
-            store_pair_distance=True,
+        self.device_cfg = device_cfg
+        self.config = KinematicsCfg.from_data_dict(robot["kinematics"], device_cfg=device_cfg)
+        self.kinematics = Kinematics(self.config)
+        self.cost = SelfCollisionCost(
+            SelfCollisionCostCfg(
+                weight=device_cfg.to_device([1.0]),
+                device_cfg=device_cfg,
+                self_collision_kin_config=self.config.self_collision_config,
+                store_pair_distance=True,
+            )
         )
-    )
-    cost.setup_batch_tensors(len(values), 1)
-    cost.forward(spheres)
-    distances = cost._pair_distance[:, 0]
-    collision_pairs = config.self_collision_config.collision_pairs
-    sphere_links = config.kinematics_config.link_sphere_idx_map[
-        collision_pairs.to(dtype=torch.int32)
-    ]
-    index_to_name = {
-        value: name for name, value in config.kinematics_config.link_name_to_idx_map.items()
-    }
-    link_pairs = [
-        tuple(sorted((index_to_name[int(a)], index_to_name[int(b)])))
-        for a, b in sphere_links.detach().cpu().numpy()
-    ]
-    result: list[dict[tuple[str, str], float]] = []
-    for sample in distances.detach().cpu().numpy():
-        grouped: dict[tuple[str, str], float] = {}
-        for pair, penetration_m in zip(link_pairs, sample, strict=True):
-            numeric = float(penetration_m)
-            if numeric > 0.0:
-                grouped[pair] = max(grouped.get(pair, 0.0), numeric)
-        result.append(grouped)
-    return result
+
+    def robot_spheres(
+        self,
+        q_samples: np.ndarray,
+        *,
+        joint_names: tuple[str, ...] | None = None,
+    ):
+        from curobo._src.state.state_joint import JointState
+
+        values = np.asarray(q_samples, dtype=np.float64)
+        names = list(joint_names or tuple(self.kinematics.joint_names))
+        state = JointState.from_position(
+            self.device_cfg.to_device(values),
+            joint_names=names,
+        )
+        return self.kinematics.compute_kinematics(state).robot_spheres
+
+    def self_collision_pair_penetrations(
+        self,
+        q_samples: np.ndarray,
+        *,
+        joint_names: tuple[str, ...] | None = None,
+    ) -> list[dict[tuple[str, str], float]]:
+        """Return positive sphere penetration grouped by physical links.
+
+        CuRobo's CUDA kernel identifies the sparse set of colliding sphere
+        pairs. Only those hits cross the CPU boundary.
+        """
+
+        import torch
+
+        values = np.asarray(q_samples, dtype=np.float64)
+        spheres = self.robot_spheres(values, joint_names=joint_names)
+        self.cost.setup_batch_tensors(len(values), 1)
+        self.cost.forward(spheres)
+        pair_hits = torch.nonzero(self.cost._pair_distance[:, 0] > 0.0, as_tuple=False)
+        result: list[dict[tuple[str, str], float]] = [{} for _ in values]
+        if pair_hits.numel() == 0:
+            return result
+
+        collision_pairs = self.config.self_collision_config.collision_pairs
+        sample_indices = pair_hits[:, 0]
+        pair_indices = pair_hits[:, 1]
+        hit_sphere_pairs = collision_pairs[pair_indices].to(dtype=torch.long)
+        sphere_values = spheres.reshape(len(values), -1, 4)
+        first = sphere_values[sample_indices, hit_sphere_pairs[:, 0]]
+        second = sphere_values[sample_indices, hit_sphere_pairs[:, 1]]
+        padding = self.config.self_collision_config.sphere_padding.reshape(-1)
+        penetration = (
+            first[:, 3]
+            + padding[hit_sphere_pairs[:, 0]]
+            + second[:, 3]
+            + padding[hit_sphere_pairs[:, 1]]
+            - torch.linalg.vector_norm(first[:, :3] - second[:, :3], dim=1)
+        )
+        sphere_links = self.config.kinematics_config.link_sphere_idx_map[
+            hit_sphere_pairs.to(dtype=torch.int32)
+        ]
+        index_to_name = {
+            value: name
+            for name, value in self.config.kinematics_config.link_name_to_idx_map.items()
+        }
+        hit_samples = sample_indices.detach().cpu().tolist()
+        hit_links = sphere_links.detach().cpu().tolist()
+        hit_penetrations = penetration.detach().cpu().tolist()
+        for sample_index, (first_link, second_link), penetration_m in zip(
+            hit_samples, hit_links, hit_penetrations, strict=True
+        ):
+            if penetration_m <= 0.0:
+                continue
+            pair = tuple(sorted((index_to_name[first_link], index_to_name[second_link])))
+            result[sample_index][pair] = max(
+                result[sample_index].get(pair, 0.0), float(penetration_m)
+            )
+        return result
+
+
+def _self_collision_pair_penetrations(
+    *,
+    robot: dict,
+    q_samples: np.ndarray,
+    device_cfg,
+    checker: CuroboKinematicCollisionChecker | None = None,
+) -> list[dict[tuple[str, str], float]]:
+    """Return strict collision results, optionally reusing parsed CUDA state."""
+
+    active = checker or CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+    return active.self_collision_pair_penetrations(q_samples)
 
 
 def _validate_curobo_finger_sweep(

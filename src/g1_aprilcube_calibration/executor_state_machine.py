@@ -357,7 +357,7 @@ class PoseExecutor:
         start_error = float(np.max(np.abs(command[0] - current_command)))
         if start_error > _COMMAND_COMPLETION_EPSILON_RAD:
             raise ValueError(
-                f"trajectory start differs from the current command by {start_error:.6f}rad"
+                f"trajectory start differs from the current command by {start_error:.9f}rad"
             )
 
         self._trajectory_time_s = times.copy()

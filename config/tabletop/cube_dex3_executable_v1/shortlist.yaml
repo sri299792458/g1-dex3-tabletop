@@ -1,7 +1,10 @@
 format: g1_aprilcube_executable_grasp_shortlist
 format_version: 1
-shortlist_id: cube_right_executable_v1
-hand_side: right
+shortlist_id: cube_dex3_executable_v1
+applicable_hand_sides: [left, right]
+qualification_source_hand_side: right
+canonical_grasp_frame: GraspGenX_G
+handedness_policy: preserve_object_T_G_and_apply_exact_dex3_side_adapter
 object_id: cube_head
 object_mesh: third_party/aprilcube/models/dex3_safe_cube/mujoco/cube.obj
 object_mesh_sha256: 27c8460e40a85475e87c3cc0d6090c3c9500de4fa7f5728a2462fc099ef3d927

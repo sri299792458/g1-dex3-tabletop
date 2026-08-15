@@ -4,14 +4,24 @@ object:
   dimensions_m: [0.040, 0.040, 0.040]
 table:
   # A single resting cube determines only its supporting plane. It cannot
-  # reveal unseen table edges, footprint, yaw, or thickness, so none are
-  # invented here. The plane guard covers only the moving right wrist, hand,
-  # and attached payload near the manipulation site. Full-robot self-collision
-  # remains active independently.
+  # reveal the complete physical table footprint. This local patch is a
+  # conservative planning aid centred under the cube. It may extend beyond the
+  # real table without weakening safety. The independent plane guard still
+  # validates the complete moving selected wrist/hand/payload route, including
+  # any
+  # samples outside this patch. Full-robot self-collision remains active
+  # independently.
   collision_policy: local_manipulation_geometry_plane
+  open_transit_patch_dimensions_m: [0.400, 0.400, 0.020]
 motion:
   supported_escape_m: 0.100
+  # First raise only one quarter of the 40 mm cube height. This removes table
+  # support while keeping a failed-retention drop close to the tabletop.
+  retention_test_lift_m: 0.010
   payload_lift_m: 0.100
+  # Conservative first-commissioning limit. CuRobo trajectories are uniformly
+  # retimed to this maximum without changing their geometry.
+  maximum_arm_velocity_rad_s: 0.100
 perception:
   minimum_frames: 3
   maximum_translation_spread_mm: 5.0

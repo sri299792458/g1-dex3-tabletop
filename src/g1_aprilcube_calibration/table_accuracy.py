@@ -397,6 +397,8 @@ def detect_hand_target_pose(
             sorted({item.face_name for item in observations if item.face_name is not None})
         ),
     )
+
+
 # Existing table-plan documents retain this callable name; new code uses the
 # target-neutral entry point above.
 detect_hand_cube_pose = detect_hand_target_pose

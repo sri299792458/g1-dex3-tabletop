@@ -5,7 +5,7 @@ Focused Unitree G1 software for two connected operations:
 1. automatically collect dorsal-Dex3 calibration observations and solve the
    fixed-marker camera extrinsic with Mike Ferguson's Ceres optimizer;
 2. use a removable calibration bundle and official NVLabs CuRobo to plan and
-   execute a right-Dex3 40 mm AprilCube pick, 100 mm lift, exact replacement,
+   execute a selected-Dex3 40 mm AprilCube pick, 100 mm lift, exact replacement,
    retreat, and controller handback.
 
 The repository contains no historical manual-teaching pipeline or custom IK.
@@ -17,18 +17,23 @@ rejected approaches, and remaining physical limits.
 
 - Inspection, candidate generation, Ferguson solving, and CuRobo planning do
   not create robot command publishers.
-- CUDA planning runs in a separate Python 3.11 process. ROS/control runs in
-  Python 3.10 and keeps publishing through the commissioned fixed-rate Unitree
-  controller while planning is in progress.
+- CUDA planning runs in one persistent separate Python 3.11 process per task.
+  It is started and warmed before SPACE, never imports Unitree transport code,
+  and remains alive for complete lifecycle planning plus measured-contact
+  validation. ROS/control runs in Python 3.10 and keeps publishing through the
+  commissioned fixed-rate Unitree controller while planning is in progress.
 - Hardware commands require the exact harness/workspace acknowledgement and a
   second interactive SPACE after a read-only live preflight.
 - Standing calibration uses `rt/arm_sdk`, full gravity feedforward, measured
   opposite-arm hold, and the independent PC2 Damp watchdog.
 - Seated tabletop execution uses complete 29-joint `rt/lowcmd` ownership and
   restores Unitree control through the commissioned FSM `0 -> 1 -> 3` path.
-- Failure after command publication stops the local command path and delegates
-  terminal takeover to the independent PC2 watchdog. Planning failure before
-  publication cannot command the robot.
+- No contact, contact-geometry rejection, and failed 10 mm retention are task
+  rejections: the controller opens or lowers as appropriate, follows exact
+  frozen reverse trajectories to the supported start, and restores seated FSM
+  3. State/transport/controller faults and Ctrl+C retain the independent PC2
+  zero-torque safety path. Planning failure before publication cannot command
+  the robot.
 
 These are commissioned control mechanisms, not permission to skip the harness,
 clear-sweep inspection, live preview, or deliberately slow first physical run.
@@ -52,6 +57,7 @@ git submodule update --init --recursive
 ./tools/setup_control_env.sh
 ./tools/setup_planner_env.sh
 ./tools/install_robot_calibration_local.sh
+./tools/setup_recording_benchmark.sh
 ./tools/g1_tabletop.sh inspect
 ```
 
@@ -74,6 +80,11 @@ CuRobo error. A reboot is the first recovery step.
 The hardware commands also require the already commissioned account-local
 CycloneDDS runtime, PC2 watchdog installation and SSH key, and the RealSense ROS
 color node publishing the profile frozen in the hardware YAML.
+
+The recording setup command installs the MCAP storage plugin under ignored
+`deps/` without sudo. The raw topic contract, lifecycle, artifact layout,
+failure semantics, and storage budget are documented in
+[`docs/data-recording.md`](docs/data-recording.md).
 
 ## Automatic Dex3 calibration
 
@@ -118,14 +129,15 @@ to the repository default. It never rewrites the base URDF.
 
 Physical starting state: G1 seated in FSM 3, both arms supported and stationary
 on the table, the printed 40 mm `dex3_safe_cube` resting flat on any face and
-visible, the complete
-right-arm sweep clear, and the RealSense node running. Tabletop yaw is free;
+visible, the complete selected-arm sweep clear, and the RealSense node running.
+Tabletop yaw is free;
 the detected face identity is only a coordinate convention and does not limit
 which face may be on top.
 
 ```bash
 cd /home/kanth042/g1-dex3-tabletop
 ./tools/g1_tabletop_hardware.sh run-tabletop \
+  --arm right \
   --network-interface enp134s0 \
   --calibration-bundle "$RUN/solve/calibration_bundle.json" \
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
@@ -134,21 +146,59 @@ cd /home/kanth042/g1-dex3-tabletop
 Before SPACE, this verifies the seated stationary state, both Dex3 states,
 camera profile, and cube observation without creating publishers. After SPACE,
 it acquires exact measured 29-joint lowcmd control, applies dual-Dex3 gravity
-feedforward, observes the cube again in the loaded state, and asks isolated
-CuRobo workers for:
+feedforward, observes the cube again in the loaded state, and sends one complete
+lifecycle request to the already-warm isolated CuRobo worker for:
 
 1. a straight supported-hand escape along the observed support-plane normal;
-2. complete-path selection from the 15 committed GraspGen-X/Isaac-qualified
-   Dex3 grasps, with every rejected candidate and failure stage recorded;
-3. approach, grasp, a collision-aware 27-sphere conservative payload lift,
-   exact reverse replacement, release, retreat, clearance return, and exact
-   reverse supported return.
+2. bounded branch-aware complete-path selection from the 15 shared
+   GraspGen-X/Isaac-qualified Dex3 grasps, with the exact side adapter applied
+   and every rejected IK branch and failure stage recorded;
+3. approach and smooth finger closure toward the qualified grasp posture;
+4. a collision-aware 27-sphere conservative payload lift, exact reverse
+   replacement, release, retreat, clearance return, and exact reverse
+   supported return.
 
-Only the moving right wrist, articulated hand, and payload are checked against
+Physical closure does not require the fingers to reproduce the exact final
+PhysX joint vector. The live controller first observes finger motion in the
+commanded closing direction, then accepts a contact posture only when at least
+one finger remains more than the commissioned `0.08 rad` endpoint tolerance
+from the empty-hand target and the posture stays within the existing `0.01 rad`
+stability band for `0.5 s`. No other finger is required to reach the target.
+The already-recorded Dex3 pressure fields remain available in the MCAP for
+offline analysis, but pressure is not a live pass/fail signal.
+
+Because the physical contact posture can differ from the simulated posture,
+the same worker rechecks the frozen payload route using the measured finger
+angles; it does not replan or alter the arm samples. Its arm-plus-finger FK and
+self-collision model is built once with the lifecycle and retained in memory.
+The planned lift is split at the first sample at least `10 mm` above contact
+without changing any sample. After that small lift, the same blocked finger
+posture must still be present before the controller continues to the configured
+full lift. A failed test follows the exact frozen 10 mm reverse, opens on the
+table, retreats, returns to the supported start, and restores seated control.
+
+Only the moving selected wrist, articulated hand, and payload are checked against
 the locally observed support plane because one cube cannot reveal the table's
-finite edges. Full G1 self-collision—including the fixed left arm, torso, legs,
-both hands, and marker plates—remains enabled. The left arm receives no changing
-target and is held at the measured takeover state with gravity feedforward.
+finite edges. Full G1 self-collision—including the fixed opposite arm, torso,
+legs, both hands, and marker plates—remains enabled. The opposite arm receives
+no changing target and is held at the measured takeover state with gravity
+feedforward. The exact live start must also be collision-free in CuRobo's sphere
+model: an overlap aborts before changing motion and prints the link pair and
+penetration in millimetres so the operator can reposition the robot and rerun.
+There is no start-state collision exception. Use `--arm left` to run the same
+shared grasp set and lifecycle with the left Dex3.
+
+For initial physical commissioning, `config/tabletop/task.yaml` limits every
+selected-arm trajectory to `0.100 rad/s`. The limit is hash-bound into each
+planning request and stored in planner provenance; the executor independently
+rejects a plan above the hardware configuration's `0.200 rad/s` ceiling. Dex3
+posture changes retain their separately commissioned two-second smooth ramp.
+
+The persistent planner's complete output is streamed to the terminal and
+retained as `planner.log` in that run directory. Terminal IK failures name the candidate
+and colliding links/scene object with penetration or signed clearance when a
+Cartesian-converged branch exists; otherwise they report the best pose residual.
+The top-level failure status includes that final diagnostic and log path.
 
 The task is a visual-localization and motion-execution test, not an independent
 ground-truth calibration measurement. The selected calibration bundle itself
@@ -156,6 +206,18 @@ records its holdout residuals and validation status. The CUDA/UVM issue was
 cleared by reboot and the complete planning path has been exercised offline on
 the laptop GPU; physical execution still requires a deliberately slow first
 commissioning run.
+
+After SPACE, the same command also records a general raw episode under
+`runs/tabletop_<UTC>/raw_episode/`: official complete G1 state/IMU and lowcmd,
+both Dex3 states and commands, raw RGB, and CameraInfo. It is a separate plain
+MCAP process with no live compression; task-specific cube and CuRobo artifacts
+remain the adjacent JSON files. Recording starts before command publishers and
+ends after terminal controller handback.
+
+Raw camera recording is enabled by default. For a temporary lower-throughput
+run, add `--skip-camera-recording`; this removes both RGB and CameraInfo from
+the MCAP completeness contract but leaves the live camera and all perception
+behavior unchanged.
 
 ## Verification
 
@@ -169,6 +231,29 @@ cd /home/kanth042/g1-dex3-tabletop
 ./tools/g1_tabletop.sh inspect
 ```
 
-CuRobo tests require the planner environment and working CUDA. The worker
-contract is file/hash based: control code never imports CuRobo and the planner
-process never imports or constructs Unitree transports.
+CuRobo tests require the planner environment and working CUDA. The persistent
+worker protocol still exchanges file/hash-bound immutable requests and results:
+control code never imports CuRobo and the planner process never imports or
+constructs Unitree transports.
+
+### No-robot recording interference benchmark
+
+Before adding continuous rosbag capture to a hardware run, exercise the exact
+laptop-side load without exposing any Unitree topic:
+
+```bash
+cd /home/kanth042/g1-dex3-tabletop
+./tools/g1_recording_benchmark.sh
+```
+
+The launcher forces `ROS_LOCALHOST_ONLY=1` on an isolated ROS domain and creates
+only synthetic `/g1_recording_benchmark/...` topics. It compares the existing
+250 Hz Python control-driver timing under three conditions: no recorder,
+state/command-only plain MCAP, and state/command plus 1280x720 RGB8 at 15 Hz.
+The account-local Humble MCAP plugin is downloaded into ignored `deps/`; no sudo
+or system installation is used. Reports and bags are retained under ignored
+`work/recording_benchmark/`.
+
+This benchmark detects laptop scheduling, DDS, memory-copy, and disk contention.
+It cannot commission physical recording safety or replace a stationary
+robot-connected A/B test using the official Unitree topics.

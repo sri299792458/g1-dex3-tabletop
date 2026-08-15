@@ -35,10 +35,9 @@ PROVENANCE = ROOT / "config/provenance.json"
 CALIBRATION_URDF = ROOT / "config/urdf/g1_29dof_rev_1_0_g1pilot_collision.urdf"
 ROBOT_CALIBRATION = ROOT / "third_party/robot_calibration"
 ROBOT_CALIBRATION_RUNNER = ROOT / "tools/g1_robot_calibration.sh"
-DEFAULT_HARDWARE = ROOT / "config/hardware_dex3_aruco.yaml"
 DEFAULT_TASK_CONFIG = ROOT / "config/tabletop/task.yaml"
 DEFAULT_CUBE_CONFIG = ROOT / "third_party/aprilcube/models/dex3_safe_cube/config.json"
-DEFAULT_GRASP_SHORTLIST = ROOT / "config/tabletop/cube_right_executable_v1/shortlist.yaml"
+DEFAULT_GRASP_SHORTLIST = ROOT / "config/tabletop/cube_dex3_executable_v1/shortlist.yaml"
 DEFAULT_QUALITY = ROOT / "config/capture_quality_dex3_aruco.yaml"
 
 
@@ -143,9 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
         "run-tabletop",
         help="single-approval seated AprilCube pick, 100mm lift, and exact replacement",
     )
+    tabletop.add_argument("--arm", choices=("left", "right"), required=True)
     tabletop.add_argument("--network-interface", required=True)
     tabletop.add_argument("--domain-id", type=int, default=0)
-    tabletop.add_argument("--hardware-config", type=Path, default=DEFAULT_HARDWARE)
+    tabletop.add_argument("--hardware-config", type=Path)
     tabletop.add_argument("--calibration-bundle", type=Path, default=DEFAULT_BUNDLE)
     tabletop.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
     tabletop.add_argument("--cube-config", type=Path, default=DEFAULT_CUBE_CONFIG)
@@ -174,6 +174,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tabletop.add_argument("--no-window", action="store_true")
     tabletop.add_argument(
+        "--skip-camera-recording",
+        action="store_true",
+        help=("exclude raw RGB and CameraInfo from the MCAP; camera perception remains active"),
+    )
+    tabletop.add_argument(
         "--lock-file",
         type=Path,
         default=Path("/tmp/g1-dex3-tabletop-command.lock"),
@@ -196,6 +201,7 @@ def run_inspect(_args: argparse.Namespace) -> int:
         "calibration_bundle_id": bundle.bundle_id,
         "calibration_bundle_sha256": bundle.content_sha256,
         "running_notes": str(ROOT / "running_notes.md"),
+        "data_recording_documentation": str(ROOT / "docs/data-recording.md"),
         "planner_environment": str(ROOT / ".venv-planner"),
         "control_environment": str(ROOT / ".venv"),
     }
@@ -397,6 +403,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run-tabletop":
         from g1_dex3_tabletop.hardware_tabletop import run_tabletop
 
+        hardware_path, _target_path = _arm_paths(args.arm)
+        if args.hardware_config is None:
+            args.hardware_config = hardware_path
         handlers["run-tabletop"] = run_tabletop
     if args.command == "collect-calibration":
         from g1_dex3_tabletop.hardware_calibration import run_collect_calibration
@@ -409,6 +418,9 @@ def main(argv: list[str] | None = None) -> int:
         handlers["collect-calibration"] = run_collect_calibration
     try:
         return handlers[args.command](args)
+    except KeyboardInterrupt:
+        print("interrupted by operator", file=sys.stderr)
+        return 130
     except (
         FileNotFoundError,
         FileExistsError,
