@@ -14,6 +14,7 @@ from g1_dex3_tabletop.planning.g1_model import (
     corrected_joint_positions,
     grasp_T_palm,
     model_source_hashes,
+    tabletop_motion_joint_names,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +130,29 @@ def test_tabletop_model_reserves_attached_payload_spheres(arm: str) -> None:
     assert robot["kinematics"]["self_collision_buffer"][
         f"{arm}_shoulder_yaw_link"
     ] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("arm", ("left", "right"))
+def test_offline_tabletop_model_can_expose_waist_yaw_with_one_arm(arm: str) -> None:
+    pytest.importorskip("curobo")
+    q29 = tuple(0.01 * index for index in range(29))
+    snapshot = RobotSnapshot(q29, (0.0,) * 7, (0.0,) * 7)
+
+    robot, reference = build_tabletop_robot_config(
+        arm=arm,
+        snapshot=snapshot,
+        joint_position_offsets_rad={},
+        active_finger_q_rad=(0.0,) * 7,
+        include_waist_yaw=True,
+    )
+
+    names = tabletop_motion_joint_names(arm, include_waist_yaw=True)
+    assert names == ("waist_yaw_joint", *tabletop_motion_joint_names(arm))
+    assert len(reference) == 8
+    assert reference[0] == pytest.approx(q29[12])
+    assert "waist_yaw_joint" not in robot["kinematics"]["lock_joints"]
+    opposite = "right" if arm == "left" else "left"
+    assert f"{opposite}_shoulder_pitch_joint" in robot["kinematics"]["lock_joints"]
 
 
 def test_graspgenx_g_to_palm_transform_is_side_specific() -> None:

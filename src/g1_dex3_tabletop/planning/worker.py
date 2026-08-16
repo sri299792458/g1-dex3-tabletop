@@ -23,6 +23,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     validate_retention_route,
 )
 from g1_dex3_tabletop.planning.tabletop_session import TabletopPlanningSession
+from g1_dex3_tabletop.planning.waist_yaw_analysis import analyze_waist_yaw_from_paths
 from g1_dex3_tabletop.tabletop_contracts import (
     CharucoSupportedEscapeRequest,
     RetentionRouteValidationRequest,
@@ -87,6 +88,27 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--plan", type=Path, required=True)
     benchmark.add_argument("--output", type=Path, required=True)
     benchmark.add_argument("--maximum-steps", type=int, default=300)
+    waist = subparsers.add_parser(
+        "analyze-waist-yaw",
+        help=(
+            "compare locked-waist and bounded waist-yaw pregrasp IK on a retained request"
+        ),
+    )
+    waist.add_argument("--request", type=Path, required=True)
+    waist.add_argument("--output", type=Path, required=True)
+    waist.add_argument(
+        "--waist-half-range-rad",
+        type=float,
+        action="append",
+        required=True,
+        help="start-relative yaw half range; repeat to compare several bounds",
+    )
+    waist.add_argument(
+        "--candidate-id",
+        action="append",
+        default=[],
+        help="limit the comparison to an exact retained grasp candidate; repeat if needed",
+    )
     return parser
 
 
@@ -207,6 +229,18 @@ def main(argv: list[str] | None = None) -> int:
                 args.plan,
                 args.output,
                 maximum_steps=args.maximum_steps,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if args.command == "analyze-waist-yaw":
+            if args.output.exists():
+                raise FileExistsError(f"planner output already exists: {args.output}")
+            result = analyze_waist_yaw_from_paths(
+                args.request,
+                args.output,
+                waist_half_ranges_rad=tuple(args.waist_half_range_rad),
+                candidate_ids=tuple(args.candidate_id),
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
             )
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0

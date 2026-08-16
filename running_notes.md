@@ -3207,3 +3207,52 @@ the full two-color plate and check the marker with the detector.
   route validation remain unchanged. Offline verification passes with
   `285 passed, 4 skipped`; Ruff and Git whitespace checks pass. No robot
   command was sent.
+
+## 2026-08-16 — Bounded waist-yaw planning study
+
+- Commit `96f11d2` is the local checkpoint immediately before this study. It
+  adds the rolling CuRobo MPC command buffer, persistent worker seam, 250 Hz
+  executor interpolation, and pelvis/torso IMU observation plumbing. The
+  checkpoint passed `315` tests with `4` skipped; the user-owned dirty
+  `third_party/aprilcube` submodule was deliberately excluded.
+- The existing tabletop planner and hardware executor are seven-arm-joint
+  contracts. The complete 29-joint lowcmd transport holds waist yaw at its
+  exact takeover value. Waist yaw was therefore added first as a read-only
+  planning study, not hidden inside a seven-joint executable trajectory.
+- `g1-curobo-worker analyze-waist-yaw` constructs NVIDIA's complete G1/Dex3
+  model with `waist_yaw_joint + selected seven arm joints` active. It compares
+  the locked baseline with explicit start-relative yaw bounds supplied on the
+  command line. Each result uses CuRobo's collision-constrained pregrasp IK and
+  then independently rechecks strict full-robot self collision, cube
+  collision, and the selected wrist/hand table-plane guard. Artifacts state
+  `commands_robot: false` and cannot be consumed by the hardware executor.
+- Simply exposing the URDF range is invalid for seated manipulation. On retained
+  run `tabletop_20260815T224443Z`, unconstrained CuRobo solutions changed waist
+  yaw by as much as `2.599 rad` (`148.9 deg`). This was useful for detecting the
+  missing policy but is not retained as an executable option.
+- The exact grasp selected by each of four retained runs was compared at locked,
+  `+/-0.1`, `+/-0.2`, `+/-0.3`, and `+/-0.5 rad` yaw ranges. The two older
+  requests were normalized into ignored `work/` artifacts because their stored
+  hashes predate the current request schema; production hash checks were not
+  weakened.
+
+  | Retained run | Locked best peak arm move | Best bounded result | Peak reduction | Arm L2 change |
+  | --- | ---: | ---: | ---: | ---: |
+  | `20260815T224443Z` | `0.718 rad` | `0.724 rad` at `+/-0.1 rad` | none | `0.4%` lower |
+  | `20260815T162444Z` | `0.835 rad` | `0.753 rad` at `+/-0.1 rad` | `9.8%` | `10.5%` higher |
+  | `20260814T190430Z` | `0.898 rad` | `0.766 rad` at `+/-0.1 rad` | `14.7%` | `1.4%` lower |
+  | `20260814T183817Z` | `1.017 rad` | `0.918 rad` at `+/-0.2 rad` | `9.7%` | `4.0%` lower |
+
+- The effect is useful but not monotonic. Three of four grasps admit a smaller
+  peak arm excursion, but the newest grasp gains nothing, one case trades peak
+  reduction for greater total arm motion, and `+/-0.3`/`+/-0.5 rad` frequently
+  add strict cube-collision branches. Waist yaw should therefore be treated as
+  lightly used redundancy with an explicit cost, not as free reach.
+- This study proves only pregrasp IK feasibility. Before waist yaw can command
+  hardware, the serialized trajectory must explicitly name eight coordinates,
+  the complete-body lowcmd target must interpolate waist yaw in the existing
+  fixed-rate process, full routes must be revalidated, and a deliberately small
+  seated waist-motion commissioning test must pass. No robot command was sent.
+- Verification after the study: planner-environment focused tests `10 passed`;
+  control-environment repository tests `317 passed, 6 skipped`; Ruff and Git
+  whitespace checks pass.

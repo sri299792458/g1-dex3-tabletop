@@ -38,6 +38,7 @@ VIRTUAL_BASE_JOINT_NAMES = (
     "base_j_ztheta",
 )
 DEX3_CANONICAL_PROFILE = Path("config/tabletop/dex3_rev1_canonical_profile.json")
+WAIST_YAW_JOINT_NAME = "waist_yaw_joint"
 
 
 def palm_link(arm: str) -> str:
@@ -50,6 +51,23 @@ def grasp_frame(arm: str) -> str:
 
 def attachment_link(arm: str) -> str:
     return f"{validate_arm_side(arm)}_attached_object"
+
+
+def tabletop_motion_joint_names(
+    arm: str,
+    *,
+    include_waist_yaw: bool = False,
+) -> tuple[str, ...]:
+    """Return the exact active-coordinate order for tabletop planning.
+
+    Hardware execution remains seven-arm-joint only.  The optional eighth
+    coordinate exists so retained observations can be studied with waist yaw
+    unlocked before the full-body command contract is commissioned.
+    """
+
+    selected = validate_arm_side(arm)
+    prefix = (WAIST_YAW_JOINT_NAME,) if include_waist_yaw else ()
+    return (*prefix, *arm_joint_names(selected))
 
 
 def curobo_checkout_root() -> Path:
@@ -240,13 +258,16 @@ def build_tabletop_robot_config(
     snapshot: RobotSnapshot,
     joint_position_offsets_rad: dict[str, float],
     active_finger_q_rad: tuple[float, ...],
+    include_waist_yaw: bool = False,
 ) -> tuple[dict[str, Any], tuple[float, ...]]:
     """Selected-arm G1/Dex3 model with GraspGenX G and attachment frames.
 
-    All legs, waist, the opposite arm, and both hands are locked to the measured
-    snapshot except the seven selected-arm joints. The selected finger posture
-    is explicit because each motion stage is planned against its actual hand
-    geometry (initial, open, or closed).
+    By default all legs, waist, the opposite arm, and both hands are locked to
+    the measured snapshot except the seven selected-arm joints.  Offline waist
+    studies may additionally expose waist yaw; no hardware path enables that
+    option yet.  The selected finger posture is explicit because each motion
+    stage is planned against its actual hand geometry (initial, open, or
+    closed).
     """
 
     selected = validate_arm_side(arm)
@@ -267,7 +288,10 @@ def build_tabletop_robot_config(
     selected_grasp_frame = grasp_frame(selected)
     selected_attachment_link = attachment_link(selected)
     robot, reference = build_robot_config_for_active_joints(
-        active_joint_names=tuple(arm_joint_names(selected)),
+        active_joint_names=tabletop_motion_joint_names(
+            selected,
+            include_waist_yaw=include_waist_yaw,
+        ),
         snapshot=adjusted,
         joint_position_offsets_rad=joint_position_offsets_rad,
         tool_frames=(selected_grasp_frame, "torso_link"),
