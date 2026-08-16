@@ -36,8 +36,9 @@ This keeps recording failure from becoming a new robot-control decision.
 
 ## One Run, One Raw Episode
 
-Every approved `run-tabletop` invocation creates this structure inside its
-normal run directory:
+Every approved `run-tabletop` or `measure-seat-compliance` invocation creates
+the same raw-episode subtree inside its normal run directory. Task-specific JSON
+files remain beside it.
 
 ```text
 runs/tabletop_<UTC>/
@@ -63,7 +64,7 @@ artifact impersonates the other.
 
 ## Topic Contract
 
-The `g1_seated_tabletop_raw_v1` profile records the official Unitree transport
+The `g1_seated_tabletop_raw_v2` profile records the official Unitree transport
 streams through their ROS graph names. CycloneDDS exposes Unitree's SDK channel
 `rt/lowstate` as ROS topic `/lowstate`: the SDK's `rt` partition is not part of
 the ROS topic name. The same mapping applies to LowCmd and Dex3.
@@ -71,6 +72,10 @@ the ROS topic name. The same mapping applies to LowCmd and Dex3.
 | Topic | Message type | Meaning | Required |
 |---|---|---|---:|
 | `/lowstate` | `unitree_hg/msg/LowState` | Complete measured G1 state, including IMU, motor state, mode, tick, and remote fields | yes |
+| `/secondary_imu` | `unitree_hg/msg/IMUState` | Independent torso IMU | yes |
+| `/camera/gyro/sample` | `sensor_msgs/msg/Imu` | Raw D435i gyroscope | yes |
+| `/camera/accel/sample` | `sensor_msgs/msg/Imu` | Raw D435i accelerometer | yes |
+| `/tf_static` | `tf2_msgs/msg/TFMessage` | Factory transforms among D435i depth, color, gyro, and accel frames | yes |
 | `/lowcmd` | `unitree_hg/msg/LowCmd` | Complete 29-joint debug-lowcmd command stream used by the seated task | yes |
 | `/dex3/left/state` | `unitree_hg/msg/HandState` | Measured left Dex3 motor state | yes |
 | `/dex3/right/state` | `unitree_hg/msg/HandState` | Measured right Dex3 motor state | yes |
@@ -78,11 +83,13 @@ the ROS topic name. The same mapping applies to LowCmd and Dex3.
 | `/dex3/right/cmd` | `unitree_hg/msg/HandCmd` | Right Dex3 motor commands | yes |
 | `/camera/color/image_raw` | `sensor_msgs/msg/Image` | Raw head-camera RGB image | yes |
 | `/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` | Intrinsics and rectified camera profile | yes |
+| `/camera/depth/image_rect_raw` | `sensor_msgs/msg/Image` | Native unaligned 640x480 Z16 depth | yes |
+| `/camera/depth/camera_info` | `sensor_msgs/msg/CameraInfo` | Native depth intrinsics and profile | yes |
 
 Camera recording is enabled by default. Passing `--skip-camera-recording`
-removes both `/camera/color/image_raw` and `/camera/color/camera_info` from the
-selected profile and from the completeness audit. It does not stop the
-RealSense, remove camera preflight, or change cube perception and planning.
+removes RGB, native depth, and both CameraInfo topics from the selected profile
+and completeness audit. It retains the RealSense gyro, accelerometer, and
+`/tf_static`; it also does not stop the RealSense or remove live perception.
 The manifest records `profile.camera_recording_enabled` so a state-only episode
 cannot be mistaken for a dropped-camera episode.
 
@@ -111,8 +118,10 @@ streams as follows:
 - `/lowstate`, `/lowcmd`, and Dex3 topics use laptop ROS/DDS receipt time
   for cross-topic bag alignment. Unitree `tick` and other device fields remain
   in the original message and must not be discarded.
-- RGB and CameraInfo retain the RealSense ROS producer's message header stamp as
-  well as the bag record timestamp.
+- RGB, depth, both CameraInfo streams, and D435i IMUs retain the RealSense ROS
+  producer's message header stamp as well as the bag record timestamp.
+- `/secondary_imu` has no ROS header; use laptop DDS receipt time. `/tf_static`
+  retains each transform's producer header stamp.
 - Host time synchronization remains an operational prerequisite. The bag does
   not repair a clock that was reset or unsynchronized during capture.
 
@@ -180,8 +189,10 @@ available if any derived job fails.
 The no-robot benchmark at
 `work/recording_benchmark/20260814T160128Z/report.json` measured approximately
 `39.86 MiB/s` for state/command topics plus raw 1280x720 RGB8 at 15 Hz. Budget
-about `2.4 GiB/min` and check free space before a physical run. A nominal
-24 GiB free allocation is only about ten minutes at that measured rate.
+an additional measured `8.9 MiB/s` for native depth plus camera motion streams,
+or roughly `2.9 GiB/min` for the current combined profile, and check free space
+before a physical run. A nominal 24 GiB free allocation is only about eight
+minutes at that conservative combined rate.
 
 ## One-Time Account-Local Setup
 

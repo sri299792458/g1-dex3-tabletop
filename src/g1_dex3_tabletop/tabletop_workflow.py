@@ -15,6 +15,7 @@ from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.tabletop_contracts import (
     SupportedEscapePlan,
     TabletopExecutionPlan,
+    TabletopFixture,
     TabletopObservation,
     TabletopTaskPlan,
     TabletopTaskRequest,
@@ -46,6 +47,8 @@ def build_tabletop_request(
     calibration_bundle_path: str | Path,
     grasp_shortlist_path: str | Path,
     task_config_path: str | Path,
+    presentation_id: str = "direct",
+    fixture: TabletopFixture | None = None,
 ) -> TabletopTaskRequest:
     task = load_task_config(task_config_path)
     if CalibrationBundle.load(calibration_bundle_path).content_sha256 != (
@@ -68,6 +71,8 @@ def build_tabletop_request(
         calibration_bundle_sha256=calibration_bundle.content_sha256,
         grasp_shortlist_path=str(relative_shortlist),
         grasp_shortlist_sha256=file_sha256(shortlist),
+        presentation_id=presentation_id,
+        fixture=fixture,
         object_dimensions_m=tuple(task["object"]["dimensions_m"]),
         open_transit_table_patch_dimensions_m=tuple(
             task["table"]["open_transit_patch_dimensions_m"]
@@ -113,6 +118,8 @@ def request_at_clearance(
         calibration_bundle_sha256=loaded_request.calibration_bundle_sha256,
         grasp_shortlist_path=loaded_request.grasp_shortlist_path,
         grasp_shortlist_sha256=loaded_request.grasp_shortlist_sha256,
+        presentation_id=loaded_request.presentation_id,
+        fixture=loaded_request.fixture,
         object_dimensions_m=loaded_request.object_dimensions_m,
         open_transit_table_patch_dimensions_m=(
             loaded_request.open_transit_table_patch_dimensions_m

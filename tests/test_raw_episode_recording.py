@@ -13,6 +13,10 @@ def test_tabletop_topic_contract_uses_official_general_streams() -> None:
 
     assert topics == {
         "/lowstate": "unitree_hg/msg/LowState",
+        "/secondary_imu": "unitree_hg/msg/IMUState",
+        "/camera/gyro/sample": "sensor_msgs/msg/Imu",
+        "/camera/accel/sample": "sensor_msgs/msg/Imu",
+        "/tf_static": "tf2_msgs/msg/TFMessage",
         "/lowcmd": "unitree_hg/msg/LowCmd",
         "/dex3/left/state": "unitree_hg/msg/HandState",
         "/dex3/right/state": "unitree_hg/msg/HandState",
@@ -20,8 +24,15 @@ def test_tabletop_topic_contract_uses_official_general_streams() -> None:
         "/dex3/right/cmd": "unitree_hg/msg/HandCmd",
         "/camera/color/image_raw": "sensor_msgs/msg/Image",
         "/camera/color/camera_info": "sensor_msgs/msg/CameraInfo",
+        "/camera/depth/image_rect_raw": "sensor_msgs/msg/Image",
+        "/camera/depth/camera_info": "sensor_msgs/msg/CameraInfo",
     }
     assert not any("cube" in name or "plan" in name or "grasp" in name for name in topics)
+    torso_imu = next(
+        topic for topic in recording.TABLETOP_RAW_TOPICS if topic.name == "/secondary_imu"
+    )
+    assert "torso IMU" in torso_imu.role
+    assert torso_imu.required is True
 
 
 def test_camera_recording_is_on_by_default_and_can_be_excluded_as_one_pair() -> None:
@@ -34,8 +45,16 @@ def test_camera_recording_is_on_by_default_and_can_be_excluded_as_one_pair() -> 
     assert default_topics - state_only_topics == {
         "/camera/color/image_raw",
         "/camera/color/camera_info",
+        "/camera/depth/image_rect_raw",
+        "/camera/depth/camera_info",
     }
     assert state_only_topics == {topic.name for topic in recording.TABLETOP_STATE_COMMAND_TOPICS}
+    assert {
+        "/secondary_imu",
+        "/camera/gyro/sample",
+        "/camera/accel/sample",
+        "/tf_static",
+    } <= state_only_topics
 
 
 def test_tabletop_cli_records_camera_by_default_and_exposes_explicit_skip() -> None:
@@ -54,6 +73,23 @@ def test_tabletop_cli_records_camera_by_default_and_exposes_explicit_skip() -> N
         build_parser().parse_args([*command, "--skip-camera-recording"]).skip_camera_recording
         is True
     )
+
+
+def test_seat_compliance_cli_records_camera_and_runs_both_arms() -> None:
+    command = [
+        "measure-seat-compliance",
+        "--network-interface",
+        "test0",
+        "--chair-condition",
+        "cushion",
+        "--confirm",
+        "test acknowledgement",
+    ]
+
+    args = build_parser().parse_args(command)
+    assert args.repetitions == 5
+    assert args.skip_camera_recording is False
+    assert not hasattr(args, "arm")
 
 
 def test_recorder_command_is_plain_uncompressed_mcap(tmp_path: Path) -> None:

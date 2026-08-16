@@ -24,6 +24,7 @@ from g1_dex3_tabletop.planning.contracts import (
     _finite_vector,
     atomic_write_json,
 )
+from g1_dex3_tabletop.planning.dex3_handedness import dex3_execution_profile
 
 
 def _hash(document: dict[str, Any]) -> str:
@@ -95,6 +96,211 @@ class TabletopObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class CharucoBoardObservation:
+    """One fixed-table ChArUco observation paired with the complete robot state."""
+
+    snapshot: RobotSnapshot
+    camera_T_board: tuple[tuple[float, ...], ...]
+    camera_profile_sha256: str
+    source_frame_sha256: tuple[str, ...]
+    translation_spread_mm: float
+    rotation_spread_deg: float
+    board_spec: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "snapshot",
+            self.snapshot
+            if isinstance(self.snapshot, RobotSnapshot)
+            else RobotSnapshot.from_dict(self.snapshot),
+        )
+        object.__setattr__(
+            self,
+            "camera_T_board",
+            _finite_transform(self.camera_T_board, "camera_T_board"),
+        )
+        if len(self.camera_profile_sha256) != 64:
+            raise ValueError("camera profile SHA-256 must contain 64 characters")
+        object.__setattr__(
+            self,
+            "source_frame_sha256",
+            tuple(str(value) for value in self.source_frame_sha256),
+        )
+        if len(self.source_frame_sha256) < 3 or any(
+            len(value) != 64 for value in self.source_frame_sha256
+        ):
+            raise ValueError("ChArUco observation requires at least three frame hashes")
+        for name in ("translation_spread_mm", "rotation_spread_deg"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        expected_spec = {
+            "squares_x": 6,
+            "squares_y": 9,
+            "square_length_mm": 30.0,
+            "marker_length_mm": 22.0,
+            "dictionary_name": "DICT_5X5_50",
+            "legacy_pattern": False,
+            "active_dimensions_mm": [180.0, 270.0],
+            "marker_count": 27,
+            "charuco_corner_count": 40,
+        }
+        if self.board_spec != expected_spec:
+            raise ValueError("ChArUco observation uses a different frozen table board")
+        object.__setattr__(self, "board_spec", dict(self.board_spec))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot": self.snapshot.to_dict(),
+            "camera_T_board": [list(row) for row in self.camera_T_board],
+            "camera_profile_sha256": self.camera_profile_sha256,
+            "source_frame_sha256": list(self.source_frame_sha256),
+            "translation_spread_mm": self.translation_spread_mm,
+            "rotation_spread_deg": self.rotation_spread_deg,
+            "board_spec": {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in self.board_spec.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CharucoBoardObservation:
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True)
+class CharucoSupportedEscapeRequest:
+    """Hash-bound 100 mm supported escape using a fixed ChArUco table plane."""
+
+    observation: CharucoBoardObservation
+    arm: str
+    torso_T_camera: tuple[tuple[float, ...], ...]
+    joint_position_offsets_rad: dict[str, float]
+    calibration_bundle_sha256: str
+    supported_escape_m: float = 0.100
+    maximum_arm_velocity_rad_s: float = 0.100
+    random_seed: int = 17
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    operation: str = "plan_charuco_supported_escape"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PLANNER_SCHEMA_VERSION:
+            raise ValueError("unsupported ChArUco escape request schema version")
+        if self.operation != "plan_charuco_supported_escape":
+            raise ValueError("unsupported ChArUco escape request operation")
+        if not isinstance(self.observation, CharucoBoardObservation):
+            object.__setattr__(
+                self,
+                "observation",
+                CharucoBoardObservation.from_dict(self.observation),
+            )
+        object.__setattr__(self, "arm", validate_arm_side(self.arm))
+        object.__setattr__(
+            self,
+            "torso_T_camera",
+            _finite_transform(self.torso_T_camera, "torso_T_camera"),
+        )
+        offsets = {
+            str(name): float(value) for name, value in self.joint_position_offsets_rad.items()
+        }
+        if any(not np.isfinite(value) for value in offsets.values()):
+            raise ValueError("joint position offsets must be finite")
+        object.__setattr__(self, "joint_position_offsets_rad", offsets)
+        if len(self.calibration_bundle_sha256) != 64:
+            raise ValueError("calibration bundle SHA-256 must contain 64 characters")
+        for name in ("supported_escape_m", "maximum_arm_velocity_rad_s"):
+            value = float(getattr(self, name))
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be positive and finite")
+        if not isinstance(self.random_seed, int):
+            raise TypeError("random_seed must be an integer")
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "operation": self.operation,
+            "observation": self.observation.to_dict(),
+            "arm": self.arm,
+            "torso_T_camera": [list(row) for row in self.torso_T_camera],
+            "joint_position_offsets_rad": self.joint_position_offsets_rad,
+            "calibration_bundle_sha256": self.calibration_bundle_sha256,
+            "supported_escape_m": self.supported_escape_m,
+            "maximum_arm_velocity_rad_s": self.maximum_arm_velocity_rad_s,
+            "random_seed": self.random_seed,
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CharucoSupportedEscapeRequest:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        request = cls(**values)
+        if expected_hash is not None and expected_hash != request.content_sha256:
+            raise ValueError("ChArUco escape request SHA-256 mismatch")
+        return request
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> CharucoSupportedEscapeRequest:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class TabletopFixture:
+    """One immutable object presenter whose pose is derived from the cube."""
+
+    fixture_id: str
+    mesh_path: str
+    mesh_sha256: str
+    mesh_scale: tuple[float, ...]
+    support_height_m: float
+    cube_pose_contract: str = "centred_and_yaw_aligned"
+
+    def __post_init__(self) -> None:
+        if not self.fixture_id.strip():
+            raise ValueError("fixture ID must be non-empty")
+        path = Path(self.mesh_path)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("fixture mesh path must be repository-relative")
+        if len(self.mesh_sha256) != 64:
+            raise ValueError("fixture mesh SHA-256 must contain 64 characters")
+        object.__setattr__(
+            self,
+            "mesh_scale",
+            _finite_vector(self.mesh_scale, 3, "fixture mesh scale"),
+        )
+        if any(value <= 0.0 for value in self.mesh_scale):
+            raise ValueError("fixture mesh scale must be positive")
+        if not np.isfinite(self.support_height_m) or self.support_height_m <= 0.0:
+            raise ValueError("fixture support height must be positive and finite")
+        if self.cube_pose_contract != "centred_and_yaw_aligned":
+            raise ValueError("unsupported fixture-to-cube pose contract")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "fixture_id": self.fixture_id,
+            "mesh_path": self.mesh_path,
+            "mesh_sha256": self.mesh_sha256,
+            "mesh_scale": list(self.mesh_scale),
+            "support_height_m": self.support_height_m,
+            "cube_pose_contract": self.cube_pose_contract,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TabletopFixture:
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True)
 class TabletopTaskRequest:
     """Complete scene, calibration, and robot state for one selected-arm task."""
 
@@ -105,6 +311,8 @@ class TabletopTaskRequest:
     calibration_bundle_sha256: str
     grasp_shortlist_path: str
     grasp_shortlist_sha256: str
+    presentation_id: str = "direct"
+    fixture: TabletopFixture | None = None
     object_dimensions_m: tuple[float, ...] = (0.040, 0.040, 0.040)
     open_transit_table_patch_dimensions_m: tuple[float, ...] = (0.400, 0.400, 0.020)
     supported_escape_m: float = 0.100
@@ -120,6 +328,14 @@ class TabletopTaskRequest:
             raise ValueError("unsupported tabletop request schema version")
         if self.operation != "plan_tabletop_pick_lift_replace":
             raise ValueError("unsupported tabletop request operation")
+        if not self.presentation_id.strip():
+            raise ValueError("tabletop presentation ID must be non-empty")
+        if self.fixture is not None and not isinstance(self.fixture, TabletopFixture):
+            object.__setattr__(self, "fixture", TabletopFixture.from_dict(self.fixture))
+        if self.presentation_id == "direct" and self.fixture is not None:
+            raise ValueError("direct tabletop presentation cannot contain a fixture")
+        if self.presentation_id != "direct" and self.fixture is None:
+            raise ValueError("non-direct tabletop presentation requires a fixture")
         object.__setattr__(self, "arm", validate_arm_side(self.arm))
         object.__setattr__(
             self,
@@ -184,6 +400,8 @@ class TabletopTaskRequest:
             "calibration_bundle_sha256": self.calibration_bundle_sha256,
             "grasp_shortlist_path": self.grasp_shortlist_path,
             "grasp_shortlist_sha256": self.grasp_shortlist_sha256,
+            "presentation_id": self.presentation_id,
+            "fixture": None if self.fixture is None else self.fixture.to_dict(),
             "object_dimensions_m": list(self.object_dimensions_m),
             "open_transit_table_patch_dimensions_m": list(
                 self.open_transit_table_patch_dimensions_m
@@ -224,7 +442,7 @@ class TabletopTaskPlan:
     selected_candidate_id: str
     object_T_grasp: tuple[tuple[float, ...], ...]
     open_active_dex3_q_rad: tuple[float, ...]
-    closed_active_dex3_q_rad: tuple[float, ...]
+    close_target_active_dex3_q_rad: tuple[float, ...]
     initial_active_dex3_q_rad: tuple[float, ...]
     trajectories: tuple[PlannedTrajectory, ...]
     phase_order: tuple[str, ...]
@@ -241,10 +459,15 @@ class TabletopTaskPlan:
         )
         for name in (
             "open_active_dex3_q_rad",
-            "closed_active_dex3_q_rad",
+            "close_target_active_dex3_q_rad",
             "initial_active_dex3_q_rad",
         ):
             object.__setattr__(self, name, _finite_vector(getattr(self, name), 7, name))
+        expected_open, expected_close = dex3_execution_profile(self.arm)
+        if self.open_active_dex3_q_rad != expected_open:
+            raise ValueError("tabletop plan open target differs from the Dex3 descriptor")
+        if self.close_target_active_dex3_q_rad != expected_close:
+            raise ValueError("tabletop plan close target differs from the Dex3 descriptor")
         object.__setattr__(
             self,
             "trajectories",
@@ -288,7 +511,7 @@ class TabletopTaskPlan:
             "selected_candidate_id": self.selected_candidate_id,
             "object_T_grasp": [list(row) for row in self.object_T_grasp],
             "open_active_dex3_q_rad": list(self.open_active_dex3_q_rad),
-            "closed_active_dex3_q_rad": list(self.closed_active_dex3_q_rad),
+            "close_target_active_dex3_q_rad": list(self.close_target_active_dex3_q_rad),
             "initial_active_dex3_q_rad": list(self.initial_active_dex3_q_rad),
             "trajectories": [item.to_dict() for item in self.trajectories],
             "phase_order": list(self.phase_order),
@@ -407,6 +630,9 @@ class RetentionRouteValidationResult:
     minimum_hand_plane_link: str
     minimum_hand_plane_sample: int
     planner_provenance: dict[str, Any]
+    minimum_fixture_clearance_m: float | None = None
+    minimum_fixture_clearance_link: str | None = None
+    minimum_fixture_clearance_sample: int | None = None
     schema_version: int = PLANNER_SCHEMA_VERSION
     kind: str = "g1_retention_route_validation"
 
@@ -422,6 +648,23 @@ class RetentionRouteValidationResult:
             raise ValueError("retention-route hand clearance must be finite")
         if not self.minimum_hand_plane_link or self.minimum_hand_plane_sample < 0:
             raise ValueError("retention-route minimum hand location is invalid")
+        fixture_values = (
+            self.minimum_fixture_clearance_m,
+            self.minimum_fixture_clearance_link,
+            self.minimum_fixture_clearance_sample,
+        )
+        if any(value is not None for value in fixture_values):
+            if not all(value is not None for value in fixture_values):
+                raise ValueError("retention-route fixture clearance fields must be complete")
+            assert self.minimum_fixture_clearance_m is not None
+            assert self.minimum_fixture_clearance_sample is not None
+            if not np.isfinite(self.minimum_fixture_clearance_m):
+                raise ValueError("retention-route fixture clearance must be finite")
+            if (
+                not self.minimum_fixture_clearance_link
+                or self.minimum_fixture_clearance_sample < 0
+            ):
+                raise ValueError("retention-route minimum fixture location is invalid")
         provenance = json.loads(
             json.dumps(self.planner_provenance, sort_keys=True, allow_nan=False)
         )
@@ -442,6 +685,9 @@ class RetentionRouteValidationResult:
             "minimum_hand_plane_clearance_m": self.minimum_hand_plane_clearance_m,
             "minimum_hand_plane_link": self.minimum_hand_plane_link,
             "minimum_hand_plane_sample": self.minimum_hand_plane_sample,
+            "minimum_fixture_clearance_m": self.minimum_fixture_clearance_m,
+            "minimum_fixture_clearance_link": self.minimum_fixture_clearance_link,
+            "minimum_fixture_clearance_sample": self.minimum_fixture_clearance_sample,
             "planner_provenance": self.planner_provenance,
         }
         if include_hash:

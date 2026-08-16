@@ -5,7 +5,7 @@ usage() {
     cat <<'EOF'
 Usage: tools/g1_realsense_pc2.sh {start|status|stop}
 
-Manage the temporary color-only RealSense ROS node on G1 PC2.
+Manage the temporary color-and-motion RealSense ROS node on G1 PC2.
 
   start   Stop the factory front-camera owner and launch RealSense ROS.
   status  Show factory and temporary RealSense process state.
@@ -46,6 +46,7 @@ log_file="/tmp/g1-calibration-realsense.log"
 lock_file="/tmp/g1-calibration-realsense.lock"
 camera_serial="348522074178"
 camera_profile="1280x720x15"
+depth_profile="640x480x15"
 
 exec 9>"${lock_file}"
 if ! flock -w 10 9; then
@@ -118,6 +119,11 @@ expected_launcher() {
     command=$(tr '\0' ' ' < "/proc/${pid}/cmdline")
     [[ "${command}" == *"serial_no:=_${camera_serial}"* ]]
     [[ "${command}" == *"rgb_camera.profile:=${camera_profile}"* ]]
+    [[ "${command}" == *"enable_depth:=true"* ]]
+    [[ "${command}" == *"depth_module.profile:=${depth_profile}"* ]]
+    [[ "${command}" == *"enable_gyro:=true"* ]]
+    [[ "${command}" == *"enable_accel:=true"* ]]
+    [[ "${command}" == *"unite_imu_method:=0"* ]]
 }
 
 tracked_node_running() {
@@ -191,7 +197,7 @@ show_status() {
     if pid=$(tracked_pid 2>/dev/null) && kill -0 "${pid}" 2>/dev/null; then
         if valid_launcher "${pid}"; then
             ps -o pid,ppid,stat,etime,cmd -p "${pid}" --ppid "${pid}"
-            grep 'Open profile:' "${log_file}" 2>/dev/null | tail -n 1 || true
+            grep 'Open profile:' "${log_file}" 2>/dev/null | tail -n 6 || true
         else
             echo "tracked PID ${pid} is not the expected ROS launch process"
         fi
@@ -281,14 +287,16 @@ case "${action}" in
             serial_no:=_348522074178 \
             enable_color:=true \
             rgb_camera.profile:=1280x720x15 \
-            enable_depth:=false \
+            enable_depth:=true \
+            depth_module.profile:=640x480x15 \
             enable_infra1:=false \
             enable_infra2:=false \
             enable_fisheye1:=false \
             enable_fisheye2:=false \
             enable_confidence:=false \
-            enable_gyro:=false \
-            enable_accel:=false \
+            enable_gyro:=true \
+            enable_accel:=true \
+            unite_imu_method:=0 \
             enable_pose:=false \
             pointcloud.enable:=false \
             align_depth.enable:=false \
@@ -309,6 +317,10 @@ case "${action}" in
         grep -q 'Device USB type: 3.2' "${log_file}"
         grep -q 'Open profile:.*Format: RGB8, Width: 1280, Height: 720, FPS: 15' \
             "${log_file}"
+        grep -q 'Open profile:.*stream_type: Depth.*Width: 640, Height: 480, FPS: 15' \
+            "${log_file}"
+        grep -q 'Open profile:.*stream_type: Gyro' "${log_file}"
+        grep -q 'Open profile:.*stream_type: Accel' "${log_file}"
         grep -q 'RealSense Node Is Up!' "${log_file}"
         expected_launcher "${pid}"
         pgrep -P "${pid}" -f \
@@ -317,7 +329,7 @@ case "${action}" in
 
         rollback_required=0
         trap - EXIT INT TERM
-        echo "started RealSense ROS for D435i ${camera_serial} at ${camera_profile} RGB8"
+        echo "started RealSense ROS for D435i ${camera_serial}: ${camera_profile} RGB8, ${depth_profile} Z16, raw gyro and accelerometer"
         show_status
         ;;
 esac

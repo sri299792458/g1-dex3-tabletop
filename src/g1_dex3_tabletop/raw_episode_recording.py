@@ -22,7 +22,7 @@ from g1_dex3_tabletop.planning.contracts import atomic_write_json
 SPARK_REPOSITORY = "RPM-lab-UMN/spark-data-collection"
 SPARK_COMMIT = "be284c2f8138f383d260526f68613c7a28d364d4"
 SPARK_RECORDER_PATH = "data_pipeline/record_episode.py"
-PROFILE_NAME = "g1_seated_tabletop_raw_v1"
+PROFILE_NAME = "g1_seated_tabletop_raw_v2"
 
 
 @dataclass(frozen=True)
@@ -40,8 +40,32 @@ TABLETOP_STATE_COMMAND_TOPICS = (
     TopicSpec(
         "/lowstate",
         "unitree_hg/msg/LowState",
-        "measured complete G1 state, including the onboard IMU",
+        "measured complete G1 state, including the pelvis IMU",
         "Unitree message tick/device fields retained; MCAP record time is laptop ROS receive time",
+    ),
+    TopicSpec(
+        "/secondary_imu",
+        "unitree_hg/msg/IMUState",
+        "measured G1 torso IMU state",
+        "MCAP record time at laptop DDS receipt; Unitree IMUState has no message header",
+    ),
+    TopicSpec(
+        "/camera/gyro/sample",
+        "sensor_msgs/msg/Imu",
+        "raw D435i angular velocity",
+        "message header stamp from the RealSense ROS producer; MCAP record time also retained",
+    ),
+    TopicSpec(
+        "/camera/accel/sample",
+        "sensor_msgs/msg/Imu",
+        "raw D435i linear acceleration",
+        "message header stamp from the RealSense ROS producer; MCAP record time also retained",
+    ),
+    TopicSpec(
+        "/tf_static",
+        "tf2_msgs/msg/TFMessage",
+        "static D435i depth, color, gyroscope, and accelerometer frame transforms",
+        "transform header stamps from the RealSense ROS producer; MCAP record time also retained",
     ),
     TopicSpec(
         "/lowcmd",
@@ -86,6 +110,18 @@ TABLETOP_CAMERA_TOPICS = (
         "/camera/color/camera_info",
         "sensor_msgs/msg/CameraInfo",
         "head-camera intrinsics and rectified image profile",
+        "message header stamp from the RealSense ROS producer; MCAP record time also retained",
+    ),
+    TopicSpec(
+        "/camera/depth/image_rect_raw",
+        "sensor_msgs/msg/Image",
+        "native unaligned D435i Z16 depth observation",
+        "message header stamp from the RealSense ROS producer; MCAP record time also retained",
+    ),
+    TopicSpec(
+        "/camera/depth/camera_info",
+        "sensor_msgs/msg/CameraInfo",
+        "native D435i depth intrinsics and rectified image profile",
         "message header stamp from the RealSense ROS producer; MCAP record time also retained",
     ),
 )

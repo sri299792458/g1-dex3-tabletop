@@ -54,7 +54,8 @@ fi
 
 set +u
 source "${ros_prefix}/setup.bash"
-if [[ "${hardware_command}" == "run-tabletop" ]]; then
+if [[ "${hardware_command}" == "run-tabletop" || \
+      "${hardware_command}" == "measure-seat-compliance" ]]; then
     if [[ ! -f "${local_mcap_prefix}/lib/librosbag2_storage_mcap.so" ]]; then
         echo "account-local MCAP plugin is unavailable; run ./tools/setup_recording_benchmark.sh once" >&2
         exit 1
@@ -78,7 +79,8 @@ if [[ -z "${CYCLONEDDS_URI:-}" ]]; then
     export CYCLONEDDS_URI="<CycloneDDS><Domain Id=\"any\"><General><Interfaces><NetworkInterface name=\"${network_interface}\" priority=\"default\" multicast=\"default\" /></Interfaces></General></Domain></CycloneDDS>"
 fi
 
-if [[ "${hardware_command}" == "run-tabletop" ]]; then
+if [[ "${hardware_command}" == "run-tabletop" || \
+      "${hardware_command}" == "measure-seat-compliance" ]]; then
     storage_plugins="$(ros2 bag list storage)"
     if ! grep -qx mcap <<<"${storage_plugins}"; then
         echo "account-local MCAP storage plugin was not discovered" >&2
@@ -86,6 +88,7 @@ if [[ "${hardware_command}" == "run-tabletop" ]]; then
     fi
     for message_type in \
         unitree_hg/msg/LowState \
+        unitree_hg/msg/IMUState \
         unitree_hg/msg/LowCmd \
         unitree_hg/msg/HandState \
         unitree_hg/msg/HandCmd
@@ -99,7 +102,7 @@ fi
 
 cd "${workspace_root}"
 case "${hardware_command}" in
-    collect-calibration|run-tabletop)
+    collect-calibration|run-tabletop|measure-seat-compliance)
         "${workspace_root}/tools/g1_realsense_pc2.sh" stop
         "${workspace_root}/tools/g1_realsense_pc2.sh" start
         ;;

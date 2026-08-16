@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from g1_dex3_tabletop.planning.dex3_handedness import (
+    dex3_execution_profile,
     dex3_q_from_canonical,
-    dex3_q_from_qualified_right_mapping,
 )
 
 
@@ -21,23 +21,27 @@ def test_canonical_posture_is_identity_for_right_and_exact_mirror_for_left() -> 
     )
 
 
-def test_qualified_right_posture_adapts_to_left() -> None:
-    source = {
-        "right_hand_thumb_0_joint": 0.1,
-        "right_hand_thumb_1_joint": 0.2,
-        "right_hand_thumb_2_joint": 0.3,
-        "right_hand_middle_0_joint": 0.4,
-        "right_hand_middle_1_joint": 0.5,
-        "right_hand_index_0_joint": 0.6,
-        "right_hand_index_1_joint": 0.7,
-    }
+def test_execution_profile_has_one_fixed_close_target_mirrored_to_each_hand() -> None:
+    right_open, right_close = dex3_execution_profile("right")
+    left_open, left_close = dex3_execution_profile("left")
 
-    assert dex3_q_from_qualified_right_mapping(source, arm="left") == (
-        -0.1,
-        -0.2,
-        -0.3,
-        -0.6,
-        -0.7,
-        -0.4,
-        -0.5,
+    assert right_open == (0.0,) * 7
+    assert right_close == (
+        0.0,
+        -0.5984,
+        -0.99731429,
+        0.8976,
+        0.99731429,
+        0.8976,
+        0.99731429,
+    )
+    assert left_open == (0.0,) * 7
+    assert left_close == (
+        -0.0,
+        0.5984,
+        0.99731429,
+        -0.8976,
+        -0.99731429,
+        -0.8976,
+        -0.99731429,
     )

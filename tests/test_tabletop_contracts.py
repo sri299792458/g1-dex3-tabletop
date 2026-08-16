@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
+from g1_dex3_tabletop.planning.dex3_handedness import dex3_execution_profile
 from g1_dex3_tabletop.tabletop_contracts import (
+    CharucoBoardObservation,
+    CharucoSupportedEscapeRequest,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
@@ -35,6 +38,28 @@ def observation() -> TabletopObservation:
         source_frame_sha256=("b" * 64, "c" * 64, "d" * 64),
         object_translation_spread_mm=0.2,
         object_rotation_spread_deg=0.1,
+    )
+
+
+def charuco_observation() -> CharucoBoardObservation:
+    return CharucoBoardObservation(
+        snapshot=RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7),
+        camera_T_board=identity(),
+        camera_profile_sha256="a" * 64,
+        source_frame_sha256=("b" * 64, "c" * 64, "d" * 64),
+        translation_spread_mm=0.2,
+        rotation_spread_deg=0.1,
+        board_spec={
+            "squares_x": 6,
+            "squares_y": 9,
+            "square_length_mm": 30.0,
+            "marker_length_mm": 22.0,
+            "dictionary_name": "DICT_5X5_50",
+            "legacy_pattern": False,
+            "active_dimensions_mm": [180.0, 270.0],
+            "marker_count": 27,
+            "charuco_corner_count": 40,
+        },
     )
 
 
@@ -72,6 +97,24 @@ def test_tabletop_request_round_trip_and_hash_guard(tmp_path: Path) -> None:
         TabletopTaskRequest.from_dict(document)
 
 
+def test_charuco_escape_request_round_trip_and_frozen_board(tmp_path: Path) -> None:
+    value = CharucoSupportedEscapeRequest(
+        observation=charuco_observation(),
+        arm="left",
+        torso_T_camera=identity(),
+        joint_position_offsets_rad={"left_shoulder_roll_joint": 0.02},
+        calibration_bundle_sha256="e" * 64,
+    )
+    path = tmp_path / "charuco_request.json"
+    value.write_json(path)
+    assert CharucoSupportedEscapeRequest.from_json(path) == value
+
+    document = value.to_dict(include_hash=False)
+    document["observation"]["board_spec"]["dictionary_name"] = "DICT_4X4_50"
+    with pytest.raises(ValueError, match="different frozen table board"):
+        CharucoSupportedEscapeRequest.from_dict(document)
+
+
 def test_tabletop_request_rejects_invalid_open_transit_patch() -> None:
     values = request().to_dict(include_hash=False)
     values["open_transit_table_patch_dimensions_m"] = [0.4, 0.0, 0.02]
@@ -97,6 +140,7 @@ def test_supported_escape_requires_exact_reverse() -> None:
 
 
 def test_task_plan_requires_complete_finite_lifecycle() -> None:
+    open_q, close_q = dex3_execution_profile("right")
     phases = (
         "move_to_pregrasp",
         "grasp_approach",
@@ -117,22 +161,28 @@ def test_task_plan_requires_complete_finite_lifecycle() -> None:
         arm="right",
         selected_candidate_id="cube_1",
         object_T_grasp=identity(),
-        open_active_dex3_q_rad=(0.0,) * 7,
-        closed_active_dex3_q_rad=(0.5,) * 7,
+        open_active_dex3_q_rad=open_q,
+        close_target_active_dex3_q_rad=close_q,
         initial_active_dex3_q_rad=(0.1,) * 7,
         trajectories=tuple(trajectories),
         phase_order=phases,
         planner_provenance={},
     )
     assert TabletopTaskPlan.from_dict(plan.to_dict()) == plan
+    serialized = plan.to_dict(include_hash=False)
+    assert serialized["close_target_active_dex3_q_rad"] == list(close_q)
+    assert "closed_active_dex3_q_rad" not in serialized
+    serialized["close_target_active_dex3_q_rad"] = [0.5] * 7
+    with pytest.raises(ValueError, match="differs from the Dex3 descriptor"):
+        TabletopTaskPlan.from_dict(serialized)
     with pytest.raises(ValueError, match="complete eight-motion lifecycle"):
         TabletopTaskPlan(
             request_sha256="a" * 64,
             arm="right",
             selected_candidate_id="cube_1",
             object_T_grasp=identity(),
-            open_active_dex3_q_rad=(0.0,) * 7,
-            closed_active_dex3_q_rad=(0.5,) * 7,
+            open_active_dex3_q_rad=open_q,
+            close_target_active_dex3_q_rad=close_q,
             initial_active_dex3_q_rad=(0.1,) * 7,
             trajectories=tuple(trajectories[:-1]),
             phase_order=phases[:-1],
@@ -141,6 +191,7 @@ def test_task_plan_requires_complete_finite_lifecycle() -> None:
 
 
 def test_complete_execution_binds_escape_task_and_exact_return() -> None:
+    open_q, close_q = dex3_execution_profile("right")
     loaded_request = request()
     clearance_observation = TabletopObservation(
         snapshot=RobotSnapshot((0.0,) * 22 + (0.1,) * 7, (0.0,) * 7, (0.0,) * 7),
@@ -190,8 +241,8 @@ def test_complete_execution_binds_escape_task_and_exact_return() -> None:
         "right",
         "cube_1",
         identity(),
-        (0.0,) * 7,
-        (0.5,) * 7,
+        open_q,
+        close_q,
         (0.1,) * 7,
         tuple(motions),
         phases,
@@ -215,6 +266,7 @@ def test_complete_execution_binds_escape_task_and_exact_return() -> None:
 
 
 def test_retention_route_contract_binds_measured_fingers_to_task(tmp_path: Path) -> None:
+    open_q, close_q = dex3_execution_profile("right")
     tabletop_request = request()
     phases = (
         "move_to_pregrasp",
@@ -236,8 +288,8 @@ def test_retention_route_contract_binds_measured_fingers_to_task(tmp_path: Path)
         "right",
         "cube_1",
         identity(),
-        (0.0,) * 7,
-        (0.5,) * 7,
+        open_q,
+        close_q,
         (0.1,) * 7,
         tuple(motions),
         phases,

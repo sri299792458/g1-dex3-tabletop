@@ -28,6 +28,10 @@ from g1_dex3_tabletop.planning.contracts import (
     RobotSnapshot,
 )
 from g1_dex3_tabletop.planning.g1_model import CUROBO_COMMIT
+from g1_dex3_tabletop.tabletop_presentation import (
+    DIRECT_PRESENTATION_ID,
+    PRESENTATION_CONFIGS,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BUNDLE = ROOT / "config/calibrations/dex3_shared_20260812_selected_free.json"
@@ -37,7 +41,6 @@ ROBOT_CALIBRATION = ROOT / "third_party/robot_calibration"
 ROBOT_CALIBRATION_RUNNER = ROOT / "tools/g1_robot_calibration.sh"
 DEFAULT_TASK_CONFIG = ROOT / "config/tabletop/task.yaml"
 DEFAULT_CUBE_CONFIG = ROOT / "third_party/aprilcube/models/dex3_safe_cube/config.json"
-DEFAULT_GRASP_SHORTLIST = ROOT / "config/tabletop/cube_dex3_executable_v1/shortlist.yaml"
 DEFAULT_QUALITY = ROOT / "config/capture_quality_dex3_aruco.yaml"
 
 
@@ -150,7 +153,17 @@ def build_parser() -> argparse.ArgumentParser:
     tabletop.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
     tabletop.add_argument("--cube-config", type=Path, default=DEFAULT_CUBE_CONFIG)
     tabletop.add_argument("--quality-config", type=Path, default=DEFAULT_QUALITY)
-    tabletop.add_argument("--grasp-shortlist", type=Path, default=DEFAULT_GRASP_SHORTLIST)
+    tabletop.add_argument(
+        "--presentation",
+        choices=(DIRECT_PRESENTATION_ID, *PRESENTATION_CONFIGS),
+        default=DIRECT_PRESENTATION_ID,
+        help="object presentation; direct keeps the existing tabletop behavior",
+    )
+    tabletop.add_argument(
+        "--grasp-shortlist",
+        type=Path,
+        help="optional direct-table shortlist override; unavailable for fixture modes",
+    )
     tabletop.add_argument("--output-root", type=Path, default=ROOT / "runs")
     tabletop.add_argument("--observation-frames", type=int, default=5)
     tabletop.add_argument(
@@ -176,9 +189,55 @@ def build_parser() -> argparse.ArgumentParser:
     tabletop.add_argument(
         "--skip-camera-recording",
         action="store_true",
-        help=("exclude raw RGB and CameraInfo from the MCAP; camera perception remains active"),
+        help=(
+            "exclude raw RGB, native depth, and their CameraInfo from the MCAP; "
+            "camera perception and low-bandwidth RealSense motion recording remain active"
+        ),
     )
     tabletop.add_argument(
+        "--lock-file",
+        type=Path,
+        default=Path("/tmp/g1-dex3-tabletop-command.lock"),
+    )
+    compliance = subparsers.add_parser(
+        "measure-seat-compliance",
+        help=("seated fixed-ChArUco A/B diagnostic: lift and exactly return both arms"),
+    )
+    compliance.add_argument("--network-interface", required=True)
+    compliance.add_argument("--domain-id", type=int, default=0)
+    compliance.add_argument("--hardware-config", type=Path)
+    compliance.add_argument("--calibration-bundle", type=Path, default=DEFAULT_BUNDLE)
+    compliance.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
+    compliance.add_argument("--chair-condition", choices=("cushion", "rigid"), required=True)
+    compliance.add_argument("--repetitions", type=int, default=5)
+    compliance.add_argument("--observation-frames", type=int, default=5)
+    compliance.add_argument("--seed", type=int, default=17)
+    compliance.add_argument("--output-root", type=Path, default=ROOT / "runs")
+    compliance.add_argument(
+        "--pc2-host",
+        default=os.environ.get("G1_PC2_HOST", "unitree@192.168.123.164"),
+    )
+    compliance.add_argument(
+        "--pc2-ssh-identity",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "G1_PC2_SSH_IDENTITY",
+                str(Path.home() / ".ssh/g1_pc2_ed25519"),
+            )
+        ),
+    )
+    compliance.add_argument("--confirm", required=True)
+    compliance.add_argument("--no-window", action="store_true")
+    compliance.add_argument(
+        "--skip-camera-recording",
+        action="store_true",
+        help=(
+            "exclude raw RGB, native depth, and their CameraInfo from the MCAP; "
+            "live ChArUco perception and low-bandwidth IMU recording remain active"
+        ),
+    )
+    compliance.add_argument(
         "--lock-file",
         type=Path,
         default=Path("/tmp/g1-dex3-tabletop-command.lock"),
@@ -416,6 +475,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.target_config is None:
             args.target_config = target_path
         handlers["collect-calibration"] = run_collect_calibration
+    if args.command == "measure-seat-compliance":
+        from g1_dex3_tabletop.hardware_seat_compliance import (
+            run_measure_seat_compliance,
+        )
+
+        hardware_path, _target_path = _arm_paths("right")
+        if args.hardware_config is None:
+            args.hardware_config = hardware_path
+        handlers["measure-seat-compliance"] = run_measure_seat_compliance
     try:
         return handlers[args.command](args)
     except KeyboardInterrupt:

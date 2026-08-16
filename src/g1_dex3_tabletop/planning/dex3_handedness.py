@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import json
+from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 
@@ -17,6 +19,9 @@ from g1_aprilcube_calibration.transports.unitree_dex3 import (
 # exchanges the canonical index/middle chains. Keep that conversion in one
 # place; object_T_G itself is identical for both sides.
 CANONICAL_DEX3_JOINT_SUFFIXES = DEX3_MOTOR_JOINT_SUFFIXES["right"]
+CANONICAL_DEX3_PROFILE = (
+    Path(__file__).resolve().parents[3] / "config/tabletop/dex3_rev1_canonical_profile.json"
+)
 _LEFT_SUFFIX_FROM_CANONICAL = {
     "thumb_0": "thumb_0",
     "thumb_1": "thumb_1",
@@ -45,17 +50,18 @@ def dex3_q_from_canonical(values: Sequence[float], *, arm: str) -> tuple[float, 
     return tuple(float(physical[suffix]) for suffix in DEX3_MOTOR_JOINT_SUFFIXES[selected])
 
 
-def dex3_q_from_qualified_right_mapping(
-    values: Mapping[str, float],
-    *,
-    arm: str,
-) -> tuple[float, ...]:
-    """Adapt one retained right-descriptor PhysX posture to either hand."""
+def dex3_execution_profile(arm: str) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Return the descriptor-defined open and fixed close targets for one hand."""
 
-    canonical = []
-    for suffix in CANONICAL_DEX3_JOINT_SUFFIXES:
-        name = f"right_hand_{suffix}_joint"
-        if name not in values:
-            raise ValueError(f"qualified grasp posture is missing {name}")
-        canonical.append(float(values[name]))
-    return dex3_q_from_canonical(canonical, arm=arm)
+    document = json.loads(CANONICAL_DEX3_PROFILE.read_text(encoding="utf-8"))
+    if tuple(document.get("canonical_joint_order", ())) != CANONICAL_DEX3_JOINT_SUFFIXES:
+        raise ValueError("canonical Dex3 profile joint order is invalid")
+    if document.get("close_command_policy") != (
+        "fixed_descriptor_target_with_contact_limited_physical_motion"
+    ):
+        raise ValueError("canonical Dex3 close-command policy is invalid")
+    open_q = dex3_q_from_canonical(document["open_q_rad"], arm=arm)
+    close_q = dex3_q_from_canonical(document["close_q_rad"], arm=arm)
+    if open_q == close_q:
+        raise ValueError("canonical Dex3 open and close targets must differ")
+    return open_q, close_q

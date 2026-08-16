@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
-import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -33,9 +32,7 @@ from g1_dex3_tabletop.planning.curobo_backend import (
     _self_collision_pair_penetrations,
 )
 from g1_dex3_tabletop.planning.dex3_handedness import (
-    CANONICAL_DEX3_JOINT_SUFFIXES,
-    dex3_q_from_canonical,
-    dex3_q_from_qualified_right_mapping,
+    dex3_execution_profile,
 )
 from g1_dex3_tabletop.planning.g1_model import (
     CUROBO_COMMIT,
@@ -47,6 +44,7 @@ from g1_dex3_tabletop.planning.g1_model import (
     model_source_hashes,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
+    CharucoSupportedEscapeRequest,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
@@ -55,7 +53,6 @@ from g1_dex3_tabletop.tabletop_contracts import (
 )
 
 ROOT = Path(__file__).resolve().parents[3]
-CANONICAL_PROFILE = ROOT / "config/tabletop/dex3_rev1_canonical_profile.json"
 WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M = 1.0e-6
 
 
@@ -251,13 +248,6 @@ def _split_lift_trajectory(
     return test_lift, payload_lift
 
 
-def _load_open_profile(arm: str) -> np.ndarray:
-    document = json.loads(CANONICAL_PROFILE.read_text(encoding="utf-8"))
-    if tuple(document.get("canonical_joint_order", ())) != CANONICAL_DEX3_JOINT_SUFFIXES:
-        raise ValueError("canonical Dex3 profile joint order is invalid")
-    return np.asarray(dex3_q_from_canonical(document["open_q_rad"], arm=arm))
-
-
 def _load_shortlist(request: TabletopTaskRequest) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     path = (ROOT / request.grasp_shortlist_path).resolve()
     if not path.is_relative_to(ROOT):
@@ -268,6 +258,31 @@ def _load_shortlist(request: TabletopTaskRequest) -> tuple[dict[str, Any], list[
     document = yaml.safe_load(content)
     if document.get("format") != "g1_aprilcube_executable_grasp_shortlist":
         raise ValueError("unsupported grasp shortlist format")
+    presentation = document.get("presentation")
+    shortlist_presentation_id = (
+        "direct" if presentation is None else str(presentation.get("id", ""))
+    )
+    if shortlist_presentation_id != request.presentation_id:
+        raise ValueError(
+            "grasp shortlist presentation differs from the task request: "
+            f"{shortlist_presentation_id!r} != {request.presentation_id!r}"
+        )
+    if request.fixture is not None:
+        assert presentation is not None
+        expected_fixture = {
+            "fixture_id": request.fixture.fixture_id,
+            "fixture_mesh": request.fixture.mesh_path,
+            "fixture_mesh_sha256": request.fixture.mesh_sha256,
+            "fixture_mesh_scale": list(request.fixture.mesh_scale),
+            "support_height_m": request.fixture.support_height_m,
+            "cube_pose_contract": request.fixture.cube_pose_contract,
+        }
+        actual_fixture = {name: presentation.get(name) for name in expected_fixture}
+        if actual_fixture != expected_fixture:
+            raise ValueError(
+                "grasp shortlist fixture contract differs from the task request: "
+                f"expected={expected_fixture}, actual={actual_fixture}"
+            )
     applicable = tuple(document.get("applicable_hand_sides", ()))
     if request.arm not in applicable or document.get("object_id") != "cube_head":
         raise ValueError(
@@ -301,8 +316,23 @@ def _load_shortlist(request: TabletopTaskRequest) -> tuple[dict[str, Any], list[
             f"task={list(request.object_dimensions_m)}, mesh={mesh_dimensions.tolist()}"
         )
     candidates = list(document.get("candidates", ()))
-    if len(candidates) != 15:
-        raise ValueError("qualified cube shortlist must contain exactly 15 candidates")
+    if not candidates or len(candidates) != int(document.get("candidate_count", -1)):
+        raise ValueError("qualified cube shortlist candidate count is invalid")
+    approach_distance_m = float(document["execution_contract"]["approach_distance_m"])
+    for candidate in candidates:
+        if candidate.get("execution_evidence", {}).get("intrinsic_retention_passed") is not True:
+            raise ValueError(
+                "qualified cube candidate lacks intrinsic retention evidence: "
+                f"{candidate.get('candidate_id', '<missing ID>')}"
+            )
+        if request.fixture is not None and approach_distance_m not in candidate.get(
+            "valid_approach_distances_m", ()
+        ):
+            raise ValueError(
+                "fixture-qualified cube candidate does not admit the runtime approach: "
+                f"{candidate.get('candidate_id', '<missing ID>')} at "
+                f"{approach_distance_m:.3f}m"
+            )
     return document, candidates
 
 
@@ -361,8 +391,56 @@ def _table_from_resting_object(
     object_up = base_T_object[:3, 2]
     down = -object_up
     extent = request.object_dimensions_m[2]
-    top_origin = base_T_object[:3, 3] + 0.5 * extent * down
+    support_height = 0.0 if request.fixture is None else request.fixture.support_height_m
+    top_origin = base_T_object[:3, 3] + (0.5 * extent + support_height) * down
     return top_origin, base_T_object, down
+
+
+def _table_from_charuco_board(
+    request: CharucoSupportedEscapeRequest,
+    base_T_torso: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the physical top-plane point and down direction from the board."""
+
+    base_T_camera = base_T_torso @ np.asarray(request.torso_T_camera)
+    base_T_board = base_T_camera @ np.asarray(request.observation.camera_T_board)
+    down = base_T_board[:3, 2]
+    # The frozen OpenCV board frame has +Z into the backing.  Reuse the same
+    # 20-degree face-up policy as the AprilCube table-plane implementation so
+    # a flipped planar solution can never request a downward escape.
+    if float(down[2]) > -np.cos(np.deg2rad(20.0)):
+        raise RuntimeError(
+            "ChArUco board normal is not face-up within 20 degrees; refusing "
+            "to infer the lift direction"
+        )
+    return base_T_board[:3, 3], down
+
+
+def _fixture_mesh_path(request: TabletopTaskRequest) -> Path | None:
+    if request.fixture is None:
+        return None
+    path = (ROOT / request.fixture.mesh_path).resolve()
+    if not path.is_relative_to(ROOT) or not path.is_file():
+        raise ValueError("fixture mesh must exist inside the repository")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != request.fixture.mesh_sha256:
+        raise ValueError("fixture mesh SHA-256 differs from the task request")
+    return path
+
+
+def _base_T_fixture(
+    request: TabletopTaskRequest,
+    base_T_object: np.ndarray,
+    down: np.ndarray,
+) -> np.ndarray | None:
+    """Place the mesh base on the inferred table under its aligned cube."""
+
+    if request.fixture is None:
+        return None
+    result = np.asarray(base_T_object, dtype=np.float64).copy()
+    result[:3, 3] += (
+        0.5 * request.object_dimensions_m[2] + request.fixture.support_height_m
+    ) * down
+    return result
 
 
 def _base_scene(
@@ -389,7 +467,76 @@ def _base_scene(
             "dims": list(dimensions),
             "pose": _pose_list(base_T_patch),
         }
+    fixture_path = _fixture_mesh_path(request)
+    fixture_pose = _base_T_fixture(request, base_T_object, down)
+    if fixture_path is not None and fixture_pose is not None:
+        assert request.fixture is not None
+        scene["mesh"] = {
+            request.fixture.fixture_id: {
+                "file_path": str(fixture_path),
+                "pose": _pose_list(fixture_pose),
+                "scale": list(request.fixture.mesh_scale),
+            }
+        }
     return scene
+
+
+def _fixture_collision_mesh(
+    request: TabletopTaskRequest,
+    base_T_object: np.ndarray,
+    down: np.ndarray,
+):
+    """Load the hash-checked fixture once in base coordinates for CPU rechecks."""
+
+    path = _fixture_mesh_path(request)
+    fixture_pose = _base_T_fixture(request, base_T_object, down)
+    if path is None or fixture_pose is None:
+        return None
+    assert request.fixture is not None
+    import trimesh
+
+    mesh = trimesh.load(path, force="mesh", process=True)
+    if not isinstance(mesh, trimesh.Trimesh) or not mesh.is_watertight:
+        raise ValueError("fixture collision mesh must be one watertight solid")
+    mesh.apply_scale(np.asarray(request.fixture.mesh_scale, dtype=np.float64))
+    mesh.apply_transform(fixture_pose)
+    return mesh
+
+
+def _fixture_clearance_from_spheres(
+    sphere_array: np.ndarray,
+    *,
+    config,
+    fixture_mesh,
+) -> tuple[float, str, int]:
+    """Return minimum exact-mesh clearance for already-computed robot spheres."""
+
+    import trimesh
+
+    values = np.asarray(sphere_array, dtype=np.float64)
+    if values.ndim != 3 or values.shape[2] != 4:
+        raise ValueError("fixture sphere array must have shape N x S x 4")
+    valid_samples, valid_spheres = np.nonzero(values[..., 3] > 0.0)
+    if len(valid_samples) == 0:
+        raise RuntimeError("fixture collision recheck found no enabled robot spheres")
+    selected = values[valid_samples, valid_spheres]
+    # trimesh uses positive signed distance inside a watertight mesh and
+    # negative distance outside. Sphere clearance is therefore -distance-r.
+    signed = trimesh.proximity.signed_distance(fixture_mesh, selected[:, :3])
+    clearances = -np.asarray(signed, dtype=np.float64) - selected[:, 3]
+    if not np.all(np.isfinite(clearances)):
+        raise RuntimeError("fixture collision recheck produced a non-finite distance")
+    minimum_index = int(np.argmin(clearances))
+    sphere_index = int(valid_spheres[minimum_index])
+    link_index = int(config.link_sphere_idx_map.reshape(-1)[sphere_index].item())
+    index_to_name = {value: name for name, value in config.link_name_to_idx_map.items()}
+    if link_index not in index_to_name:
+        raise RuntimeError("fixture collision recheck could not resolve a sphere link")
+    return (
+        float(clearances[minimum_index]),
+        index_to_name[link_index],
+        int(valid_samples[minimum_index]),
+    )
 
 
 def _local_plane_clearance(
@@ -935,7 +1082,7 @@ def _cleanup(planner) -> None:
 
 
 def plan_supported_escape(
-    request: TabletopTaskRequest,
+    request: TabletopTaskRequest | CharucoSupportedEscapeRequest,
     *,
     progress: Callable[[str], None] | None = None,
 ) -> SupportedEscapePlan:
@@ -943,14 +1090,11 @@ def plan_supported_escape(
 
     report = progress or (lambda _message: None)
     arm = request.arm
-    initial_fingers = (
-        request.observation.snapshot.left_dex3_q_rad
-        if arm == "left"
-        else request.observation.snapshot.right_dex3_q_rad
-    )
+    snapshot = request.observation.snapshot
+    initial_fingers = snapshot.left_dex3_q_rad if arm == "left" else snapshot.right_dex3_q_rad
     strict_robot, reference_tuple = build_tabletop_robot_config(
         arm=arm,
-        snapshot=request.observation.snapshot,
+        snapshot=snapshot,
         joint_position_offsets_rad=request.joint_position_offsets_rad,
         active_finger_q_rad=initial_fingers,
     )
@@ -980,10 +1124,16 @@ def plan_supported_escape(
         planner.destroy()
         planner = None
         _use_moving_grasp_frame_only(robot, arm=arm)
-        scene = _base_scene(request, base_T_torso, include_cube=True)
+        if isinstance(request, CharucoSupportedEscapeRequest):
+            scene = {}
+            plane_point, down = _table_from_charuco_board(request, base_T_torso)
+            plane_source = "fixed ChArUco board"
+        else:
+            scene = _base_scene(request, base_T_torso, include_cube=True)
+            plane_point, _base_T_object, down = _table_from_resting_object(request, base_T_torso)
+            plane_source = "resting AprilCube"
         planner, device_cfg = _planner(robot, scene, max_goalset=1, seed=request.random_seed)
         state = _joint_state(device_cfg, reference, names)
-        plane_point, _base_T_object, down = _table_from_resting_object(request, base_T_torso)
         target = base_T_grasp.copy()
         target[:3, 3] -= request.supported_escape_m * down
         from curobo.types import GoalToolPose, Pose, ToolPoseCriteria
@@ -1074,7 +1224,8 @@ def plan_supported_escape(
                 "elapsed_s": time.monotonic() - started,
                 "execution_maximum_arm_velocity_rad_s": (request.maximum_arm_velocity_rad_s),
                 "policy": (
-                    "straight 100mm table-normal escape; no fabricated table box; "
+                    f"straight table-normal escape from {plane_source}; "
+                    "no fabricated table box; "
                     f"local {arm}-wrist/hand plane guard; exact reverse return"
                 ),
                 "local_plane_minimum_clearance_m": route_clearance,
@@ -1316,7 +1467,7 @@ def _plan_attached_lift(
     *,
     request: TabletopTaskRequest,
     selected: dict[str, Any],
-    closed_q: np.ndarray,
+    close_target_q: np.ndarray,
     contact_command_q: tuple[float, ...],
     contact_model_q: np.ndarray,
     base_T_torso: np.ndarray,
@@ -1324,21 +1475,21 @@ def _plan_attached_lift(
     down: np.ndarray,
     arm: str,
 ) -> _LiftBranchPlan:
-    """Switch to the closed-hand attached-payload model and validate the lift."""
+    """Plan with the descriptor close target; live measured fingers are rechecked later."""
 
     planner = None
     try:
         contact_snapshot = _snapshot_at_arm_q(request, contact_command_q)
-        closed_robot, _ = build_tabletop_robot_config(
+        close_target_robot, _ = build_tabletop_robot_config(
             arm=arm,
             snapshot=contact_snapshot,
             joint_position_offsets_rad=request.joint_position_offsets_rad,
-            active_finger_q_rad=tuple(closed_q),
+            active_finger_q_rad=tuple(close_target_q),
         )
-        _use_moving_grasp_frame_only(closed_robot, arm=arm)
+        _use_moving_grasp_frame_only(close_target_robot, arm=arm)
         attached_scene = _base_scene(request, base_T_torso, include_cube=False)
         planner, device_cfg = _planner(
-            closed_robot,
+            close_target_robot,
             attached_scene,
             max_goalset=1,
             seed=request.random_seed,
@@ -1528,9 +1679,14 @@ class RetentionRouteValidator:
         )
         kinematics = self.checker.kinematics.compute_kinematics(reference_state)
         base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
-        self.plane_point, _base_T_object, self.down = _table_from_resting_object(
+        self.plane_point, base_T_object, self.down = _table_from_resting_object(
             tabletop,
             base_T_torso,
+        )
+        self.fixture_mesh = _fixture_collision_mesh(
+            tabletop,
+            base_T_object,
+            self.down,
         )
         self.cache_build_s = time.monotonic() - started
 
@@ -1585,9 +1741,29 @@ class RetentionRouteValidator:
                 f"table plane: clearance={hand_clearance:.4f}m at {hand_link} sample "
                 f"{hand_sample}/{len(route_q) - 1}"
             )
+        fixture_clearance = fixture_link = fixture_sample = None
+        if self.fixture_mesh is not None:
+            fixture_clearance, fixture_link, fixture_sample = _fixture_clearance_from_spheres(
+                spheres,
+                config=self.checker.config.kinematics_config,
+                fixture_mesh=self.fixture_mesh,
+            )
+            if fixture_clearance < 0.0:
+                raise RuntimeError(
+                    "measured stalled Dex3 posture invalidates the frozen payload route "
+                    f"against the presentation fixture: {fixture_link} has "
+                    f"{fixture_clearance * 1000.0:.3f}mm clearance at sample "
+                    f"{fixture_sample}/{len(route_q) - 1}"
+                )
+        fixture_report = (
+            ""
+            if fixture_clearance is None
+            else f" and fixture clearance={fixture_clearance:.4f}m at {fixture_link}"
+        )
         report(
             "measured stalled-hand retention route passed strict self-collision and "
             f"table-plane checks; minimum hand clearance={hand_clearance:.4f}m"
+            f"{fixture_report}"
         )
         return RetentionRouteValidationResult(
             request_sha256=request.content_sha256,
@@ -1597,6 +1773,9 @@ class RetentionRouteValidator:
             minimum_hand_plane_clearance_m=hand_clearance,
             minimum_hand_plane_link=hand_link,
             minimum_hand_plane_sample=hand_sample,
+            minimum_fixture_clearance_m=fixture_clearance,
+            minimum_fixture_clearance_link=fixture_link,
+            minimum_fixture_clearance_sample=fixture_sample,
             planner_provenance={
                 **model_source_hashes(),
                 "curobo_commit": CUROBO_COMMIT,
@@ -1605,8 +1784,11 @@ class RetentionRouteValidator:
                 "cache_build_s": self.cache_build_s,
                 "policy": (
                     "frozen split payload arm route; measured contact-stalled active Dex3; "
-                    "strict full-robot self-collision and selected wrist/hand table plane"
+                    "strict full-robot self-collision, selected wrist/hand table plane, "
+                    "and optional exact presenter mesh"
                 ),
+                "presentation_id": self.tabletop.presentation_id,
+                "fixture_mesh_rechecked": self.fixture_mesh is not None,
                 "blocked_motor_ids": list(request.blocked_motor_ids),
                 "pressure_used_for_live_decision": False,
             },
@@ -1634,7 +1816,9 @@ def plan_tabletop_task(
     report = progress or (lambda _message: None)
     arm = request.arm
     shortlist, candidates = _load_shortlist(request)
-    open_q = _load_open_profile(arm)
+    open_profile, close_target_profile = dex3_execution_profile(arm)
+    open_q = np.asarray(open_profile, dtype=np.float64)
+    close_target_q = np.asarray(close_target_profile, dtype=np.float64)
     reference = np.asarray(request.observation.snapshot.measured_q29_rad)[
         np.asarray(arm_indices(arm))
     ]
@@ -1670,7 +1854,6 @@ def plan_tabletop_task(
         selected_round = 0
         open_plan: _OpenBranchPlan | None = None
         lift_plan: _LiftBranchPlan | None = None
-        closed_q: np.ndarray | None = None
         branch_attempt_count = 0
         search_round = 0
         strict_open_checker: CuroboKinematicCollisionChecker | None = None
@@ -1786,17 +1969,10 @@ def plan_tabletop_task(
                 )
                 _cleanup(planner)
                 planner = None
-                candidate_closed_q = np.asarray(
-                    dex3_q_from_qualified_right_mapping(
-                        candidate["execution_evidence"]["isaac_closed_q"],
-                        arm=arm,
-                    ),
-                    dtype=np.float64,
-                )
                 branch_lift = _plan_attached_lift(
                     request=request,
                     selected=candidate,
-                    closed_q=candidate_closed_q,
+                    close_target_q=close_target_q,
                     contact_command_q=branch_open.grasp.command_q_rad[-1],
                     contact_model_q=np.asarray(branch_open.grasp.model_q_rad[-1]),
                     base_T_torso=base_T_torso,
@@ -1818,13 +1994,6 @@ def plan_tabletop_task(
                 selected_branch = branch
                 selected_round = search_round
                 open_plan, lift_plan = complete
-                closed_q = np.asarray(
-                    dex3_q_from_qualified_right_mapping(
-                        selected["execution_evidence"]["isaac_closed_q"],
-                        arm=arm,
-                    ),
-                    dtype=np.float64,
-                )
                 break
 
             _cleanup(planner)
@@ -1839,13 +2008,7 @@ def plan_tabletop_task(
                     "only now removing that grasp candidate"
                 )
 
-        if (
-            selected is None
-            or selected_branch is None
-            or open_plan is None
-            or lift_plan is None
-            or closed_q is None
-        ):
+        if selected is None or selected_branch is None or open_plan is None or lift_plan is None:
             raise RuntimeError(
                 "all qualified cube grasp IK branches failed complete-path validation: "
                 f"{branch_rejections}"
@@ -1899,7 +2062,7 @@ def plan_tabletop_task(
             selected_candidate_id=str(selected["candidate_id"]),
             object_T_grasp=tuple(tuple(float(v) for v in row) for row in object_T_grasp),
             open_active_dex3_q_rad=tuple(open_q),
-            closed_active_dex3_q_rad=tuple(closed_q),
+            close_target_active_dex3_q_rad=tuple(close_target_q),
             initial_active_dex3_q_rad=(
                 request.observation.snapshot.left_dex3_q_rad
                 if arm == "left"
@@ -1929,6 +2092,8 @@ def plan_tabletop_task(
                 **model_source_hashes(),
                 "curobo_commit": CUROBO_COMMIT,
                 "arm": arm,
+                "presentation_id": request.presentation_id,
+                "fixture": (None if request.fixture is None else request.fixture.to_dict()),
                 "elapsed_s": time.monotonic() - started,
                 "grasp_shortlist_sha256": request.grasp_shortlist_sha256,
                 "candidate_count": len(candidates),
@@ -1943,6 +2108,10 @@ def plan_tabletop_task(
                 "selected_pregrasp_rotation_error_rad": (selected_branch.rotation_error_rad),
                 "rejected_grasp_branches": branch_rejections,
                 "qualification": "GraspGenX + Isaac/PhysX retained shortlist",
+                "finger_close_command_policy": (
+                    "one descriptor-defined target for every grasp; physical contact limits "
+                    "measured travel; candidate PhysX endpoints are qualification evidence only"
+                ),
                 "attachment_policy": (
                     "CuRobo AttachmentManager deterministic conservative 3x3x3 cuboid cover"
                 ),
@@ -1950,7 +2119,8 @@ def plan_tabletop_task(
                 "visual_policy": (
                     "fresh stationary AprilCube observation after supported escape; "
                     "support plane inferred from its gravity-aligned bottom face; "
-                    "configured local open-transit patch centred under the cube"
+                    "configured local open-transit patch centred under the cube; "
+                    "optional presenter fixed from the observed aligned cube pose"
                 ),
                 "open_transit_world_scope": (
                     f"{arm} wrist/hand only during patch steering; CuRobo per-link "

@@ -23,6 +23,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
 )
 from g1_dex3_tabletop.planning.tabletop_session import TabletopPlanningSession
 from g1_dex3_tabletop.tabletop_contracts import (
+    CharucoSupportedEscapeRequest,
     RetentionRouteValidationRequest,
     TabletopTaskRequest,
 )
@@ -52,6 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "plan-supported-escape",
             "plan the reversible supported-table lift before opening Dex3",
+        ),
+        (
+            "plan-charuco-supported-escape",
+            "plan the reversible supported-table lift from a fixed ChArUco board",
         ),
         (
             "plan-tabletop-task",
@@ -116,6 +121,9 @@ def _serve_tabletop() -> int:
             if command == "plan-tabletop-lifecycle":
                 request = TabletopTaskRequest.from_json(request_path)
                 result = session.plan_lifecycle(request, progress=progress)
+            elif command == "plan-charuco-supported-escape":
+                request = CharucoSupportedEscapeRequest.from_json(request_path)
+                result = plan_supported_escape(request, progress=progress)
             elif command == "validate-retention-route":
                 request = RetentionRouteValidationRequest.from_json(request_path)
                 result = session.validate_retention_route(request, progress=progress)
@@ -159,6 +167,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "validate-retention-route":
             request = RetentionRouteValidationRequest.from_json(args.request)
             result = validate_retention_route(
+                request,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            summary = {
+                "commands_robot": False,
+                "output": str(args.output.resolve()),
+                "plan_sha256": result.content_sha256,
+                "operation": args.command,
+            }
+        elif args.command == "plan-charuco-supported-escape":
+            request = CharucoSupportedEscapeRequest.from_json(args.request)
+            result = plan_supported_escape(
                 request,
                 progress=lambda message: print(message, file=sys.stderr, flush=True),
             )

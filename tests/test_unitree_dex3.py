@@ -401,10 +401,14 @@ def test_grasp_closure_accepts_stable_position_stall_and_verifies_persistence(
     assert stall.moved_motor_ids == (1, 2, 3, 4, 5, 6)
     assert stall.remaining_error_rad[3] == pytest.approx(-0.55)
     assert stall.settle_spread_rad == pytest.approx(0.0)
+    controller.begin_retention_test()
     retention = controller.verify_grasp_stall_persistence()
     assert retention.grasp_stall == stall
-    assert retention.maximum_blocked_departure_rad == pytest.approx(0.0)
+    assert retention.verified_blocked_motor_ids == (3,)
+    assert retention.maximum_contact_shift_rad == pytest.approx(0.0)
+    assert retention.settle_spread_rad == pytest.approx(0.0)
     assert retention.verification_dwell_s == pytest.approx(0.2)
+    controller.finish_retention_test()
     controller.timeout_and_close()
 
 
@@ -492,7 +496,7 @@ def test_grasp_closure_rejects_complete_empty_hand_target(dex3_sdk):
     controller.timeout_and_close()
 
 
-def test_grasp_hold_faults_when_blocked_finger_advances_after_contact(dex3_sdk):
+def test_grasp_hold_allows_closing_settle_before_post_lift_verification(dex3_sdk):
     bindings, _ = dex3_sdk
     clock = ManualClock(0.0)
     target_left = np.asarray((0.0, -0.5, -0.5, -0.6, -0.8, -0.7, -0.9))
@@ -512,55 +516,11 @@ def test_grasp_hold_faults_when_blocked_finger_advances_after_contact(dex3_sdk):
     )
     emit_pair(np.zeros(7), target_right)
 
-    def advance_with_contact(_duration_s):
-        clock.advance(0.1)
-        emit_pair(contact_left, target_right)
-
-    controller = UnitreeDex3PostureController(
-        controller_config,
-        observer=observer,
-        clock=clock,
-        sleep=advance_with_contact,
-    )
-    controller.command_grasp_until_stall(
-        active_side="left",
-        left_target_q_rad=target_left,
-        right_target_q_rad=target_right,
-        label="test cube grasp",
-    )
-    advanced = contact_left.copy()
-    advanced[3] -= 0.02
-    clock.advance(0.11)
-    emit_pair(advanced, target_right)
-
-    with pytest.raises(RuntimeError, match="grasp retention lost"):
-        controller.maintain_active_posture()
-    controller.timeout_and_close()
-
-
-def test_retention_test_reports_contact_loss_without_faulting_control_heartbeat(dex3_sdk):
-    bindings, _ = dex3_sdk
-    clock = ManualClock(0.0)
-    target_left = np.asarray((0.0, -0.5, -0.5, -0.6, -0.8, -0.7, -0.9))
-    target_right = np.zeros(7)
-    contact_left = target_left.copy()
-    contact_left[3] = -0.05
-    controller_config = config(
-        command_rate_hz=10.0,
-        posture_settle_dwell_s=0.2,
-        posture_timeout_s=1.0,
-        state_freshness_timeout_s=0.2,
-    )
-    observer = UnitreeDex3StateObserver(
-        controller_config,
-        bindings=bindings,
-        clock=clock,
-    )
-    emit_pair(np.zeros(7), target_right)
+    measured_left = contact_left.copy()
 
     def advance_with_contact(_duration_s):
         clock.advance(0.1)
-        emit_pair(contact_left, target_right)
+        emit_pair(measured_left, target_right)
 
     controller = UnitreeDex3PostureController(
         controller_config,
@@ -575,16 +535,119 @@ def test_retention_test_reports_contact_loss_without_faulting_control_heartbeat(
         label="test cube grasp",
     )
     controller.begin_retention_test()
-    advanced = contact_left.copy()
-    advanced[3] -= 0.02
+    measured_left[3] -= 0.02
     clock.advance(0.11)
-    emit_pair(advanced, target_right)
+    emit_pair(measured_left, target_right)
 
-    # The fixed-rate heartbeat keeps publishing the grasp target so the main
-    # task thread can lower along its frozen 10 mm reverse route.
     controller.maintain_active_posture()
-    with pytest.raises(Dex3RetentionLostError, match="grasp retention lost"):
+    retention = controller.verify_grasp_stall_persistence()
+    assert retention.verified_blocked_motor_ids == (3,)
+    assert retention.maximum_contact_shift_rad == pytest.approx(0.02)
+    np.testing.assert_allclose(retention.verified_q_rad, measured_left)
+    controller.timeout_and_close()
+
+
+def test_retention_test_rejects_stable_empty_hand_close_after_lift(dex3_sdk):
+    bindings, _ = dex3_sdk
+    clock = ManualClock(0.0)
+    target_left = np.asarray((0.0, -0.5, -0.5, -0.6, -0.8, -0.7, -0.9))
+    target_right = np.zeros(7)
+    contact_left = target_left.copy()
+    contact_left[3] = -0.05
+    controller_config = config(
+        command_rate_hz=10.0,
+        posture_settle_dwell_s=0.2,
+        posture_timeout_s=1.0,
+        state_freshness_timeout_s=0.2,
+    )
+    observer = UnitreeDex3StateObserver(
+        controller_config,
+        bindings=bindings,
+        clock=clock,
+    )
+    emit_pair(np.zeros(7), target_right)
+
+    measured_left = contact_left.copy()
+
+    def advance_with_contact(_duration_s):
+        clock.advance(0.1)
+        emit_pair(measured_left, target_right)
+
+    controller = UnitreeDex3PostureController(
+        controller_config,
+        observer=observer,
+        clock=clock,
+        sleep=advance_with_contact,
+    )
+    controller.command_grasp_until_stall(
+        active_side="left",
+        left_target_q_rad=target_left,
+        right_target_q_rad=target_right,
+        label="test cube grasp",
+    )
+    controller.begin_retention_test()
+    measured_left[:] = target_left
+    clock.advance(0.11)
+    emit_pair(measured_left, target_right)
+
+    # The fixed-rate heartbeat keeps publishing during the lift. Retention is
+    # decided only from the stable lifted endpoint, not one moving sample.
+    controller.maintain_active_posture()
+    with pytest.raises(Dex3RetentionLostError, match="empty-hand close target"):
         controller.verify_grasp_stall_persistence()
+    controller.timeout_and_close()
+
+
+def test_retention_reclassifies_the_stable_blocked_set_after_lift(dex3_sdk):
+    bindings, _ = dex3_sdk
+    clock = ManualClock(0.0)
+    target_left = np.asarray((0.0, -0.5, -0.5, -0.6, -0.8, -0.7, -0.9))
+    target_right = np.zeros(7)
+    contact_left = target_left.copy()
+    contact_left[3] = -0.05
+    contact_left[5] = -0.05
+    measured_left = contact_left.copy()
+    controller_config = config(
+        command_rate_hz=10.0,
+        posture_position_tolerance_rad=0.08,
+        posture_position_spread_rad=0.01,
+        posture_settle_dwell_s=0.2,
+        posture_timeout_s=1.0,
+        state_freshness_timeout_s=0.2,
+    )
+    observer = UnitreeDex3StateObserver(
+        controller_config,
+        bindings=bindings,
+        clock=clock,
+    )
+    emit_pair(np.zeros(7), target_right)
+
+    def advance_measured(_duration_s):
+        clock.advance(0.1)
+        emit_pair(measured_left, target_right)
+
+    controller = UnitreeDex3PostureController(
+        controller_config,
+        observer=observer,
+        clock=clock,
+        sleep=advance_measured,
+    )
+    stall = controller.command_grasp_until_stall(
+        active_side="left",
+        left_target_q_rad=target_left,
+        right_target_q_rad=target_right,
+        label="test cube grasp",
+    )
+    assert stall.blocked_motor_ids == (3, 5)
+
+    controller.begin_retention_test()
+    measured_left[3] = target_left[3]
+    measured_left[5] = -0.20
+    emit_pair(measured_left, target_right)
+    retention = controller.verify_grasp_stall_persistence()
+
+    assert retention.verified_blocked_motor_ids == (5,)
+    assert retention.remaining_error_rad[5] == pytest.approx(-0.5)
     controller.timeout_and_close()
 
 

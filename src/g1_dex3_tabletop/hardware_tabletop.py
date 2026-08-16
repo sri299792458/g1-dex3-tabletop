@@ -71,6 +71,7 @@ from g1_dex3_tabletop.tabletop_contracts import (
     TabletopExecutionPlan,
 )
 from g1_dex3_tabletop.tabletop_perception import observe_resting_cube
+from g1_dex3_tabletop.tabletop_presentation import load_tabletop_presentation
 from g1_dex3_tabletop.tabletop_workflow import (
     build_tabletop_request,
     load_task_config,
@@ -391,6 +392,33 @@ def _restore_seated_control(*, driver, dex_controller, guard, synchronized) -> N
     synchronized.confirm_external_takeover("PC2 verified AI FSM 0 -> 1 -> seated FSM 3")
 
 
+def _teardown_ros_runtime(
+    *,
+    no_window: bool,
+    camera,
+    node,
+    rclpy_module,
+    transport,
+    synchronized,
+) -> None:
+    """Tear ROS down only after direct robot ownership has ended."""
+
+    if (
+        transport is not None
+        and transport.requires_external_takeover
+        and (synchronized is None or synchronized.state is not ExecutorState.STOPPED)
+    ):
+        raise RuntimeError("refusing ROS teardown before verified external robot-control takeover")
+    if not no_window:
+        cv2.destroyAllWindows()
+    if camera is not None:
+        camera.close()
+    if node is not None:
+        node.destroy_node()
+    if rclpy_module is not None and rclpy_module.ok():
+        rclpy_module.shutdown()
+
+
 def _save_frames(directory: Path, frames: tuple[ROSImageFrame, ...]) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     manifest = []
@@ -418,6 +446,11 @@ def run_tabletop(args) -> int:
     if args.confirm != MOTION_ACK:
         raise ValueError(f"--confirm must equal exactly: {MOTION_ACK}")
     arm = validate_arm_side(args.arm)
+    presentation = load_tabletop_presentation(
+        args.presentation,
+        direct_shortlist_override=args.grasp_shortlist,
+    )
+    presentation.require_arm(arm)
     hardware = load_hardware(args.hardware_config)
     configured_arms = {
         str(hardware["robot"]["calibration_arm"]),
@@ -441,6 +474,9 @@ def run_tabletop(args) -> int:
     bundle_bytes = args.calibration_bundle.read_bytes()
     quality_bytes = args.quality_config.read_bytes()
     task_config_bytes = args.task_config.read_bytes()
+    presentation_config_bytes = (
+        None if presentation.config_path is None else presentation.config_path.read_bytes()
+    )
     detector = CorrespondenceDetector(args.cube_config)
     recording, _pairing = recording_configs(args.hardware_config)
     control_config, rate_hz = executor_config(args.hardware_config)
@@ -459,10 +495,16 @@ def run_tabletop(args) -> int:
     )
     preflight_frames: tuple[ROSImageFrame, ...] = ()
     loaded_frames: tuple[ROSImageFrame, ...] = ()
-    status: dict = {"status": "started", "commands_robot": False, "arm": arm}
+    status: dict = {
+        "status": "started",
+        "commands_robot": False,
+        "arm": arm,
+        "presentation_id": presentation.presentation_id,
+    }
     primary_error: BaseException | None = None
     rejection_return_completed = False
     camera = observer = dex_observer = transport = dex_controller = None
+    node = rclpy_module = None
     raw_recorder = None
     guard = synchronized = driver = planner = None
     command_lock = CommandOwnerLock(args.lock_file)
@@ -472,6 +514,7 @@ def run_tabletop(args) -> int:
             import rclpy
         except ImportError as error:
             raise RuntimeError("rclpy unavailable; use ./tools/g1_tabletop_hardware.sh") from error
+        rclpy_module = rclpy
         rclpy.init(args=None)
         node = rclpy.create_node("g1_dex3_tabletop_task")
         try:
@@ -517,9 +560,16 @@ def run_tabletop(args) -> int:
             print(
                 "READ-ONLY PREFLIGHT PASSED — seated stationary state, both Dex3 "
                 "states, rectified camera profile, and resting AprilCube are valid; "
-                "no command publisher exists",
+                f"presentation={presentation.presentation_id}; no command publisher exists",
                 flush=True,
             )
+            if presentation.fixture is not None:
+                print(
+                    "TRIPOD-H50 CONTRACT — fixture base fixed to the table; cube centred "
+                    "and yaw-aligned on its three pads; the exact fixture mesh will be a "
+                    "CuRobo obstacle",
+                    flush=True,
+                )
             planner = PersistentTabletopPlanner(
                 executable=ROOT / ".venv-planner/bin/g1-curobo-worker",
                 log_path=task_run / "planner.log",
@@ -546,6 +596,11 @@ def run_tabletop(args) -> int:
                 raise RuntimeError("capture quality configuration changed after preflight")
             if args.task_config.read_bytes() != task_config_bytes:
                 raise RuntimeError("tabletop task configuration changed after preflight")
+            if (
+                presentation.config_path is not None
+                and presentation.config_path.read_bytes() != presentation_config_bytes
+            ):
+                raise RuntimeError("tabletop presentation configuration changed after preflight")
             raw_recorder = RawEpisodeRecorder(
                 task_run / "raw_episode",
                 repository=ROOT,
@@ -636,8 +691,10 @@ def run_tabletop(args) -> int:
                 observation=loaded_observation,
                 calibration_bundle=bundle,
                 calibration_bundle_path=args.calibration_bundle,
-                grasp_shortlist_path=args.grasp_shortlist,
+                grasp_shortlist_path=presentation.grasp_shortlist_path,
                 task_config_path=args.task_config,
+                presentation_id=presentation.presentation_id,
+                fixture=presentation.fixture,
             )
             loaded_request_path = task_run / "loaded_request.json"
             execution_path = task_run / "execution_plan.json"
@@ -747,16 +804,16 @@ def run_tabletop(args) -> int:
             open_active_hand(f"{arm}-hand pregrasp open")
             execute_phase("move_to_pregrasp")
             execute_phase("grasp_approach")
-            active_closed = task.closed_active_dex3_q_rad
+            active_close_target = task.close_target_active_dex3_q_rad
             try:
                 grasp_stall = _command_grasp_fingers(
                     dex_controller,
                     driver,
                     guard,
                     active_side=arm,
-                    left=active_closed if arm == "left" else initial_left,
-                    right=active_closed if arm == "right" else initial_right,
-                    label=f"selected qualified {arm}-hand cube grasp",
+                    left=active_close_target if arm == "left" else initial_left,
+                    right=active_close_target if arm == "right" else initial_right,
+                    label=f"descriptor-defined {arm}-hand cube close",
                 )
             except Dex3GraspNotAcquiredError as error:
                 driver.check()
@@ -828,8 +885,8 @@ def run_tabletop(args) -> int:
                 retention_evidence.to_dict(),
             )
             print(
-                "RETENTION TEST PASSED — the same blocked finger posture persisted "
-                "through the test lift; continuing the full payload lift",
+                "RETENTION TEST PASSED — a fresh stable finger stall remained after "
+                "the test lift; continuing the full payload lift",
                 flush=True,
             )
             execute_phase("payload_lift")
@@ -859,6 +916,7 @@ def run_tabletop(args) -> int:
                 "status": "completed",
                 "commands_robot": True,
                 "arm": arm,
+                "presentation_id": presentation.presentation_id,
                 "selected_candidate_id": task.selected_candidate_id,
                 "execution_plan_sha256": execution.content_sha256,
                 "grasp_stall": grasp_stall.to_dict(),
@@ -877,15 +935,10 @@ def run_tabletop(args) -> int:
                 flush=True,
             )
         finally:
-            if not args.no_window:
-                cv2.destroyAllWindows()
-            if "node" in locals():
-                if camera is not None:
-                    camera.close()
-                    camera = None
-                node.destroy_node()
-            if "rclpy" in locals() and rclpy.ok():
-                rclpy.shutdown()
+            # Robot ownership is resolved by the outer lifecycle handlers. ROS
+            # teardown must remain later because participant destruction can
+            # block Python callbacks long enough to stale the control state.
+            pass
     except TabletopTaskRejected as rejection:
         try:
             _restore_seated_control(
@@ -900,6 +953,7 @@ def run_tabletop(args) -> int:
                 "status": "failed",
                 "commands_robot": bool(transport is not None and transport.command_count),
                 "arm": arm,
+                "presentation_id": presentation.presentation_id,
                 "error_type": type(error).__name__,
                 "error": f"task rejection recovery failed after {rejection}: {error}",
             }
@@ -908,6 +962,7 @@ def run_tabletop(args) -> int:
             "status": "task_rejected",
             "commands_robot": bool(transport is not None and transport.command_count),
             "arm": arm,
+            "presentation_id": presentation.presentation_id,
             "reason": str(rejection),
             "terminal_action": guard.terminal_action,
             "frozen_reverse_return_completed": rejection_return_completed,
@@ -930,17 +985,13 @@ def run_tabletop(args) -> int:
             "status": "failed",
             "commands_robot": bool(transport is not None and transport.command_count),
             "arm": arm,
+            "presentation_id": presentation.presentation_id,
             "error_type": type(error).__name__,
             "error": str(error),
         }
         raise
     finally:
         cleanup_errors: list[str] = []
-        if planner is not None:
-            try:
-                planner.close()
-            except BaseException as error:  # noqa: BLE001
-                cleanup_errors.append(f"planner: {error}")
         if driver is not None and driver.is_alive:
             try:
                 driver.close()
@@ -964,6 +1015,11 @@ def run_tabletop(args) -> int:
                 )
             except BaseException as error:  # noqa: BLE001
                 cleanup_errors.append(f"PC2 takeover: {error}")
+        if planner is not None:
+            try:
+                planner.close()
+            except BaseException as error:  # noqa: BLE001
+                cleanup_errors.append(f"planner: {error}")
         if dex_controller is not None:
             try:
                 if not dex_controller.timed_out and guard is not None and guard.terminal_action:
@@ -978,6 +1034,19 @@ def run_tabletop(args) -> int:
                     value.close()
                 except BaseException as error:  # noqa: BLE001
                     cleanup_errors.append(f"{name}: {error}")
+        try:
+            _teardown_ros_runtime(
+                no_window=args.no_window,
+                camera=camera,
+                node=node,
+                rclpy_module=rclpy_module,
+                transport=transport,
+                synchronized=synchronized,
+            )
+            camera = None
+            node = None
+        except BaseException as error:  # noqa: BLE001
+            cleanup_errors.append(f"ROS teardown: {error}")
         command_lock.release()
         if raw_recorder is not None and (raw_recorder.started or raw_recorder.summary is not None):
             try:

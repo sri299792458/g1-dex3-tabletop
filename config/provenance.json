@@ -10,6 +10,14 @@
       "commit": "724ee07079c25765b3e630f5508bca3b7731eef5",
       "source": "artifacts/grasp_shortlists/cube_right_executable_v1/shortlist.yaml",
       "runtime_policy": "shared object_T_G with exact left/right Dex3 side adapter"
+    },
+    "cube_tripod_h50": {
+      "repository": "sri299792458/g1-aprilcube-demo",
+      "commit": "4325bc94988b44554f106b206fb1bcd650cfd619",
+      "fixture_source": "hardware/fixtures/cube_tripod_presenter/cube_tripod_presenter_h50.stl",
+      "fixture_shortlist_source": "artifacts/grasp_shortlists/cube_tripod_right_v1/h50/shortlist.yaml",
+      "arm_grasp_pool_source": "artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml",
+      "runtime_policy": "opt-in exact-mesh presenter with all 372 fixture-qualified candidates; PhysX contact endpoints are evidence only and hardware uses the fixed Dex3 descriptor close target"
     }
   },
   "upstream": {

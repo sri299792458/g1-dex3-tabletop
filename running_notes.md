@@ -120,6 +120,40 @@
 
 ### Hardware facts carried forward
 
+- This physical G1 publishes two distinct IMU streams. `/lowstate.imu_state`
+  measures the pelvis, while `/secondary_imu` (`unitree_hg/msg/IMUState`)
+  measures the torso. A read-only live check on 2026-08-16 observed different
+  orientations and raw accelerations from the two streams. Raw episode profile
+  `g1_seated_tabletop_raw_v2` therefore requires both; the torso stream directly
+  observes camera-body rotation but does not provide translation.
+- The same raw profile requires the D435i's separate
+  `/camera/gyro/sample` and `/camera/accel/sample` streams. PC2 enables the two
+  physical motion streams with the RealSense driver's `unite_imu_method=0`, so
+  the bag retains raw angular velocity and linear acceleration rather than a
+  driver-interpolated orientation. `--skip-camera-recording` continues to omit
+  the high-bandwidth image streams while these low-bandwidth motion topics
+  remain recorded.
+- Native unaligned D435i Z16 depth is enabled at 640x480x15 and recorded with
+  its CameraInfo by default. This is the RealSense measurement relevant to
+  table-normal translation: an offline plane fit can recover camera-to-table
+  distance and plane normal. It cannot observe translation parallel to an
+  otherwise featureless plane. Live alignment, point-cloud generation, and
+  depth processing remain disabled on PC2. A camera-only live check on
+  2026-08-16 confirmed 15.00 Hz depth, 199.5 Hz gyro, and 100.1 Hz accel on the
+  laptop, after which the temporary node was stopped and `video_hub_pc4` was
+  restored. No robot command publisher was created.
+- `/tf_static` is also a required low-bandwidth recording topic. The same live
+  check verified that the serial-specific driver publishes the complete
+  `camera_link` transforms for depth, color, gyro, and accel frames, including
+  the nonzero factory depth-to-color baseline. Consequently pixel alignment can
+  be performed offline from the raw images, both CameraInfo messages, and the
+  recorded static transforms; no live alignment is needed on PC2.
+- A 3.87-second plain-MCAP integration check started after the driver and still
+  received the transient-local transform tree: 1 `/tf_static` message, 58 depth
+  images, 58 depth CameraInfo messages, 773 gyro messages, and 387 accel
+  messages. The depth-plus-motion bag wrote 34.5 MiB (about 8.9 MiB/s). The
+  temporary verification bag was deleted and the factory camera service was
+  restored; no robot command publisher was created.
 - On this G1, Ready is locomotion FSM 4, seated is FSM 3, Damp is FSM 1, and
   selecting AI motion service first reaches zero-torque FSM 0. Seated debug
   lowcmd restoration must follow the physically verified `0 -> 1 -> 3` chain.
@@ -146,6 +180,182 @@
   deterministic holdout and bootstrap evidence in each new bundle. The current
   tabletop task uses that bundle for visual localization but does not claim
   same-image hand-marker cancellation or calibration ground truth.
+
+## 2026-08-16 — Matched cushion/rigid fixed-board diagnostic
+
+- Added `measure-seat-compliance` as a diagnostic separate from the cube grasp
+  lifecycle. It requires the already frozen `DICT_5X5_50`, 6x9, 30/22 mm
+  ChArUco board fixed to the table. It never fabricates a cube, table extent,
+  grasp, finger motion, or payload.
+- After one SPACE approval, the existing seated debug-lowcmd takeover, complete
+  dual-Dex3 gravity feedforward, PC2 watchdog, fixed-rate controller, measured
+  Dex3 hold, and verified FSM `0 -> 1 -> 3` restoration remain unchanged.
+- Both arm plans are generated from one post-takeover loaded state before the
+  first changing target. The existing CuRobo supported-escape implementation
+  now accepts the board plane as an alternative plane source: strict full-robot
+  self-collision, selected wrist/hand plane guard, 100 mm normal lift, and the
+  exact frozen reverse are unchanged. No fake scene object or table box is
+  added.
+- The controller switches active arms through the same full-weight
+  `adopt_owned_control` mechanism already commissioned by automatic
+  calibration. Only one arm moves at a time; the other arm and complete body
+  remain held. The measured finger postures are never changed.
+- The default run performs five left/right pairs. It measures the fixed-board
+  pose at loaded baseline, each lifted endpoint, and each exact return. Board
+  burst spread is recorded rather than promoted into a new arbitrary rejection
+  threshold; every accepted frame still passes the frozen ChArUco geometry,
+  corner-count, positive-depth, IPPE-ambiguity, and reprojection checks.
+- Raw profile `g1_seated_tabletop_raw_v2` records the synchronized evidence
+  needed for offline attribution: pelvis and torso IMUs, waist/arm measured and
+  commanded states, both Dex3 streams, RealSense gyro/accel, native depth/RGB,
+  both CameraInfo streams, and `/tf_static`. One condition alone establishes
+  camera motion relative to the board. Only a matched run on the same chair
+  frame with the cushion replaced by rigid non-slip support can attribute an
+  excess to seat compliance.
+- This implementation was verified offline only; no robot command was issued.
+
+### Physical runs, result, and operating decision
+
+- The physical runs are retained at
+  `runs/seat_compliance_cushion_20260816T120404Z` and
+  `runs/seat_compliance_rigid_20260816T121420Z`. Both completed all five
+  left/right lift-return pairs, restored seated control, reported no cleanup or
+  recorder problems, and retained complete 14-topic MCAPs. The cushion run has
+  1,212,481 messages over 266.80 s; the rigid run has 1,128,698 messages over
+  248.71 s.
+- Do not interpret the `status.json` motion summary as the isolated lift
+  response. It compares every endpoint with the early loaded observation made
+  before both CuRobo plans and therefore includes planning-time startup
+  settling. The analysis below uses repetitions 2--5 and brackets every lift
+  with the immediately preceding and following returned observations.
+- That warning applies to the two retained physical runs above. The diagnostic
+  code was subsequently corrected: every new cycle records an explicit
+  `pre_lift` board/state burst while the fixed-rate controller holds the arm,
+  and new `status.json` summaries report `pre_lift -> lifted`,
+  `pre_lift -> returned`, and `lifted -> returned`. The early loaded observation
+  remains planning provenance only and is no longer labeled as lift motion.
+- Relative to the preceding return, the cushion run measured
+  `10.825 +/- 0.132 mm, 1.399 +/- 0.008 deg` for the left arm and
+  `10.386 +/- 0.346 mm, 1.659 +/- 0.056 deg` for the right arm. The rigid run
+  measured `5.355 +/- 0.221 mm, 0.707 +/- 0.029 deg` and
+  `5.260 +/- 0.046 mm, 0.790 +/- 0.009 deg`, respectively.
+- Comparing each lift with its following exact return gives the same
+  conclusion: cushion `9.112 +/- 0.103 mm, 1.212 +/- 0.015 deg` left and
+  `10.719 +/- 0.347 mm, 1.660 +/- 0.043 deg` right; rigid
+  `4.260 +/- 0.068 mm, 0.522 +/- 0.007 deg` left and
+  `3.783 +/- 0.140 mm, 0.529 +/- 0.018 deg` right. The rigid support reduced
+  the observed translation by approximately 50--65 percent and rotation by
+  approximately 50--69 percent, but did not eliminate body-relative table
+  motion.
+- This is physical motion rather than ChArUco estimation noise. Rigid-run
+  endpoint bursts had median spread `0.068 mm / 0.020 deg` and maximum spread
+  `0.210 mm / 0.047 deg`. Native D435i depth independently measured the
+  board-normal component as approximately `3.5--4.3 mm` on the cushion and
+  `0.8--1.3 mm` on rigid support, closely matching the ChArUco differential.
+- The endpoint IMUs independently confirm the rotation. In steady repetitions,
+  the torso IMU changed by approximately `1.396 deg` left and `1.589 deg`
+  right on the cushion, versus `0.752 deg` and `0.790 deg` on rigid support.
+  The pelvis IMU moved less, showing that both seat/pelvis motion and measured
+  waist deflection contribute.
+- The complete-body lowcmd waist targets did not change during a lift. Measured
+  waist-pitch error at lifted endpoints was approximately `2.3 deg` on the
+  cushion and `1.2 deg` on rigid support. Combining the fixed-board observation
+  with measured waist FK attributes the rigid-run response approximately to a
+  `3.72 mm / 0.514 deg` waist-state effect plus a `1.96 mm / 0.221 deg`
+  pelvis/support effect on the left, and `2.61 mm / 0.408 deg` plus
+  `3.30 mm / 0.430 deg` on the right. These are 3D transform effects and their
+  scalar norms are not additive.
+- **Causal limitation:** the physical runs were not posture-matched. Loaded
+  waist pitch was `7.118 deg` for the cushion run and `0.101 deg` for the rigid
+  run; the observed board normal differed by `14.984 deg` in the camera frame,
+  and the loaded arm configurations and resulting CuRobo trajectories also
+  differed. Moving the board does not invalidate within-run relative motion,
+  but the posture change prevents assigning every millimetre of the difference
+  uniquely to cushion compression. Preserve this limitation in any report.
+- **Operating decision:** continue tabletop development on the rigid chair.
+  This is an engineering decision supported by the consistent reduction across
+  both arms, ChArUco, depth, pelvis IMU, torso IMU, measured joints, and unchanged
+  commands; it is not a claim that the present experiment perfectly isolated
+  cushion compliance. Do not change the camera calibration bundle from this
+  diagnostic.
+- The residual rigid-chair motion remains task-significant for a 40 mm cube.
+  The tabletop pipeline should eventually observe the cube again after the
+  supported arm has lifted and the loaded body has settled, then plan from the
+  fresh measured 29-joint state. This corrects the proven observation-to-motion
+  state change without requiring the wrist marker. Gain or integral tuning is
+  deferred; it cannot remove support translation and should not be substituted
+  for this measurement-timing correction.
+- A future causal follow-up should use a rigid spacer with the cushion's seat
+  height, keep the board and head pitch fixed, match the loaded waist and arm
+  posture, and record an explicit board burst immediately before every lift.
+  Three repetitions per condition should be adequate given the repeatability
+  seen here. Until that test, retain the raw runs and describe the cushion
+  contribution as strong but posture-confounded evidence.
+
+### Offline camera state-estimation benchmark
+
+- Added a read-only research stack in `state_estimation.py` and
+  `state_estimation_replay.py`. It filters the retained MCAP to state and timing
+  topics, creates no Unitree publisher, hash-binds the source observations,
+  URDF, and removable calibration bundle, and evaluates explicit estimator
+  hypotheses against the fixed-board camera pose. The design and limitations
+  are documented in `docs/state-estimation-research.md`.
+- The rigid legacy run uses repetitions 2--5 and anchors each lift to its
+  immediately preceding returned observation. Its uncorrected camera motion is
+  `5.355 mm / 0.707 deg` left and `5.260 mm / 0.790 deg` right. A hybrid using
+  pelvis-IMU orientation plus measured waist FK for position and the torso IMU
+  for orientation leaves `1.052 mm / 0.123 deg` left and
+  `1.220 mm / 0.104 deg` right after pairing through the fitted image-header to
+  MCAP clock mapping.
+- These numbers depend on a short-horizon fixed-pelvis-IMU-origin contact
+  hypothesis. They do not prove globally observable odometry. Absolute
+  position and yaw still require a visual/depth landmark, VIO/SLAM, or another
+  external update. Do not copy the hybrid into the robot controller until it
+  passes continuous-trajectory and changed-posture replay tests.
+- Replaying the same estimator on the cushion run reduced
+  `10.825 mm / 1.399 deg` to `1.920 mm / 0.139 deg` left and
+  `10.386 mm / 1.659 deg` to `1.963 mm / 0.135 deg` right. The remaining
+  translation is about twice the rigid-chair residual, consistent with the
+  fixed-pelvis-origin hypothesis degrading on compliant support. The
+  cross-condition posture confound still applies.
+- MCAP timing shows roughly 1,000 changed LowState ticks/s; about four percent
+  of recorded messages are consecutive duplicate ticks and must be
+  deduplicated. RealSense producer clocks have a stable large offset from MCAP
+  receipt time, and color versus D435i IMU headers differ systematically by
+  about `68.6 ms`; fit each stream to MCAP time independently.
+- After fitting the RealSense color header clock to MCAP time, the lowcmd joint
+  target was already static for `0.82--0.85 s` before every lifted image burst.
+  Waiting longer is not the primary remedy. The application image callback
+  receipt was about `102 ms` late at the median endpoint and reached `190 ms`,
+  so it remains diagnostic metadata rather than a fusion timestamp. Endpoint
+  accelerometer noise is approximately `0.03--0.06 m/s^2` per axis,
+  far too large for unanchored double integration to recover millimetre
+  translation over these multi-second motions.
+- Added a continuous fixed-board replay using the unchanged strict ChArUco
+  detector. It evaluates only loaded-baseline through final-return time; the
+  earlier draft incorrectly included post-task seated-controller restoration,
+  which produced unrelated cushion outliers. Every tenth RGB frame was enough
+  for the architectural comparison. A single initial hybrid anchor accumulated
+  `4.661 mm` mean error on rigid support. With fresh 6D visual anchors at a
+  realized `1.335 s` cadence, propagation was `0.371 mm` mean and `0.873 mm`
+  p95; at `2.002 s`, it was `0.427 mm` mean and `0.993 mm` p95. Cushion results
+  were `0.435/1.189 mm` and `0.497/1.389 mm` at the same cadences.
+- Added an independent native-depth plane replay using the recorded D435i
+  color/depth static TF. RGB and depth are phase-shifted by `66.67 ms`; poses
+  are interpolated in their common hardware-header clock. On rigid support,
+  338 sampled frames gave `-0.341 mm` mean depth-minus-ChArUco plane offset,
+  `0.513 mm` p95 absolute offset, `0.292 deg` mean normal disagreement, and
+  `0.827 mm` plane-fit RMS. Cushion results were `-1.869 mm`, `2.035 mm`,
+  `0.639 deg`, and `0.746 mm`. Within-run offset standard deviations were only
+  `0.104 mm` and `0.094 mm`; depth is useful for relative tilt/table-normal
+  correction but not for table X/Y or yaw, and its absolute bias is not shared
+  across these changed views.
+- The first integration contract is therefore visual 6D anchoring after loaded
+  ownership, high-rate hybrid IMU/waist-FK propagation, depth-plane tilt/height
+  updates, and fresh visual resets at 1--2 second stationary task boundaries.
+  Missing visual evidence grows uncertainty; it does not authorize an invented
+  in-plane correction. CuRobo replanning consumes the boundary estimate later;
+  continuous trajectory deformation is not part of this research stack.
 
 ## 2026-08-04 — Continuous GUIDE/HOLD teaching replaced per-pose acquisition
 
@@ -2847,3 +3057,153 @@ the full two-color plate and check the marker with the detector.
   faults—and Ctrl+C—still retain the PC2 zero-torque path.
 - Repository verification after the refactor: `278 passed, 4 skipped`; Ruff
   formatting and lint checks both pass.
+
+## 2026-08-15 — Opt-in h50 tripod presentation
+
+- Pulled `sri299792458/g1-aprilcube-demo` through merge commit `25748ec`; its
+  source change `e9b4c1f` adds exact 40/50/60 mm printed presenter meshes and
+  fixture-conditioned right-Dex3 proposal sets. The h50 STL SHA-256 is
+  `2da7c59130b78a777fdb85b1aef5d3291adccb990bf7a75ca32bb30066eaade2`.
+- The fixture is an opt-in presentation, not a second task controller. The
+  existing `run-tabletop` command gains `--presentation tripod-h50`; the
+  omitted/default value is `direct`, whose request and CuRobo scene contain no
+  fixture. All observation, safety, planning-session, execution, retention,
+  recovery, recording, and seated-restoration code remains shared.
+- The h50 request hash-binds the fixture ID, repository-relative mesh path,
+  mesh hash, millimetre-to-metre scale, 50 mm support height, and the explicit
+  `centred_and_yaw_aligned` cube contract. The observed cube fixes the fixture
+  pose. Only tripod mode moves the inferred table plane from the cube bottom
+  to the actual table 50 mm below it.
+- CuRobo receives the exact mesh for supported escape, open approach, and
+  attached-payload planning. After physical contact, the retained 14-joint
+  validator inserts the measured finger posture into the unchanged payload
+  arm route and additionally checks all resulting robot spheres against the
+  exact transformed presenter mesh. Direct mode skips mesh loading and that
+  recheck.
+- Remote commit `4325bc9` adds the previously omitted source pool with each
+  candidate's exact `closed_before_tug` PhysX joint state. The runtime
+  shortlist joins all 372 h50-qualified candidates to that evidence by
+  candidate ID, source index, content hash, and pose. These achieved contact
+  states remain qualification evidence only; the physical close command comes
+  from the single fixed Dex3 descriptor profile. All 372 are source-qualified
+  for the common 70 mm runtime approach; the source also records 365 at 100 mm
+  and 353 at 150 mm. CuRobo receives the complete 372-candidate set as one goal
+  set.
+- Validation was local only; no robot command was issued. The full repository
+  suite passes (`282 passed, 4 skipped`), Ruff formatting/lint and diff checks
+  pass, the exact-mesh CPU query reports the expected `-70..-20 mm` vertical
+  bounds, and an offline CUDA/CuRobo construction accepted the combined cube,
+  table patch, and exact tripod mesh scene from a retained robot snapshot with
+  goal-set capacity 372.
+
+## 2026-08-15 — Single-face planar PnP branch correction
+
+- Retained run `tabletop_20260815T160830Z` failed its unchanged 5 mm cube-pose
+  spread check even though its five loaded-observation images show a stationary
+  object. The selected observation was tag 1 on face `-X` in every frame, with
+  a 61.7--62.0 px short side.
+- Exact offline replay isolated one bad PnP branch in `frame_000`: the existing
+  cold-start SQPnP result was about 19.8 mm and 61 degrees from the other four
+  frames and had 1.242 px RMS reprojection error. Generic planar IPPE returned
+  both mathematical solutions; its other branch had 0.107 px RMS error and
+  joined the stationary cluster. This was neither object motion nor a reason
+  to relax the tabletop quality gate.
+- The correction is centralized in the vendored AprilCube pose estimator. Only
+  a cold-start observation with exactly four coplanar object points uses
+  generic `SOLVEPNP_IPPE`; all returned solutions are required to keep every
+  object point at positive camera depth, and the lower-reprojection solution is
+  selected before the existing LM refinement. Prior-seeded, multi-point, and
+  nonplanar solves keep their existing paths. `SOLVEPNP_IPPE_SQUARE` is not
+  used because the cube-face points are expressed in the cube frame rather than
+  OpenCV's required centered square convention.
+- A numerical AprilCube regression test stores only the four detected image
+  corners, four known object corners, and camera matrix from the failed frame;
+  it does not depend on retaining the large run. Replaying all five saved images
+  through the unchanged tabletop observation code now measures 1.585 mm
+  translation spread and 0.472 degrees rotation spread, below the existing
+  5 mm and 2 degree limits. No robot command was issued for this diagnosis or
+  fix.
+
+## 2026-08-15 — Grasp pose and finger-close contracts separated
+
+- Reading the GraspGen-X paper and NVIDIA's released end-to-end code confirmed
+  the intended interface: inference returns an SE(3) grasp pose and score for a
+  gripper with one predefined open-to-close motion. A candidate-specific final
+  finger posture is not a model output.
+- Our shortlist's `isaac_closed_q` is the measured result after simulated
+  contact. It is useful qualification evidence, but the initial tabletop code
+  incorrectly promoted it into the hardware close command. The fixed descriptor
+  close target was loaded in the first implementation and then left unused.
+- The canonical Dex3 profile now carries the exact fixed close target used by
+  the qualified descriptor. Both the provisional attached-payload model and
+  physical controller use that target for every grasp. Finite gains allow
+  contact to limit each physical joint independently; the resulting measured
+  posture still undergoes the existing strict route recheck before any lift.
+- Executable plans now name the field `close_target_active_dex3_q_rad`. Plan
+  construction and deserialization reject open or close values that differ from
+  the hash-bound descriptor profile. No runtime Python source reads
+  `isaac_closed_q`; the retained shortlist data remain unchanged for offline
+  qualification analysis.
+- This is a reusable interface lesson: generated intent, simulated outcome, and
+  hardware command must have separate types and names even when all three are
+  stored in one artifact pipeline.
+- Offline verification after the change: 282 tests passed and 4
+  hardware/environment tests were skipped; Ruff formatting, Ruff linting, JSON
+  parsing, and Git whitespace checks all passed. No robot command was sent.
+
+## 2026-08-15 — Robot ownership now precedes ROS teardown
+
+- Retained run `tabletop_20260815T162444Z` reached the exact final handoff
+  command and held it for 1.120 seconds. The laptop command stream then paused
+  for 209.2 ms and the controller rejected its 206 ms-old cached LowState
+  against the unchanged 100 ms freshness limit. The independent MCAP recorder
+  saw only an 18.5 ms maximum LowState gap, proving the robot/network stream
+  itself remained healthy.
+- The failure path returned from the complete frozen rejection route and then
+  destroyed the camera node and called `rclpy.shutdown()` before its outer
+  handler restored seated control. That ROS participant teardown temporarily
+  starved the Python control thread and its Unitree callback while direct
+  lowcmd ownership was still active. Earlier failed runs contain the same
+  approximately 199--210 ms terminal command gap, but their primary errors
+  hid this secondary lifecycle fault.
+- ROS teardown now occurs only in the outer resource cleanup, after either the
+  normal verified seated takeover or the failure-path verified PC2 zero-torque
+  takeover. Planner shutdown was moved behind the same ownership boundary.
+  A runtime invariant refuses camera/node/ROS teardown whenever a direct-control
+  transport still requires takeover and the executor has not reached `STOPPED`.
+- The 100 ms state-freshness, 250 ms controller-gap, and 500 ms PC2-watchdog
+  limits remain unchanged. Regression tests prove ROS resources are untouched
+  before takeover and close in order after takeover. Offline verification:
+  284 tests passed and 4 hardware/environment tests were skipped; Ruff and Git
+  whitespace checks passed. No robot command was sent.
+
+## 2026-08-15 — Post-lift stall is remeasured instead of frozen at first contact
+
+- Source review corrected the naming: the fixed descriptor close is NVIDIA
+  GR00T-VisualSim2Real's explicit Dex3 `close` profile. It is distinct from
+  GR00T-WholeBodyControl's `middle_close`, which its VLA runner uses as a
+  generic closed-hand posture. The tabletop runtime retains the
+  VisualSim2Real profile used by the GraspGenX/PhysX qualification; no new
+  close target was introduced.
+- The prior retention check incorrectly treated the first stable contact angle
+  as immutable. It rejected any initially blocked motor that advanced more
+  than the `0.01 rad` settling-band value, even though the unchanged fixed
+  close target remains commanded and a loaded grasp can settle farther during
+  the test lift.
+- The controller now continues publishing the exact same fixed close target
+  throughout the test lift and makes no contact decision from a single moving
+  sample. At the lifted endpoint it collects a new stable window using the
+  unchanged `0.08 rad` endpoint tolerance, `0.01 rad` peak-to-peak stability
+  band, `0.5 s` dwell, and existing timeout. At least one closing joint must
+  remain short of the empty-hand target. The final blocked-motor set may differ
+  from the initial set; stable complete empty-hand closure is a failed grasp.
+- Retention evidence now records the post-lift joint vector, post-lift blocked
+  IDs and names, residuals to the fixed close target, peak-to-peak settling
+  spread, and maximum shift from the initial contact posture. That shift is
+  diagnostic rather than a pass/fail threshold. Raw velocity, effort, and
+  pressure remain diagnostic only.
+- No additional finger-sweep or post-lift collision pass was added. The
+  existing provisional fixed-close CuRobo planning and measured first-contact
+  route validation remain unchanged. Offline verification passes with
+  `285 passed, 4 skipped`; Ruff and Git whitespace checks pass. No robot
+  command was sent.

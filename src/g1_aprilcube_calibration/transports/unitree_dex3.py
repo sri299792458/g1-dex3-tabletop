@@ -321,21 +321,37 @@ class Dex3GraspStallEvidence:
 
 @dataclass(frozen=True, slots=True)
 class Dex3RetentionEvidence:
-    """The same blocked joints remained blocked through a test-lift dwell."""
+    """A stable position stall remained after the physical test lift."""
 
     grasp_stall: Dex3GraspStallEvidence
     verified_q_rad: tuple[float, ...]
-    maximum_blocked_departure_rad: float
+    verified_blocked_motor_ids: tuple[int, ...]
+    remaining_error_rad: tuple[float, ...]
+    maximum_contact_shift_rad: float
+    settle_spread_rad: float
     verification_dwell_s: float
 
     def __post_init__(self) -> None:
         if not isinstance(self.grasp_stall, Dex3GraspStallEvidence):
             raise TypeError("Dex3 retention evidence requires grasp-stall evidence")
-        q = np.asarray(self.verified_q_rad, dtype=np.float64).reshape(-1)
-        if q.shape != (DEX3_MOTOR_COUNT,) or not np.all(np.isfinite(q)):
-            raise ValueError("Dex3 retention verified posture must contain seven finite values")
-        object.__setattr__(self, "verified_q_rad", tuple(float(value) for value in q))
-        for name in ("maximum_blocked_departure_rad", "verification_dwell_s"):
+        for name in ("verified_q_rad", "remaining_error_rad"):
+            value = np.asarray(getattr(self, name), dtype=np.float64).reshape(-1)
+            if value.shape != (DEX3_MOTOR_COUNT,) or not np.all(np.isfinite(value)):
+                raise ValueError(f"Dex3 retention {name} must contain seven finite values")
+            object.__setattr__(self, name, tuple(float(item) for item in value))
+        blocked = tuple(int(value) for value in self.verified_blocked_motor_ids)
+        if (
+            not blocked
+            or len(set(blocked)) != len(blocked)
+            or any(value < 0 or value >= DEX3_MOTOR_COUNT for value in blocked)
+        ):
+            raise ValueError("Dex3 retention verified blocked motor IDs are invalid")
+        object.__setattr__(self, "verified_blocked_motor_ids", blocked)
+        for name in (
+            "maximum_contact_shift_rad",
+            "settle_spread_rad",
+            "verification_dwell_s",
+        ):
             value = float(getattr(self, name))
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"Dex3 retention {name} must be finite and non-negative")
@@ -345,7 +361,14 @@ class Dex3RetentionEvidence:
         return {
             "grasp_stall": self.grasp_stall.to_dict(),
             "verified_q_rad": list(self.verified_q_rad),
-            "maximum_blocked_departure_rad": self.maximum_blocked_departure_rad,
+            "verified_blocked_motor_ids": list(self.verified_blocked_motor_ids),
+            "verified_blocked_joint_names": [
+                dex3_motor_joint_name(self.grasp_stall.active_side, value)
+                for value in self.verified_blocked_motor_ids
+            ],
+            "remaining_error_rad": list(self.remaining_error_rad),
+            "maximum_contact_shift_rad": self.maximum_contact_shift_rad,
+            "settle_spread_rad": self.settle_spread_rad,
             "verification_dwell_s": self.verification_dwell_s,
         }
 
@@ -484,8 +507,8 @@ class UnitreeDex3PostureController:
         self._active_left_target: np.ndarray | None = None
         self._active_right_target: np.ndarray | None = None
         self._active_grasp_stall: Dex3GraspStallEvidence | None = None
+        self._active_retention: Dex3RetentionEvidence | None = None
         self._retention_test_active = False
-        self._retention_test_loss: Dex3RetentionLostError | None = None
         self.command_count = 0
 
     @property
@@ -516,8 +539,8 @@ class UnitreeDex3PostureController:
         self._active_left_target = initial.left.position.copy()
         self._active_right_target = initial.right.position.copy()
         self._active_grasp_stall = None
+        self._active_retention = None
         self._retention_test_active = False
-        self._retention_test_loss = None
         return initial
 
     def acquire_posture(
@@ -539,8 +562,8 @@ class UnitreeDex3PostureController:
         self._active_left_target = np.asarray(self.config.left_target_q_rad, dtype=np.float64)
         self._active_right_target = np.asarray(self.config.right_target_q_rad, dtype=np.float64)
         self._active_grasp_stall = None
+        self._active_retention = None
         self._retention_test_active = False
-        self._retention_test_loss = None
         return result
 
     def command_posture(
@@ -570,8 +593,8 @@ class UnitreeDex3PostureController:
         self._active_left_target = left.copy()
         self._active_right_target = right.copy()
         self._active_grasp_stall = None
+        self._active_retention = None
         self._retention_test_active = False
-        self._retention_test_loss = None
         return result
 
     def command_grasp_until_stall(
@@ -585,9 +608,9 @@ class UnitreeDex3PostureController:
     ) -> Dex3GraspStallEvidence:
         """Close smoothly and accept only stable blockage before the target.
 
-        The threshold and dwell deliberately reuse the physically commissioned
-        empty-hand posture tolerance and settling limits. Raw ``dq``, pressure,
-        and effort are not used by the live decision.
+        The decision deliberately reuses the existing position-tolerance and
+        settling limits. Raw ``dq``, pressure, and effort are not used by the
+        live decision.
         """
 
         if active_side not in DEX3_MOTOR_JOINT_SUFFIXES:
@@ -610,29 +633,35 @@ class UnitreeDex3PostureController:
         self._active_left_target = left.copy()
         self._active_right_target = right.copy()
         self._active_grasp_stall = evidence
+        self._active_retention = None
         self._retention_test_active = False
-        self._retention_test_loss = None
         return evidence
 
     def begin_retention_test(self) -> None:
-        """Treat contact loss during the small test lift as a task outcome."""
+        """Allow contact to settle during the small physical test lift."""
 
         if self._active_grasp_stall is None:
             raise RuntimeError("Dex3 grasp stall was not acquired before the test lift")
+        self._active_retention = None
         self._retention_test_active = True
-        self._retention_test_loss = None
 
     def finish_retention_test(self) -> None:
-        """Return contact monitoring to fail-closed behavior after a passed test."""
+        """Finish only after a new stable post-lift stall was measured."""
 
-        self.check_retention_test()
+        if self._active_retention is None:
+            raise RuntimeError("Dex3 retention was not verified after the test lift")
         self._retention_test_active = False
 
     def check_retention_test(self) -> None:
-        """Raise in the task thread if the heartbeat observed contact loss."""
+        """Confirm that the test-lift interval is active.
 
-        if self._retention_test_loss is not None:
-            raise self._retention_test_loss
+        Contact cannot be inferred from one moving sample. The controller keeps
+        publishing the fixed close target during the lift and makes the
+        retention decision from a fresh stable window at the lifted endpoint.
+        """
+
+        if not self._retention_test_active:
+            raise RuntimeError("Dex3 retention test is not active")
 
     def restore_initial_posture(
         self,
@@ -652,8 +681,8 @@ class UnitreeDex3PostureController:
         self._active_left_target = self._initial_posture.left.position.copy()
         self._active_right_target = self._initial_posture.right.position.copy()
         self._active_grasp_stall = None
+        self._active_retention = None
         self._retention_test_active = False
-        self._retention_test_loss = None
         return result
 
     def _move_to_grasp_stall(
@@ -792,32 +821,168 @@ class UnitreeDex3PostureController:
         *,
         safety_heartbeat: Callable[[], None] | None = None,
     ) -> Dex3RetentionEvidence:
-        """Require the blocked posture to persist for one commissioned dwell."""
+        """Require a fresh stable stall after the physical test lift.
+
+        The hand keeps receiving the same fixed close target throughout the
+        lift. Contact may therefore settle farther in the closing direction;
+        retention does not require the exact first-contact joint values or the
+        original blocked-motor set to remain unchanged.
+        """
 
         if self._active_grasp_stall is None:
             raise RuntimeError("Dex3 grasp stall was not acquired before retention verification")
-        if self._retention_test_loss is not None:
-            raise self._retention_test_loss
+        if not self._retention_test_active:
+            raise RuntimeError("Dex3 retention test was not started")
         started = self.clock.monotonic()
-        maximum_departure = 0.0
-        pair = self.observer.observe()
+        deadline = started + self.config.posture_timeout_s
+        contact = np.asarray(self._active_grasp_stall.contact_q_rad, dtype=np.float64)
+        maximum_contact_shift = 0.0
+        settled_since: float | None = None
+        settle_min_q: np.ndarray | None = None
+        settle_max_q: np.ndarray | None = None
+        stable_outcome: str | None = None
+        stable_blocked: tuple[int, ...] = ()
+        last_spread_rad: float | None = None
         while True:
             if safety_heartbeat is not None:
                 safety_heartbeat()
-            pair, departure = self._publish_and_check_grasp_stall()
-            maximum_departure = max(maximum_departure, departure)
             now = self.clock.monotonic()
-            if now - started >= self.config.posture_settle_dwell_s:
-                active = (
-                    pair.left if self._active_grasp_stall.active_side == "left" else pair.right
-                )
-                return Dex3RetentionEvidence(
-                    grasp_stall=self._active_grasp_stall,
-                    verified_q_rad=tuple(active.position),
-                    maximum_blocked_departure_rad=maximum_departure,
-                    verification_dwell_s=self.config.posture_settle_dwell_s,
+            pair = self._publish_grasp_target()
+            active = pair.left if self._active_grasp_stall.active_side == "left" else pair.right
+            maximum_contact_shift = max(
+                maximum_contact_shift,
+                float(np.max(np.abs(active.position - contact))),
+            )
+            outcome, blocked, remaining, reason = self._classify_retained_stall(pair)
+            measured_positions = np.concatenate((pair.left.position, pair.right.position))
+            if outcome != "invalid":
+                if settled_since is None or outcome != stable_outcome or blocked != stable_blocked:
+                    settled_since = now
+                    stable_outcome = outcome
+                    stable_blocked = blocked
+                    settle_min_q = measured_positions.copy()
+                    settle_max_q = measured_positions.copy()
+                    last_spread_rad = 0.0
+                else:
+                    assert settle_min_q is not None and settle_max_q is not None
+                    settle_min_q = np.minimum(settle_min_q, measured_positions)
+                    settle_max_q = np.maximum(settle_max_q, measured_positions)
+                    last_spread_rad = float(np.max(settle_max_q - settle_min_q))
+                    if last_spread_rad > self.config.posture_position_spread_rad:
+                        settled_since = now
+                        settle_min_q = measured_positions.copy()
+                        settle_max_q = measured_positions.copy()
+                        last_spread_rad = 0.0
+                if now - settled_since >= self.config.posture_settle_dwell_s:
+                    if outcome == "empty_target":
+                        raise Dex3RetentionLostError(
+                            f"Dex3 grasp retention was lost after the test lift: {reason}"
+                        )
+                    evidence = Dex3RetentionEvidence(
+                        grasp_stall=self._active_grasp_stall,
+                        verified_q_rad=tuple(active.position),
+                        verified_blocked_motor_ids=blocked,
+                        remaining_error_rad=tuple(remaining),
+                        maximum_contact_shift_rad=maximum_contact_shift,
+                        settle_spread_rad=float(last_spread_rad or 0.0),
+                        verification_dwell_s=self.config.posture_settle_dwell_s,
+                    )
+                    self._active_retention = evidence
+                    return evidence
+            else:
+                settled_since = None
+                settle_min_q = None
+                settle_max_q = None
+                stable_outcome = None
+                stable_blocked = ()
+                last_spread_rad = None
+
+            if now >= deadline:
+                raise Dex3RetentionLostError(
+                    "Dex3 grasp retention was not re-established after the test lift: "
+                    f"{reason}; position spread="
+                    f"{'n/a' if last_spread_rad is None else f'{last_spread_rad:.4f}rad'} "
+                    f"(limit={self.config.posture_position_spread_rad:.4f}rad)"
                 )
             self._sleep(1.0 / self.config.command_rate_hz)
+
+    def _classify_retained_stall(
+        self,
+        pair: Dex3StatePair,
+    ) -> tuple[str, tuple[int, ...], np.ndarray, str]:
+        """Classify one post-lift sample relative to the unchanged close target."""
+
+        evidence = self._active_grasp_stall
+        if (
+            evidence is None
+            or self._active_left_target is None
+            or self._active_right_target is None
+        ):
+            raise RuntimeError("Dex3 grasp-stall hold is not active")
+        active = pair.left if evidence.active_side == "left" else pair.right
+        inactive = pair.right if evidence.active_side == "left" else pair.left
+        active_target = (
+            self._active_left_target
+            if evidence.active_side == "left"
+            else self._active_right_target
+        )
+        inactive_target = (
+            self._active_right_target
+            if evidence.active_side == "left"
+            else self._active_left_target
+        )
+        contact = np.asarray(evidence.contact_q_rad, dtype=np.float64)
+        travel = active_target - contact
+        tolerance = self.config.posture_position_tolerance_rad
+        commanded = np.zeros(DEX3_MOTOR_COUNT, dtype=bool)
+        commanded[list(set(evidence.moved_motor_ids) | set(evidence.blocked_motor_ids))] = True
+        progress = active.position - contact
+        remaining = active_target - active.position
+        on_commanded_segment = (progress * travel >= -(tolerance * np.abs(travel))) & (
+            progress * travel <= travel * travel + tolerance * np.abs(travel)
+        )
+        still_before_target = remaining * travel > 0.0
+        blocked_mask = (
+            commanded
+            & (np.abs(remaining) > tolerance)
+            & on_commanded_segment
+            & still_before_target
+        )
+        blocked = tuple(int(value) for value in np.flatnonzero(blocked_mask))
+        unexplained_active_error = float(np.max(np.abs(remaining[~blocked_mask]), initial=0.0))
+        inactive_error = float(np.max(np.abs(inactive.position - inactive_target)))
+        if not blocked:
+            if max(unexplained_active_error, inactive_error) <= tolerance:
+                reason = "the active hand reached the complete empty-hand close target"
+            else:
+                reason = (
+                    "no closing joint remained stably short of the target; maximum "
+                    f"unexplained target error={max(unexplained_active_error, inactive_error):.4f}rad"
+                )
+            outcome = (
+                "empty_target"
+                if max(unexplained_active_error, inactive_error) <= tolerance
+                else "invalid"
+            )
+            return outcome, (), remaining, reason
+        if unexplained_active_error > tolerance:
+            return (
+                "invalid",
+                blocked,
+                remaining,
+                (
+                    "a non-contact closing joint remained outside the target tolerance: "
+                    f"{unexplained_active_error:.4f}rad"
+                ),
+            )
+        if inactive_error > tolerance:
+            return (
+                "invalid",
+                blocked,
+                remaining,
+                f"the inactive hand target error is {inactive_error:.4f}rad",
+            )
+        return "retained_stall", blocked, remaining, "stable post-lift position stall"
 
     def _move_to_targets(
         self,
@@ -957,12 +1122,7 @@ class UnitreeDex3PostureController:
                 and now - self._last_publish_s < 1.0 / self.config.command_rate_hz
             ):
                 return
-            try:
-                self._publish_and_check_grasp_stall()
-            except Dex3RetentionLostError as error:
-                if not self._retention_test_active:
-                    raise
-                self._retention_test_loss = error
+            self._publish_grasp_target()
             return
         self._maintain_targets(
             left_target_q_rad=self._active_left_target,
@@ -970,16 +1130,16 @@ class UnitreeDex3PostureController:
             label="active task posture",
         )
 
-    def _publish_and_check_grasp_stall(self) -> tuple[Dex3StatePair, float]:
+    def _publish_grasp_target(self) -> Dex3StatePair:
         self._require_active()
-        evidence = self._active_grasp_stall
         if (
-            evidence is None
+            self._active_grasp_stall is None
             or self._active_left_target is None
             or self._active_right_target is None
         ):
             raise RuntimeError("Dex3 grasp-stall hold is not active")
         pair = self.observer.observe()
+        evidence = self._active_grasp_stall
         active = pair.left if evidence.active_side == "left" else pair.right
         inactive = pair.right if evidence.active_side == "left" else pair.left
         active_target = (
@@ -992,57 +1152,23 @@ class UnitreeDex3PostureController:
             if evidence.active_side == "left"
             else self._active_left_target
         )
-        blocked = np.asarray(evidence.blocked_motor_ids, dtype=np.int64)
-        contact = np.asarray(evidence.contact_q_rad, dtype=np.float64)
-        departure = float(np.max(np.abs(active.position[blocked] - contact[blocked])))
-        if departure > self.config.posture_position_spread_rad:
-            motor_index = int(
-                blocked[np.argmax(np.abs(active.position[blocked] - contact[blocked]))]
-            )
-            error = Dex3RetentionLostError(
-                "Dex3 grasp retention lost: blocked "
-                f"{dex3_motor_joint_name(evidence.active_side, motor_index)} moved "
-                f"{departure:.4f}rad from its contact posture; limit is "
-                f"{self.config.posture_position_spread_rad:.4f}rad"
-            )
-            self._publish_targets(
-                pair,
-                {"left": self._active_left_target, "right": self._active_right_target},
-            )
-            raise error
-        remaining = np.abs(active_target[blocked] - active.position[blocked])
-        if np.any(remaining <= self.config.posture_position_tolerance_rad):
-            motor_index = int(blocked[np.argmin(remaining)])
-            error = Dex3RetentionLostError(
-                "Dex3 grasp retention lost: blocked "
-                f"{dex3_motor_joint_name(evidence.active_side, motor_index)} continued to "
-                "the empty-hand target"
-            )
-            self._publish_targets(
-                pair,
-                {"left": self._active_left_target, "right": self._active_right_target},
-            )
-            raise error
-        unblocked = np.ones(DEX3_MOTOR_COUNT, dtype=bool)
-        unblocked[blocked] = False
-        active_error = float(
-            np.max(
-                np.abs(active.position[unblocked] - active_target[unblocked]),
-                initial=0.0,
-            )
+        closing = np.zeros(DEX3_MOTOR_COUNT, dtype=bool)
+        closing[list(set(evidence.moved_motor_ids) | set(evidence.blocked_motor_ids))] = True
+        fixed_active_error = float(
+            np.max(np.abs(active.position[~closing] - active_target[~closing]), initial=0.0)
         )
         inactive_error = float(np.max(np.abs(inactive.position - inactive_target)))
-        if max(active_error, inactive_error) > self.config.posture_position_tolerance_rad:
+        if max(fixed_active_error, inactive_error) > self.config.posture_position_tolerance_rad:
             raise RuntimeError(
-                "Dex3 grasp hold departed a non-contact target: maximum error "
-                f"{max(active_error, inactive_error):.4f}rad; limit is "
+                "Dex3 grasp hold departed a non-closing target: maximum error "
+                f"{max(fixed_active_error, inactive_error):.4f}rad; limit is "
                 f"{self.config.posture_position_tolerance_rad:.4f}rad"
             )
         self._publish_targets(
             pair,
             {"left": self._active_left_target, "right": self._active_right_target},
         )
-        return pair, departure
+        return pair
 
     def _maintain_targets(
         self,

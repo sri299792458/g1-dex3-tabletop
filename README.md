@@ -125,6 +125,49 @@ dataset, computes holdout residuals and bootstrap observability, and writes
 select it with `--calibration-bundle`, or remove that argument to return cleanly
 to the repository default. It never rewrites the base URDF.
 
+## Cushion-versus-rigid seat diagnostic
+
+This is deliberately separate from grasping and calibration validation. Tape
+the frozen `DICT_5X5_50` 6x9 ChArUco board (30 mm squares, 22 mm markers) to the
+table where it stays visible throughout both arm lifts. Use the same chair
+frame, robot/table/head/feet/harness arrangement, and board placement for both
+conditions; change only the cushion versus rigid non-slip seat support.
+
+Each invocation takes one approval, acquires seated full-body lowcmd control,
+plans both arms from the loaded measured state, then performs five pairs of:
+
+1. left arm 100 mm table-normal lift and exact reverse;
+2. right arm 100 mm table-normal lift and exact reverse.
+
+The hands retain their measured posture. There is no cube, grasp, finger close,
+or payload motion. The fixed-board pose is measured at loaded baseline and,
+within every arm cycle, immediately before the lift, at the lifted endpoint, and
+at the returned endpoint. `status.json` reports only those explicit same-cycle
+comparisons; it does not use the earlier pre-planning loaded observation as a
+lift baseline. Plain MCAP simultaneously records pelvis and torso IMUs,
+waist/arm state and command, both Dex3 streams, raw D435i IMUs, native unaligned
+depth, RGB, CameraInfo, and the factory camera transform tree.
+
+```bash
+cd /home/kanth042/g1-dex3-tabletop
+./tools/g1_tabletop_hardware.sh measure-seat-compliance \
+  --network-interface enp134s0 \
+  --chair-condition cushion \
+  --repetitions 5 \
+  --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
+```
+
+Repeat with only `--chair-condition rigid` changed after replacing the cushion
+with the rigid support. Results are written under
+`runs/seat_compliance_<condition>_<UTC>/`. A single condition can show camera
+motion relative to the board; only the matched A/B comparison can assign an
+excess to seat compliance.
+
+The read-only endpoint, continuous-trajectory, and native-depth replay tools,
+their measured results, observability limits, and proposed task integration are
+documented in
+[`docs/state-estimation-research.md`](docs/state-estimation-research.md).
+
 ## Tabletop cube task
 
 Physical starting state: G1 seated in FSM 3, both arms supported and stationary
@@ -143,6 +186,36 @@ cd /home/kanth042/g1-dex3-tabletop
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
+The direct-table behavior above remains the default. For the separate 50 mm
+tripod presenter, tape its base to the table and place the cube centred and
+yaw-aligned on the three pads, then add exactly one argument:
+
+```bash
+./tools/g1_tabletop_hardware.sh run-tabletop \
+  --presentation tripod-h50 \
+  --arm right \
+  --network-interface enp134s0 \
+  --calibration-bundle "$RUN/solve/calibration_bundle.json" \
+  --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
+```
+
+`tripod-h50` changes only the object presentation. It uses the exact printed
+STL as a CuRobo obstacle, derives its base pose from the freshly observed cube,
+and places the table plane 50 mm below the cube bottom. Camera observation,
+calibration, persistent planning, arm/Dex3 control, contact-stall detection,
+10 mm retention test, reverse recovery, seated restoration, and MCAP recording
+are the same shared implementation. Omitting `--presentation tripod-h50`
+removes the fixture completely from the request and scene.
+
+The packaged tripod shortlist contains all 372 independently h50-qualified
+candidates. Their achieved PhysX finger joints remain qualification evidence;
+they are not robot commands. Every physical grasp uses the one fixed close
+target from the Dex3 descriptor, while contact limits each finger's measured
+travel. Every candidate is qualified for the common 70 mm approach used at
+runtime; 365 and 353 also pass the longer 100 and 150 mm approaches respectively.
+CuRobo receives all 372 in one goal set and chooses using live reachability and
+complete-scene collision.
+
 Before SPACE, this verifies the seated stationary state, both Dex3 states,
 camera profile, and cube observation without creating publishers. After SPACE,
 it acquires exact measured 29-joint lowcmd control, applies dual-Dex3 gravity
@@ -153,7 +226,7 @@ lifecycle request to the already-warm isolated CuRobo worker for:
 2. bounded branch-aware complete-path selection from the 15 shared
    GraspGen-X/Isaac-qualified Dex3 grasps, with the exact side adapter applied
    and every rejected IK branch and failure stage recorded;
-3. approach and smooth finger closure toward the qualified grasp posture;
+3. approach and smooth finger closure toward the fixed descriptor close target;
 4. a collision-aware 27-sphere conservative payload lift, exact reverse
    replacement, release, retreat, clearance return, and exact reverse
    supported return.
@@ -171,11 +244,17 @@ Because the physical contact posture can differ from the simulated posture,
 the same worker rechecks the frozen payload route using the measured finger
 angles; it does not replan or alter the arm samples. Its arm-plus-finger FK and
 self-collision model is built once with the lifecycle and retained in memory.
+In tripod mode this same recheck also measures every robot collision sphere
+against the exact presenter mesh; direct mode incurs no fixture check.
 The planned lift is split at the first sample at least `10 mm` above contact
-without changing any sample. After that small lift, the same blocked finger
-posture must still be present before the controller continues to the configured
-full lift. A failed test follows the exact frozen 10 mm reverse, opens on the
-table, retreats, returns to the supported start, and restores seated control.
+without changing any sample. The fixed close target remains commanded during
+that small lift. At its endpoint the controller collects a fresh `0.5 s` stable
+window and requires at least one closing joint still to remain more than
+`0.08 rad` short of the empty-hand target. The fingers may settle farther and
+the blocked-joint set may change; reaching the complete empty-hand target is a
+failed retention test. A failed test follows the exact frozen 10 mm reverse,
+opens on the table, retreats, returns to the supported start, and restores
+seated control.
 
 Only the moving selected wrist, articulated hand, and payload are checked against
 the locally observed support plane because one cube cannot reveal the table's
@@ -208,16 +287,23 @@ the laptop GPU; physical execution still requires a deliberately slow first
 commissioning run.
 
 After SPACE, the same command also records a general raw episode under
-`runs/tabletop_<UTC>/raw_episode/`: official complete G1 state/IMU and lowcmd,
-both Dex3 states and commands, raw RGB, and CameraInfo. It is a separate plain
-MCAP process with no live compression; task-specific cube and CuRobo artifacts
-remain the adjacent JSON files. Recording starts before command publishers and
-ends after terminal controller handback.
+`runs/tabletop_<UTC>/raw_episode/`: official complete G1 state (including the
+pelvis IMU), the independently published torso IMU, lowcmd, both Dex3 states and
+commands, raw D435i gyroscope and accelerometer streams, raw RGB, native
+unaligned Z16 depth, both CameraInfo streams, and the RealSense static frame
+transforms required for offline depth-to-color alignment. It is a separate
+plain MCAP process with no live compression; task-specific cube and CuRobo
+artifacts remain the adjacent JSON files. Recording starts before command
+publishers and ends after terminal controller handback.
 
 Raw camera recording is enabled by default. For a temporary lower-throughput
-run, add `--skip-camera-recording`; this removes both RGB and CameraInfo from
-the MCAP completeness contract but leaves the live camera and all perception
-behavior unchanged.
+run, add `--skip-camera-recording`; this removes RGB, native depth, and their
+CameraInfo streams from the MCAP completeness contract but leaves the
+low-bandwidth D435i gyroscope and accelerometer streams, live camera, and all
+perception behavior unchanged. Depth remains native and unaligned at 640x480x15;
+PC2 does not generate a point cloud or perform live depth-to-color alignment.
+The driver publishes the two raw motion streams separately; it does not
+synthesize an orientation estimate.
 
 ## Verification
 
