@@ -167,6 +167,15 @@ def build_parser() -> argparse.ArgumentParser:
     tabletop.add_argument("--output-root", type=Path, default=ROOT / "runs")
     tabletop.add_argument("--observation-frames", type=int, default=5)
     tabletop.add_argument(
+        "--approach-controller",
+        choices=("trajectory", "mpc"),
+        default="trajectory",
+        help=(
+            "controller for the collision-free clearance-to-pregrasp phase; "
+            "mpc uses continuously replenished CuRobo windows"
+        ),
+    )
+    tabletop.add_argument(
         "--pc2-host",
         default=os.environ.get("G1_PC2_HOST", "unitree@192.168.123.164"),
     )

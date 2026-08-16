@@ -44,6 +44,7 @@ class RobotStateSample:
     velocity: np.ndarray
     estimated_torque: np.ndarray
     source_sequence: int | None = None
+    pelvis_imu_quaternion_wxyz: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if not np.isfinite(self.receipt_monotonic_s) or self.receipt_monotonic_s < 0:
@@ -61,6 +62,19 @@ class RobotStateSample:
         object.__setattr__(self, "estimated_torque", estimated_torque)
         if self.source_sequence is not None and self.source_sequence < 0:
             raise ValueError("source_sequence must be non-negative")
+        if self.pelvis_imu_quaternion_wxyz is not None:
+            quaternion = np.asarray(
+                self.pelvis_imu_quaternion_wxyz, dtype=np.float64
+            ).reshape(-1)
+            if (
+                quaternion.shape != (4,)
+                or not np.all(np.isfinite(quaternion))
+                or np.linalg.norm(quaternion) <= 0.0
+            ):
+                raise ValueError("pelvis IMU quaternion must contain four finite values")
+            quaternion = quaternion / np.linalg.norm(quaternion)
+            quaternion.setflags(write=False)
+            object.__setattr__(self, "pelvis_imu_quaternion_wxyz", quaternion)
 
     @property
     def is_mode5(self) -> bool:
@@ -113,6 +127,11 @@ class RobotStateSample:
             "velocity": self.velocity.tolist(),
             "estimated_torque": self.estimated_torque.tolist(),
             "source_sequence": self.source_sequence,
+            "pelvis_imu_quaternion_wxyz": (
+                None
+                if self.pelvis_imu_quaternion_wxyz is None
+                else self.pelvis_imu_quaternion_wxyz.tolist()
+            ),
         }
 
     @classmethod
@@ -126,5 +145,10 @@ class RobotStateSample:
             estimated_torque=np.asarray(data["estimated_torque"], dtype=np.float64),
             source_sequence=(
                 None if data.get("source_sequence") is None else int(data["source_sequence"])
+            ),
+            pelvis_imu_quaternion_wxyz=(
+                None
+                if data.get("pelvis_imu_quaternion_wxyz") is None
+                else np.asarray(data["pelvis_imu_quaternion_wxyz"], dtype=np.float64)
             ),
         )

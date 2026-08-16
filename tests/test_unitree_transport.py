@@ -16,6 +16,7 @@ from g1_aprilcube_calibration.transports.unitree_arm_sdk import (
     UnitreeArmSDKTransport,
     UnitreeLowStateObserver,
     UnitreeSDKBindings,
+    UnitreeTorsoIMUObserver,
     UnitreeTransportConfig,
 )
 from g1_aprilcube_calibration.transports.unitree_debug_lowcmd import (
@@ -148,6 +149,34 @@ def test_read_only_observer_never_constructs_a_publisher(sdk):
     np.testing.assert_allclose(sample.estimated_torque, np.arange(29) / 1000)
     observer.close()
     assert Subscriber.instances[0].closed
+
+
+def test_torso_imu_observer_reuses_factory_and_normalizes_orientation(sdk):
+    bindings, initialized = sdk
+    bindings = UnitreeSDKBindings(
+        initialize=bindings.initialize,
+        publisher_type=bindings.publisher_type,
+        subscriber_type=bindings.subscriber_type,
+        low_command_type=bindings.low_command_type,
+        low_state_type=bindings.low_state_type,
+        make_low_command=bindings.make_low_command,
+        calculate_crc=bindings.calculate_crc,
+        imu_state_type=object,
+    )
+    clock = ManualClock(2.0)
+    lowstate = UnitreeLowStateObserver(config(), bindings=bindings, clock=clock)
+    torso = UnitreeTorsoIMUObserver(
+        config(), lowstate_observer=lowstate, clock=clock
+    )
+
+    assert initialized == [(4, "enp3s0")]
+    Subscriber.instances[1].emit(SimpleNamespace(quaternion=[2.0, 0.0, 0.0, 0.0]))
+    sample = torso.observe()
+    np.testing.assert_allclose(sample.quaternion_wxyz, [1.0, 0.0, 0.0, 0.0])
+    assert sample.receipt_monotonic_s == 2.0
+    torso.close()
+    lowstate.close()
+    assert Subscriber.instances[1].closed
 
 
 def test_observer_forwards_only_valid_samples(sdk):

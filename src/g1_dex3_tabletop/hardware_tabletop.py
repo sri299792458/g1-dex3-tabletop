@@ -59,6 +59,7 @@ from g1_dex3_tabletop.hardware_config import (
     transport_config,
     watchdog,
 )
+from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
 from g1_dex3_tabletop.persistent_planner import (
     PersistentTabletopPlanner,
     PlannerRequestRejected,
@@ -380,6 +381,74 @@ def _execute_trajectory(
     print(f"completed phase: {trajectory.to_pose_id}", flush=True)
 
 
+def _execute_mpc_approach(
+    synchronized,
+    driver,
+    planner,
+    *,
+    arm: str,
+    plan_sha256: str,
+    control_config,
+) -> list[dict]:
+    """Execute the nominal clearance-to-pregrasp route through rolling MPC."""
+
+    def request_window() -> MPCCommandWindow:
+        state, active_command = synchronized.observe_control_input()
+        event = planner.request_payload(
+            "step-open-approach-mpc",
+            payload={
+                "measured_command_q_rad": state.arm_q(arm).tolist(),
+                "measured_dq_rad_s": state.arm_dq(arm).tolist(),
+                "active_command_q_rad": active_command.tolist(),
+                "state_monotonic_s": state.receipt_monotonic_s,
+            },
+            control_check=driver.check,
+            timeout_s=max(1.0, control_config.state_freshness_timeout_s * 10.0),
+        )
+        return MPCCommandWindow.from_dict(event["payload"])
+
+    windows: list[dict] = []
+    first = request_window()
+    accepted = synchronized.start_streaming_trajectory(
+        from_pose_id="clearance",
+        to_pose_id="move_to_pregrasp",
+        window=first,
+        plan_sha256=plan_sha256,
+        operator_confirmed=True,
+    )
+    windows.append(accepted.to_dict())
+    replan_lead_s = control_config.state_freshness_timeout_s
+    while synchronized.state is ExecutorState.MOVING:
+        driver.check()
+        status = synchronized.streaming_trajectory_status()
+        if bool(status["terminal"]):
+            break
+        if float(status["remaining_s"]) > replan_lead_s:
+            time.sleep(0.01)
+            continue
+        window = request_window()
+        accepted = synchronized.update_streaming_trajectory(window=window)
+        windows.append(accepted.to_dict())
+        if accepted.generation % 10 == 0:
+            print(
+                "CuRobo MPC approach progress: "
+                f"window={accepted.generation}, solve={accepted.solve_time_s:.3f}s, "
+                f"remaining={accepted.duration_s:.3f}s",
+                flush=True,
+            )
+    _wait_ready(
+        synchronized,
+        driver,
+        timeout_s=control_config.motion_timeout_s,
+        label="move_to_pregrasp MPC terminal settle",
+    )
+    print(
+        f"completed phase: move_to_pregrasp through {len(windows)} validated MPC windows",
+        flush=True,
+    )
+    return windows
+
+
 def _restore_seated_control(*, driver, dex_controller, guard, synchronized) -> None:
     """Cleanly return a healthy held controller to Unitree seated FSM 3."""
 
@@ -507,6 +576,8 @@ def run_tabletop(args) -> int:
     node = rclpy_module = None
     raw_recorder = None
     guard = synchronized = driver = planner = None
+    mpc_preparation = None
+    mpc_windows: list[dict] = []
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
@@ -712,6 +783,26 @@ def run_tabletop(args) -> int:
                     f"complete lifecycle planning failed: {error}"
                 ) from error
             execution = TabletopExecutionPlan.from_json(execution_path)
+            if args.approach_controller == "mpc":
+                try:
+                    mpc_event = planner.request_payload(
+                        "prepare-open-approach-mpc",
+                        payload={},
+                        control_check=driver.check,
+                        timeout_s=30.0,
+                    )
+                except (PlannerRequestRejected, RuntimeError) as error:
+                    driver.check()
+                    raise TabletopTaskRejected(
+                        f"CuRobo MPC preparation failed: {error}"
+                    ) from error
+                mpc_preparation = dict(mpc_event["payload"])
+                print(
+                    "CUROBO MPC READY — CUDA graphs and the exact open-hand scene "
+                    f"were warmed in {mpc_preparation['setup_time_s']:.3f}s; "
+                    "the 250 Hz robot controller remains in the parent process",
+                    flush=True,
+                )
             escape = execution.supported_escape
             task = execution.task
             # Keep the component artifacts independently inspectable even though the
@@ -802,7 +893,17 @@ def run_tabletop(args) -> int:
 
             execute_phase("clearance")
             open_active_hand(f"{arm}-hand pregrasp open")
-            execute_phase("move_to_pregrasp")
+            if args.approach_controller == "mpc":
+                mpc_windows = _execute_mpc_approach(
+                    synchronized,
+                    driver,
+                    planner,
+                    arm=arm,
+                    plan_sha256=execution.content_sha256,
+                    control_config=control_config,
+                )
+            else:
+                execute_phase("move_to_pregrasp")
             execute_phase("grasp_approach")
             active_close_target = task.close_target_active_dex3_q_rad
             try:
@@ -912,6 +1013,18 @@ def run_tabletop(args) -> int:
                 guard=guard,
                 synchronized=synchronized,
             )
+            if mpc_windows:
+                atomic_write_json(
+                    task_run / "mpc_approach.json",
+                    {
+                        "schema_version": 1,
+                        "controller": "curobo_mpc",
+                        "phase": "move_to_pregrasp",
+                        "plan_sha256": execution.content_sha256,
+                        "preparation": mpc_preparation,
+                        "windows": mpc_windows,
+                    },
+                )
             status = {
                 "status": "completed",
                 "commands_robot": True,
@@ -919,6 +1032,8 @@ def run_tabletop(args) -> int:
                 "presentation_id": presentation.presentation_id,
                 "selected_candidate_id": task.selected_candidate_id,
                 "execution_plan_sha256": execution.content_sha256,
+                "approach_controller": args.approach_controller,
+                "mpc_window_count": len(mpc_windows),
                 "grasp_stall": grasp_stall.to_dict(),
                 "retention_evidence": retention_evidence.to_dict(),
                 "retention_route_validation_sha256": retention_route.content_sha256,

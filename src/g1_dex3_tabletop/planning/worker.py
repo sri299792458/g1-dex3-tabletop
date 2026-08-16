@@ -16,6 +16,7 @@ from g1_dex3_tabletop.planning.curobo_backend import (
     plan_calibration,
     plan_dex3_preparation,
 )
+from g1_dex3_tabletop.planning.tabletop_mpc import benchmark_from_paths
 from g1_dex3_tabletop.planning.tabletop_planner import (
     plan_supported_escape,
     plan_tabletop_task,
@@ -78,6 +79,14 @@ def build_parser() -> argparse.ArgumentParser:
         "serve-tabletop",
         help="serve lifecycle planning and retention validation over stdin/stdout",
     )
+    benchmark = subparsers.add_parser(
+        "benchmark-tabletop-mpc",
+        help="offline exact-model MPC benchmark of a retained clearance-to-pregrasp route",
+    )
+    benchmark.add_argument("--request", type=Path, required=True)
+    benchmark.add_argument("--plan", type=Path, required=True)
+    benchmark.add_argument("--output", type=Path, required=True)
+    benchmark.add_argument("--maximum-steps", type=int, default=300)
     return parser
 
 
@@ -101,56 +110,88 @@ def _serve_tabletop() -> int:
             "device": torch.cuda.get_device_name(0) if cuda_available else None,
         }
     )
-    for line in sys.stdin:
-        request_id = None
-        try:
-            message = json.loads(line)
-            if message.get("command") == "shutdown":
-                _emit({"type": "stopped"})
-                return 0
-            request_id = int(message["id"])
-            command = str(message["command"])
-            request_path = Path(message["request"])
-            output_path = Path(message["output"])
-            if output_path.exists():
-                raise FileExistsError(f"planner output already exists: {output_path}")
+    try:
+        for line in sys.stdin:
+            request_id = None
+            try:
+                message = json.loads(line)
+                if message.get("command") == "shutdown":
+                    _emit({"type": "stopped"})
+                    return 0
+                request_id = int(message["id"])
+                command = str(message["command"])
 
-            def progress(text: str, *, event_id: int = request_id) -> None:
-                _emit({"type": "progress", "id": event_id, "message": text})
+                def progress(text: str, *, event_id: int = request_id) -> None:
+                    _emit({"type": "progress", "id": event_id, "message": text})
 
-            if command == "plan-tabletop-lifecycle":
-                request = TabletopTaskRequest.from_json(request_path)
-                result = session.plan_lifecycle(request, progress=progress)
-            elif command == "plan-charuco-supported-escape":
-                request = CharucoSupportedEscapeRequest.from_json(request_path)
-                result = plan_supported_escape(request, progress=progress)
-            elif command == "validate-retention-route":
-                request = RetentionRouteValidationRequest.from_json(request_path)
-                result = session.validate_retention_route(request, progress=progress)
-            else:
-                raise ValueError(f"unsupported persistent planner command: {command}")
-            result.write_json(output_path)
-            _emit(
-                {
-                    "type": "result",
-                    "id": request_id,
-                    "ok": True,
-                    "operation": command,
-                    "output": str(output_path.resolve()),
-                    "plan_sha256": result.content_sha256,
-                }
-            )
-        except (FileNotFoundError, FileExistsError, RuntimeError, TypeError, ValueError) as error:
-            _emit(
-                {
-                    "type": "result",
-                    "id": locals().get("request_id"),
-                    "ok": False,
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                }
-            )
-    return 0
+                if command == "prepare-open-approach-mpc":
+                    payload = session.prepare_open_approach_mpc()
+                    event = {
+                        "type": "result",
+                        "id": request_id,
+                        "ok": True,
+                        "operation": command,
+                        "payload": payload,
+                    }
+                elif command == "step-open-approach-mpc":
+                    window = session.step_open_approach_mpc(message["payload"])
+                    event = {
+                        "type": "result",
+                        "id": request_id,
+                        "ok": True,
+                        "operation": command,
+                        "payload": window.to_dict(),
+                    }
+                else:
+                    request_path = Path(message["request"])
+                    output_path = Path(message["output"])
+                    if output_path.exists():
+                        raise FileExistsError(
+                            f"planner output already exists: {output_path}"
+                        )
+                    if command == "plan-tabletop-lifecycle":
+                        request = TabletopTaskRequest.from_json(request_path)
+                        result = session.plan_lifecycle(request, progress=progress)
+                    elif command == "plan-charuco-supported-escape":
+                        request = CharucoSupportedEscapeRequest.from_json(request_path)
+                        result = plan_supported_escape(request, progress=progress)
+                    elif command == "validate-retention-route":
+                        request = RetentionRouteValidationRequest.from_json(request_path)
+                        result = session.validate_retention_route(request, progress=progress)
+                    else:
+                        raise ValueError(
+                            f"unsupported persistent planner command: {command}"
+                        )
+                    result.write_json(output_path)
+                    event = {
+                        "type": "result",
+                        "id": request_id,
+                        "ok": True,
+                        "operation": command,
+                        "output": str(output_path.resolve()),
+                        "plan_sha256": result.content_sha256,
+                    }
+                _emit(event)
+            except (
+                FileNotFoundError,
+                FileExistsError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                _emit(
+                    {
+                        "type": "result",
+                        "id": locals().get("request_id"),
+                        "ok": False,
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                    }
+                )
+        return 0
+    finally:
+        session.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -158,6 +199,17 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "serve-tabletop":
             return _serve_tabletop()
+        if args.command == "benchmark-tabletop-mpc":
+            if args.output.exists():
+                raise FileExistsError(f"planner output already exists: {args.output}")
+            result = benchmark_from_paths(
+                args.request,
+                args.plan,
+                args.output,
+                maximum_steps=args.maximum_steps,
+            )
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
         if args.command == "inspect-model":
             request = CalibrationPlanRequest.from_json(args.request)
             print(json.dumps(inspect_model(request), indent=2, sort_keys=True))

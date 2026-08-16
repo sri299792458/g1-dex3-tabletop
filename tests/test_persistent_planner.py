@@ -28,6 +28,8 @@ for line in sys.stdin:
     print(prefix + json.dumps({"type": "progress", "id": message["id"], "message": "working"}), flush=True)
     ok = message["command"] != "reject"
     result = {"type": "result", "id": message["id"], "ok": ok}
+    if "payload" in message:
+        result["payload"] = message["payload"]
     if not ok:
         result.update({"error_type": "RuntimeError", "error": "no route"})
     print(prefix + json.dumps(result), flush=True)
@@ -57,6 +59,9 @@ def test_persistent_planner_reuses_one_process_and_reports_rejection(
         output_path=tmp_path / "plan.json",
     )
     assert first["ok"] is True
+    assert planner._process is process
+    payload = planner.request_payload("step", payload={"generation": 7})
+    assert payload["payload"] == {"generation": 7}
     assert planner._process is process
     with pytest.raises(PlannerRequestRejected, match="no route"):
         planner.request(

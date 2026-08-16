@@ -40,6 +40,18 @@ class Executor:
     def start_trajectory(self, **kwargs):
         self.trajectory = kwargs
 
+    @property
+    def calibration_command_q(self):
+        return (0.1,) * 7
+
+    def start_streaming_trajectory(self, **kwargs):
+        self.streaming_trajectory = kwargs
+        return "started"
+
+    def update_streaming_trajectory(self, **kwargs):
+        self.streaming_update = kwargs
+        return "updated"
+
 
 def test_control_driver_ticks_on_dedicated_thread_and_serializes_actions():
     raw = Executor()
@@ -89,6 +101,17 @@ def test_synchronized_executor_forwards_frozen_trajectory() -> None:
     synchronized = SynchronizedPoseExecutor(raw)
     synchronized.start_trajectory(from_pose_id="a", to_pose_id="b")
     assert raw.trajectory == {"from_pose_id": "a", "to_pose_id": "b"}
+
+
+def test_synchronized_executor_forwards_streaming_trajectory_atomically() -> None:
+    raw = Executor()
+    synchronized = SynchronizedPoseExecutor(raw)
+
+    assert synchronized.calibration_command_q == (0.1,) * 7
+    assert synchronized.start_streaming_trajectory(window="first") == "started"
+    assert synchronized.update_streaming_trajectory(window="next") == "updated"
+    assert raw.streaming_trajectory == {"window": "first"}
+    assert raw.streaming_update == {"window": "next"}
 
 
 def test_control_driver_preserves_executor_fault_reason():

@@ -17,6 +17,7 @@ from g1_aprilcube_calibration.pose_schema import (
     PoseSet,
 )
 from g1_aprilcube_calibration.transports.fake import FakeArmTransport
+from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
 
 UTC = "2026-08-02T12:00:00Z"
 REPORT_HASH = "b" * 64
@@ -300,6 +301,123 @@ def test_executor_rejects_trajectory_from_a_different_plan() -> None:
             plan_sha256="c" * 64,
             operator_confirmed=True,
         )
+
+
+def mpc_window(
+    clock: ManualClock,
+    *,
+    generation: int,
+    start_q: np.ndarray,
+    end_q: np.ndarray,
+    terminal: bool,
+    feasible: bool = True,
+) -> MPCCommandWindow:
+    midpoint = (start_q + end_q) / 2.0
+    return MPCCommandWindow(
+        generation=generation,
+        plan_sha256=REPORT_HASH,
+        state_monotonic_s=clock.monotonic(),
+        sample_time_s=(0.0, 0.1, 0.2),
+        command_q_rad=(tuple(start_q), tuple(midpoint), tuple(end_q)),
+        feasible=feasible,
+        terminal=terminal,
+        solve_time_s=0.01,
+        diagnostics={"source": "executor-test"},
+    )
+
+
+def test_executor_streams_rebased_mpc_windows_then_settles_terminal_window() -> None:
+    clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+
+    first = mpc_window(
+        clock,
+        generation=0,
+        start_q=np.zeros(7),
+        end_q=np.full(7, 0.01),
+        terminal=False,
+    )
+    executor.start_streaming_trajectory(
+        from_pose_id=HANDOFF_POSE_ID,
+        to_pose_id="pose_001",
+        window=first,
+        plan_sha256=REPORT_HASH,
+        operator_confirmed=True,
+    )
+    for _ in range(5):
+        transport.step(0.02)
+        executor.tick()
+    active = executor.calibration_command_q
+    assert np.allclose(active, 0.005)
+
+    # The worker solved from the older zero command. Installation rebases its
+    # t=0 sample atomically to the command that is now active.
+    terminal = mpc_window(
+        clock,
+        generation=1,
+        start_q=np.zeros(7),
+        end_q=np.full(7, 0.02),
+        terminal=True,
+    )
+    accepted = executor.update_streaming_trajectory(window=terminal)
+    np.testing.assert_allclose(accepted.command_q_rad[0], active)
+    advance_until(transport, executor, ExecutorState.READY)
+
+    assert executor.current_pose_id == "pose_001"
+    np.testing.assert_allclose(executor.calibration_command_q, 0.02)
+
+
+def test_executor_faults_when_nonterminal_mpc_window_is_not_replenished() -> None:
+    clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    executor.start_streaming_trajectory(
+        from_pose_id=HANDOFF_POSE_ID,
+        to_pose_id="pose_001",
+        window=mpc_window(
+            clock,
+            generation=0,
+            start_q=np.zeros(7),
+            end_q=np.full(7, 0.01),
+            terminal=False,
+        ),
+        plan_sha256=REPORT_HASH,
+        operator_confirmed=True,
+    )
+
+    for _ in range(24):
+        transport.step(0.02)
+        executor.tick()
+        if executor.state is ExecutorState.FAULT:
+            break
+
+    assert executor.state is ExecutorState.FAULT
+    assert "MPC command window expired" in (executor.fault_reason or "")
+
+
+def test_executor_rejects_infeasible_mpc_window_before_motion() -> None:
+    clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+
+    with pytest.raises(ValueError, match="infeasible"):
+        executor.start_streaming_trajectory(
+            from_pose_id=HANDOFF_POSE_ID,
+            to_pose_id="pose_001",
+            window=mpc_window(
+                clock,
+                generation=0,
+                start_q=np.zeros(7),
+                end_q=np.full(7, 0.01),
+                terminal=False,
+                feasible=False,
+            ),
+            plan_sha256=REPORT_HASH,
+            operator_confirmed=True,
+        )
+
+    assert executor.state is ExecutorState.READY
 
 
 def test_loaded_handoff_can_atomically_install_a_new_validated_plan() -> None:

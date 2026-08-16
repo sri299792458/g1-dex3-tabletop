@@ -75,17 +75,51 @@ class PersistentTabletopPlanner:
         control_check=None,
         timeout_s: float = 180.0,
     ) -> dict:
-        process = self._require_alive()
         if output_path.exists():
             raise FileExistsError(f"planner output already exists: {output_path}")
-        request_id = self._next_request_id
-        self._next_request_id += 1
         message = {
-            "id": request_id,
             "command": command,
             "request": str(request_path.resolve()),
             "output": str(output_path.resolve()),
         }
+        return self._request_message(
+            message,
+            command=command,
+            control_check=control_check,
+            timeout_s=timeout_s,
+        )
+
+    def request_payload(
+        self,
+        command: str,
+        *,
+        payload: dict,
+        control_check=None,
+        timeout_s: float = 10.0,
+    ) -> dict:
+        """Exchange one small in-memory request with the persistent worker."""
+
+        if not isinstance(payload, dict):
+            raise TypeError("persistent planner payload must be a dictionary")
+        return self._request_message(
+            {"command": command, "payload": payload},
+            command=command,
+            control_check=control_check,
+            timeout_s=timeout_s,
+        )
+
+    def _request_message(
+        self,
+        message: dict,
+        *,
+        command: str,
+        control_check,
+        timeout_s: float,
+    ) -> dict:
+        process = self._require_alive()
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        message = {"id": request_id, **message}
         assert process.stdin is not None
         process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         process.stdin.flush()

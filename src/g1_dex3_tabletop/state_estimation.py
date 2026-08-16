@@ -38,6 +38,33 @@ ESTIMATOR_NAMES: tuple[EstimatorName, ...] = (
 )
 
 
+def rotation_from_wxyz(value: np.ndarray) -> np.ndarray:
+    """Convert one Unitree scalar-first quaternion to a rotation matrix."""
+
+    quaternion = np.asarray(value, dtype=np.float64).reshape(-1)
+    if (
+        quaternion.shape != (4,)
+        or not np.all(np.isfinite(quaternion))
+        or np.linalg.norm(quaternion) <= 0.0
+    ):
+        raise ValueError("IMU quaternion must contain four finite values")
+    quaternion = quaternion / np.linalg.norm(quaternion)
+    return Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix()
+
+
+def proprioceptive_sample(state, torso_imu) -> ProprioceptiveSample:
+    """Build the tested estimator input from fresh live Unitree observations."""
+
+    if state.pelvis_imu_quaternion_wxyz is None:
+        raise ValueError("LowState has no pelvis IMU quaternion")
+    return ProprioceptiveSample(
+        timestamp_ns=int(max(state.receipt_monotonic_s, torso_imu.receipt_monotonic_s) * 1e9),
+        q29_rad=state.position,
+        navigation_R_pelvis_imu=rotation_from_wxyz(state.pelvis_imu_quaternion_wxyz),
+        navigation_R_torso_imu=rotation_from_wxyz(torso_imu.quaternion_wxyz),
+    )
+
+
 def _rotation(value: np.ndarray, *, name: str) -> np.ndarray:
     matrix = np.asarray(value, dtype=np.float64).copy()
     if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):

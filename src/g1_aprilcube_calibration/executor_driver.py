@@ -55,6 +55,12 @@ class SynchronizedPoseExecutor:
     def observe_state(self):
         return self._call("observe_state")
 
+    def observe_control_input(self):
+        return self._call("observe_control_input")
+
+    def streaming_trajectory_status(self):
+        return self._call("streaming_trajectory_status")
+
     def observe(self):
         """Expose the transport-style observation API under the same lock."""
 
@@ -74,6 +80,16 @@ class SynchronizedPoseExecutor:
 
     def start_trajectory(self, **kwargs) -> None:
         self._call("start_trajectory", **kwargs)
+
+    @property
+    def calibration_command_q(self):
+        return self._call("calibration_command_q")
+
+    def start_streaming_trajectory(self, **kwargs):
+        return self._call("start_streaming_trajectory", **kwargs)
+
+    def update_streaming_trajectory(self, **kwargs):
+        return self._call("update_streaming_trajectory", **kwargs)
 
     def install_validated_plan(self, **kwargs) -> None:
         self._call("install_validated_plan", **kwargs)
@@ -101,7 +117,8 @@ class SynchronizedPoseExecutor:
 
     def _call(self, name: str, *args, **kwargs) -> Any:
         with self._lock:
-            return getattr(self._executor, name)(*args, **kwargs)
+            attribute = getattr(self._executor, name)
+            return attribute(*args, **kwargs) if callable(attribute) else attribute
 
 
 class ExecutorControlDriver:

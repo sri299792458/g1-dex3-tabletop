@@ -26,6 +26,7 @@ from g1_aprilcube_calibration.transports.base import ArmCommand
 
 LOWSTATE_TOPIC = "rt/lowstate"
 ARM_SDK_TOPIC = "rt/arm_sdk"
+SECONDARY_IMU_TOPIC = "rt/secondary_imu"
 HG_MOTOR_COUNT = 35
 ARM_WEIGHT_SLOT = 29
 _ARM_INDICES = LEFT_ARM_INDICES + RIGHT_ARM_INDICES
@@ -76,6 +77,7 @@ class UnitreeSDKBindings:
     low_state_type: type
     make_low_command: Callable[[], Any]
     calculate_crc: Callable[[Any], int]
+    imu_state_type: type | None = None
 
     @classmethod
     def load(cls) -> UnitreeSDKBindings:
@@ -86,7 +88,7 @@ class UnitreeSDKBindings:
                 ChannelSubscriber,
             )
             from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
-            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_
+            from unitree_sdk2py.idl.unitree_hg.msg.dds_ import IMUState_, LowCmd_, LowState_
             from unitree_sdk2py.utils.crc import CRC
         except (ImportError, OSError) as error:
             raise RuntimeError(
@@ -102,7 +104,33 @@ class UnitreeSDKBindings:
             low_state_type=LowState_,
             make_low_command=unitree_hg_msg_dds__LowCmd_,
             calculate_crc=crc.Crc,
+            imu_state_type=IMUState_,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class IMUOrientationSample:
+    receipt_monotonic_s: float
+    quaternion_wxyz: np.ndarray
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.receipt_monotonic_s) or self.receipt_monotonic_s < 0.0:
+            raise ValueError("IMU receipt time must be finite and non-negative")
+        quaternion = np.asarray(self.quaternion_wxyz, dtype=np.float64).reshape(-1)
+        if (
+            quaternion.shape != (4,)
+            or not np.all(np.isfinite(quaternion))
+            or np.linalg.norm(quaternion) <= 0.0
+        ):
+            raise ValueError("IMU quaternion must contain four finite values")
+        quaternion = quaternion / np.linalg.norm(quaternion)
+        quaternion.setflags(write=False)
+        object.__setattr__(self, "quaternion_wxyz", quaternion)
+
+    def age_s(self, now_monotonic_s: float) -> float:
+        if now_monotonic_s < self.receipt_monotonic_s:
+            raise ValueError("current time precedes the IMU receipt time")
+        return now_monotonic_s - self.receipt_monotonic_s
 
 
 class UnitreeLowStateObserver:
@@ -157,6 +185,11 @@ class UnitreeLowStateObserver:
                 velocity=velocity,
                 estimated_torque=estimated_torque,
                 source_sequence=int(message.tick),
+                pelvis_imu_quaternion_wxyz=(
+                    None
+                    if getattr(message, "imu_state", None) is None
+                    else np.asarray(message.imu_state.quaternion, dtype=np.float64)
+                ),
             )
         except (AttributeError, TypeError, ValueError) as error:
             with self._lock:
@@ -178,6 +211,74 @@ class UnitreeLowStateObserver:
             if self._latest is None:
                 suffix = "" if self._last_error is None else f": {self._last_error}"
                 raise RuntimeError(f"no valid Unitree LowState received{suffix}")
+            return self._latest
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        close = getattr(self._subscriber, "Close", None)
+        if callable(close):
+            close()
+
+
+class UnitreeTorsoIMUObserver:
+    """Read-only official ``rt/secondary_imu`` torso orientation subscriber."""
+
+    def __init__(
+        self,
+        config: UnitreeTransportConfig,
+        *,
+        lowstate_observer: UnitreeLowStateObserver | None = None,
+        bindings: UnitreeSDKBindings | None = None,
+        clock: MonotonicClock | None = None,
+    ) -> None:
+        if lowstate_observer is not None:
+            if lowstate_observer.config != config:
+                raise ValueError("existing observer configuration does not match")
+            if bindings is not None:
+                raise ValueError("bindings cannot accompany an existing lowstate observer")
+            self.bindings = lowstate_observer.bindings
+        else:
+            self.bindings = bindings or UnitreeSDKBindings.load()
+            self.bindings.initialize(config.domain_id, config.network_interface)
+        if self.bindings.imu_state_type is None:
+            raise RuntimeError("Unitree SDK bindings do not provide HG IMUState")
+        self.config = config
+        self.clock = clock or SystemClock()
+        self._lock = threading.Lock()
+        self._latest: IMUOrientationSample | None = None
+        self._last_error: str | None = None
+        self._closed = False
+        self._subscriber = self.bindings.subscriber_type(
+            SECONDARY_IMU_TOPIC, self.bindings.imu_state_type
+        )
+        self._subscriber.Init(self._receive, config.subscriber_queue_length)
+
+    def _receive(self, message: Any) -> None:
+        try:
+            sample = IMUOrientationSample(
+                receipt_monotonic_s=self.clock.monotonic(),
+                quaternion_wxyz=np.asarray(message.quaternion, dtype=np.float64),
+            )
+        except (AttributeError, TypeError, ValueError) as error:
+            with self._lock:
+                self._last_error = f"invalid torso IMU: {error}"
+            return
+        with self._lock:
+            if self._closed:
+                return
+            self._latest = sample
+            self._last_error = None
+
+    def observe(self) -> IMUOrientationSample:
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Unitree torso IMU observer is closed")
+            if self._latest is None:
+                suffix = "" if self._last_error is None else f": {self._last_error}"
+                raise RuntimeError(f"no valid Unitree torso IMU received{suffix}")
             return self._latest
 
     def close(self) -> None:

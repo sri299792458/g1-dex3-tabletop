@@ -23,6 +23,10 @@ from g1_aprilcube_calibration.motion_profile import velocity_limited_step
 from g1_aprilcube_calibration.opposite_arm_hold import OppositeArmHold
 from g1_aprilcube_calibration.pose_schema import HANDOFF_POSE_ID, PoseSet
 from g1_aprilcube_calibration.transports.base import ArmCommand, ArmTransport
+from g1_dex3_tabletop.mpc_command_buffer import (
+    MPCCommandWindow,
+    RollingMPCCommandBuffer,
+)
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _COMMAND_COMPLETION_EPSILON_RAD = 1e-9
@@ -149,11 +153,38 @@ class PoseExecutor:
         self._maximum_acquisition_position_change_rad = 0.0
         self._trajectory_time_s: np.ndarray | None = None
         self._trajectory_command_q: np.ndarray | None = None
+        self._mpc_command_buffer: RollingMPCCommandBuffer | None = None
         self._active_motion_timeout_s = self.config.motion_timeout_s
 
     @property
     def maximum_acquisition_position_change_rad(self) -> float:
         return self._maximum_acquisition_position_change_rad
+
+    @property
+    def calibration_command_q(self) -> np.ndarray:
+        """Return the exact calibration-arm command active in the control loop."""
+
+        if self._command_q14 is None:
+            raise RuntimeError("executor has no acquired arm command")
+        if self.pose_set.calibration_arm == "left":
+            return self._command_q14[:7].copy()
+        return self._command_q14[7:].copy()
+
+    def observe_control_input(self) -> tuple[RobotStateSample, np.ndarray]:
+        """Return one fresh measurement paired with the exact active command."""
+
+        return self.observe_state(), self.calibration_command_q
+
+    def streaming_trajectory_status(self) -> dict[str, float | int | bool]:
+        if self._mpc_command_buffer is None:
+            raise RuntimeError("no streaming MPC trajectory is active")
+        now = self.clock.monotonic()
+        return {
+            "generation": self._mpc_command_buffer.last_generation,
+            "terminal": self._mpc_command_buffer.terminal,
+            "remaining_s": self._mpc_command_buffer.remaining_s(now_s=now),
+            "duration_s": self._mpc_command_buffer.duration_s,
+        }
 
     def acquire(
         self,
@@ -386,6 +417,89 @@ class PoseExecutor:
             now,
         )
 
+    def start_streaming_trajectory(
+        self,
+        *,
+        from_pose_id: str,
+        to_pose_id: str,
+        window: MPCCommandWindow,
+        plan_sha256: str,
+        operator_confirmed: bool,
+    ) -> MPCCommandWindow:
+        """Start one continuously replenished, validated MPC arm trajectory."""
+
+        if self.state not in {ExecutorState.HOLDING, ExecutorState.READY}:
+            raise RuntimeError("a streaming trajectory can only start while holding or ready")
+        if not operator_confirmed:
+            raise ValueError("operator confirmation is required for every trajectory")
+        if self.current_pose_id != from_pose_id:
+            raise ValueError("streaming trajectory source does not match the current pose")
+        if plan_sha256 != self.approved_validation_report_sha256:
+            raise ValueError("streaming trajectory belongs to a different approved plan")
+        if to_pose_id != HANDOFF_POSE_ID and not any(
+            pose.id == to_pose_id for pose in self.pose_set.poses
+        ):
+            raise ValueError(
+                f"streaming trajectory target is not in the installed plan: {to_pose_id}"
+            )
+        if self._command_q14 is None:
+            raise RuntimeError("executor has no acquired arm state")
+
+        now = self.clock.monotonic()
+        buffer = RollingMPCCommandBuffer(
+            plan_sha256=plan_sha256,
+            maximum_velocity_rad_s=self.config.maximum_joint_velocity_rad_s,
+            maximum_state_age_s=self.config.state_freshness_timeout_s,
+            maximum_window_gap_s=self.config.control_gap_fault_s,
+        )
+        accepted = window.rebase_start(self.calibration_command_q)
+        buffer.accept(
+            accepted,
+            now_s=now,
+            active_command_q_rad=self.calibration_command_q,
+        )
+        self._mpc_command_buffer = buffer
+        self._calibration_goal_q = np.asarray(accepted.command_q_rad[-1], dtype=np.float64)
+        self._goal_q14 = self._compose_command(self._calibration_goal_q)
+        self._pending_pose_id = to_pose_id
+        self._phase_started_s = now
+        self._motion_started_s = now
+        self._active_motion_timeout_s = self.config.motion_timeout_s
+        self._reset_settle_window()
+        self._last_motion_phase = ExecutorState.MOVING
+        self._last_motion_elapsed_s = 0.0
+        self._last_motion_measured_q = None
+        self._last_motion_position_errors = None
+        self._last_command_remaining_rad = None
+        self._last_settle_elapsed_s = 0.0
+        self._last_settle_spread_rad = None
+        self._transition(
+            ExecutorState.MOVING,
+            f"approved streaming MPC trajectory {from_pose_id}->{to_pose_id}",
+            now,
+        )
+        return accepted
+
+    def update_streaming_trajectory(
+        self,
+        *,
+        window: MPCCommandWindow,
+    ) -> MPCCommandWindow:
+        """Atomically install the next MPC window at the current command."""
+
+        if self.state is not ExecutorState.MOVING or self._mpc_command_buffer is None:
+            raise RuntimeError("no streaming MPC trajectory is active")
+        now = self.clock.monotonic()
+        accepted = window.rebase_start(self.calibration_command_q)
+        self._mpc_command_buffer.accept(
+            accepted,
+            now_s=now,
+            active_command_q_rad=self.calibration_command_q,
+        )
+        self._calibration_goal_q = np.asarray(accepted.command_q_rad[-1], dtype=np.float64)
+        self._goal_q14 = self._compose_command(self._calibration_goal_q)
+        return accepted
+
     def install_validated_plan(
         self,
         *,
@@ -561,7 +675,14 @@ class PoseExecutor:
 
         assert self._command_q14 is not None
         assert self._goal_q14 is not None
-        if self._trajectory_time_s is None:
+        if self._mpc_command_buffer is not None:
+            try:
+                calibration_command = self._mpc_command_buffer.command(now_s=now)
+            except (TypeError, ValueError, RuntimeError) as error:
+                self._enter_fault(str(error), now)
+                return self.state
+            self._command_q14 = self._compose_command(calibration_command)
+        elif self._trajectory_time_s is None:
             self._command_q14 = velocity_limited_step(
                 self._command_q14,
                 self._goal_q14,
@@ -605,7 +726,17 @@ class PoseExecutor:
             np.max(np.abs(commanded_q - self._calibration_goal_q))
         )
         if self.state is ExecutorState.MOVING:
-            if self._last_command_remaining_rad <= _COMMAND_COMPLETION_EPSILON_RAD:
+            streaming_complete = (
+                self._mpc_command_buffer is not None
+                and self._mpc_command_buffer.terminal
+                and self._mpc_command_buffer.remaining_s(now_s=now)
+                <= _COMMAND_COMPLETION_EPSILON_RAD
+            )
+            frozen_or_pose_complete = (
+                self._mpc_command_buffer is None
+                and self._last_command_remaining_rad <= _COMMAND_COMPLETION_EPSILON_RAD
+            )
+            if streaming_complete or frozen_or_pose_complete:
                 self._reset_settle_window()
                 self._transition(
                     ExecutorState.SETTLING,
@@ -657,6 +788,7 @@ class PoseExecutor:
                     self._pending_pose_id = None
                     self._trajectory_time_s = None
                     self._trajectory_command_q = None
+                    self._mpc_command_buffer = None
                     self._active_motion_timeout_s = self.config.motion_timeout_s
                     endpoint_evidence = (
                         f"endpoint error {position_error:.4f}rad passed"
