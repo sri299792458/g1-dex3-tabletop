@@ -180,6 +180,12 @@ def _serve_tabletop() -> int:
                     if command == "plan-tabletop-lifecycle":
                         request = TabletopTaskRequest.from_json(request_path)
                         result = session.plan_lifecycle(request, progress=progress)
+                    elif command == "plan-supported-escape":
+                        request = TabletopTaskRequest.from_json(request_path)
+                        result = session.plan_escape(request, progress=progress)
+                    elif command == "replan-tabletop-at-clearance":
+                        request = TabletopTaskRequest.from_json(request_path)
+                        result = session.replan_at_clearance(request, progress=progress)
                     elif command == "plan-charuco-supported-escape":
                         request = CharucoSupportedEscapeRequest.from_json(request_path)
                         result = plan_supported_escape(request, progress=progress)

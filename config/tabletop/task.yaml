@@ -13,6 +13,12 @@ table:
   # independently.
   collision_policy: local_manipulation_geometry_plane
   open_transit_patch_dimensions_m: [0.400, 0.400, 0.020]
+  # A mathematically positive sphere/plane distance is not enough execution
+  # margin. This matches the commissioned 5 mm minimum collision clearance
+  # used by the calibration route validator. It applies to selected wrist/hand
+  # geometry after the supported escape; the resting cube is intentionally
+  # allowed to contact its supporting plane.
+  minimum_hand_plane_clearance_m: 0.005
 motion:
   supported_escape_m: 0.100
   # First raise only one quarter of the 40 mm cube height. This removes table

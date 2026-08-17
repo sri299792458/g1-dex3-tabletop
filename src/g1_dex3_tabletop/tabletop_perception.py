@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.camera_models import RectifiedCameraInfo
 from g1_aprilcube_calibration.table_accuracy import detect_hand_target_pose
+from g1_aprilcube_calibration.transforms import invert_transform, validate_transform
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.tabletop_contracts import TabletopObservation
 
@@ -27,6 +28,31 @@ def _average(transforms: Sequence[np.ndarray]) -> np.ndarray:
 def _rotation_error_deg(first: np.ndarray, second: np.ndarray) -> float:
     relative = first[:3, :3].T @ second[:3, :3]
     return float(np.rad2deg(Rotation.from_matrix(relative).magnitude()))
+
+
+def camera_motion_from_fixed_cube(
+    reference_camera_T_object,
+    current_camera_T_object,
+) -> dict[str, object]:
+    """Measure camera motion in the AprilCube frame, assuming the cube stayed fixed."""
+
+    reference_object_T_camera = invert_transform(
+        validate_transform(np.asarray(reference_camera_T_object, dtype=np.float64))
+    )
+    current_object_T_camera = invert_transform(
+        validate_transform(np.asarray(current_camera_T_object, dtype=np.float64))
+    )
+    translation_mm = 1000.0 * (current_object_T_camera[:3, 3] - reference_object_T_camera[:3, 3])
+    return {
+        "translation_object_xyz_mm": translation_mm.tolist(),
+        "translation_norm_mm": float(np.linalg.norm(translation_mm)),
+        "rotation_deg": _rotation_error_deg(
+            reference_object_T_camera,
+            current_object_T_camera,
+        ),
+        "anchor": "fixed_tabletop_aprilcube",
+        "sign_convention": "current_camera_minus_reference_camera_in_fixed_object_frame",
+    }
 
 
 def observe_resting_cube(

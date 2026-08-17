@@ -37,6 +37,9 @@ class Executor:
     def install_validated_plan(self, **kwargs):
         self.installed_plan = kwargs
 
+    def replace_validated_remaining_plan(self, **kwargs):
+        self.replaced_plan = kwargs
+
     def start_trajectory(self, **kwargs):
         self.trajectory = kwargs
 
@@ -138,3 +141,13 @@ def test_synchronized_executor_serializes_validated_plan_install():
     synchronized.install_validated_plan(**values)
 
     assert raw.installed_plan == values
+
+
+def test_synchronized_executor_serializes_remaining_plan_replacement():
+    raw = Executor()
+    synchronized = SynchronizedPoseExecutor(raw)
+    values = {"pose_set": object(), "approved_validation_report_sha256": "c" * 64}
+
+    synchronized.replace_validated_remaining_plan(**values)
+
+    assert raw.replaced_plan == values

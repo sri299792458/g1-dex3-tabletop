@@ -3418,3 +3418,53 @@ the full two-color plate and check the marker with the detector.
   only milliseconds and is not worth further optimization.
 - No robot command was sent. Retained-run planning and all tensor comparisons
   were performed offline.
+
+## 2026-08-17 — Fixed-cube clearance-boundary replan and physical table margin
+
+- The rigid-chair measurements established that the camera/table relationship
+  changes by about `5.3 mm` between the supported loaded state and lifted arm
+  state. The production task now uses the existing visible AprilCube as a
+  task-local fixed anchor: it is observed after loaded ownership and again
+  while the exact supported-escape endpoint is held. The second observation
+  replaces the camera/object transform and all measured locked-body/finger
+  coordinates. The selected arm coordinate remains the exact serialized escape
+  endpoint, preserving command continuity.
+- Before the first changing target, CuRobo now freezes only the 100 mm supported
+  escape and its exact reverse. This is the complete recovery contract needed
+  to reach the stationary observation boundary. After the boundary burst, the
+  same persistent worker plans the only grasp task eligible for execution and
+  atomically replaces the executor's remaining pose set and plan hash. If the
+  observation, replan, or boundary install fails while the controller remains
+  healthy, the arm follows the already-frozen exact reverse to handoff and the
+  task stops. No task plan from the known-stale loaded scene can execute.
+- A merely positive wrist/hand-to-table distance is no longer accepted.
+  `task.yaml` hash-binds a `5 mm` minimum, matching the existing commissioned
+  calibration route validator's general collision-clearance policy. Frozen
+  open routes, provisional closed-hand payload routes, measured-contact route
+  validation, and non-supported MPC windows enforce that same floor. The
+  supported escape retains its start-relative policy, and the resting/just-
+  attached cube remains allowed to contact its supporting plane.
+- A command-free replay of retained physical request
+  `tabletop_20260815T224443Z` proved why both changes are needed. Its only
+  otherwise reachable grasp branches had `0.9 mm` minimum clearance at
+  `left_hand_thumb_2_link`; all were rejected against the new `5.0 mm` floor.
+  The other IK branches retained their prior genuine torso collisions. This is
+  the same sub-millimetre route class that preceded the physical table strike;
+  it is no longer labeled execution-ready. Requiring that stale grasp plan
+  before the supported lift would prevent reaching the measurement boundary,
+  so the reversible escape and boundary task are deliberately separate
+  planning transactions.
+- Run artifacts now retain `loaded_observation/`, `clearance_observation/`,
+  `loaded_request.json`, `initial_clearance_request.json`, the final
+  `clearance_request.json`, `supported_escape.json`, `execution_plan.json`, and
+  `cube_anchor_motion.json`. The latter reports inferred camera translation and
+  rotation in the fixed cube frame. Moving the cube between observations
+  violates this explicit contract; the code does not relabel object motion as
+  robot state.
+- The production worker generated the escape-only artifact from that retained
+  physical request without ROS or robot commands: terminal G-frame clearance
+  `149.0 mm`, plan SHA-256
+  `0255cc7f001322c580a9bbe79bbfc3294e561e0d4e8edb5d296933b3d9098422`.
+  Final verification is `334 passed, 6 skipped` in the control environment and
+  `333 passed, 1 skipped` in the CUDA planner environment; Ruff and Git
+  whitespace checks pass. No robot command was sent.

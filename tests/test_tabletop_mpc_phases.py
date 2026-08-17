@@ -202,6 +202,82 @@ def test_planning_session_updates_measured_contact_without_rebuilding_solver(mon
     assert not built[0].closed
 
 
+def test_clearance_replan_atomically_replaces_task_and_resets_old_mpc(monkeypatch) -> None:
+    events = []
+    request = SimpleNamespace(content_sha256="fresh", observation=object())
+    task = object()
+    execution = SimpleNamespace(supported_escape=object(), task=object())
+    replacement = SimpleNamespace(task=task)
+
+    class Validator:
+        cache_build_s = 0.25
+
+        def __init__(self, received_request, received_task) -> None:
+            assert received_request is request
+            assert received_task is task
+
+    class Controller:
+        def close(self) -> None:
+            events.append("closed")
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.request_at_clearance_observation",
+        lambda loaded, escape, observation: request,
+    )
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.plan_tabletop_task",
+        lambda received, progress: task,
+    )
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.combine_tabletop_plans",
+        lambda **kwargs: replacement,
+    )
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.RetentionRouteValidator",
+        Validator,
+    )
+    session = TabletopPlanningSession()
+    session._loaded_request = object()
+    session._clearance_request = object()
+    session._supported_escape = execution.supported_escape
+    session._execution = execution
+    session._retention_validator = object()
+    session._phase_mpc = Controller()
+    session._active_phase_mpc = session._phase_mpc
+
+    assert session.replan_at_clearance(request, progress=events.append) is replacement
+    assert session._clearance_request is request
+    assert session._execution is replacement
+    assert isinstance(session._retention_validator, Validator)
+    assert session._phase_mpc is None
+    assert session._active_phase_mpc is None
+    assert "closed" in events
+
+
+def test_escape_only_session_retains_exact_reverse_for_later_boundary_replan(
+    monkeypatch,
+) -> None:
+    request = object()
+    escape = object()
+    clearance = object()
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.plan_supported_escape",
+        lambda received, progress: escape,
+    )
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.request_at_clearance",
+        lambda received, received_escape: clearance,
+    )
+    session = TabletopPlanningSession()
+
+    assert session.plan_escape(request) is escape
+    assert session._loaded_request is request
+    assert session._supported_escape is escape
+    assert session._clearance_request is clearance
+    assert session._execution is None
+    assert session._retention_validator is None
+
+
 def test_payload_uses_frozen_planner_cuboid_cover_in_grasp_frame() -> None:
     object_T_grasp = np.eye(4)
     object_T_grasp[:3, 3] = (0.01, -0.02, 0.03)

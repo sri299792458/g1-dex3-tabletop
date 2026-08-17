@@ -69,14 +69,19 @@ from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_
 from g1_dex3_tabletop.tabletop_contracts import (
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
+    SupportedEscapePlan,
     TabletopExecutionPlan,
 )
-from g1_dex3_tabletop.tabletop_perception import observe_resting_cube
+from g1_dex3_tabletop.tabletop_perception import (
+    camera_motion_from_fixed_cube,
+    observe_resting_cube,
+)
 from g1_dex3_tabletop.tabletop_presentation import load_tabletop_presentation
 from g1_dex3_tabletop.tabletop_workflow import (
     build_tabletop_request,
     load_task_config,
     request_at_clearance,
+    request_at_clearance_observation,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -625,6 +630,7 @@ def run_tabletop(args) -> int:
     )
     preflight_frames: tuple[ROSImageFrame, ...] = ()
     loaded_frames: tuple[ROSImageFrame, ...] = ()
+    clearance_frames: tuple[ROSImageFrame, ...] = ()
     status: dict = {
         "status": "started",
         "commands_robot": False,
@@ -639,6 +645,7 @@ def run_tabletop(args) -> int:
     raw_recorder = None
     guard = synchronized = driver = planner = None
     mpc_phases: dict[str, dict] = {}
+    cube_anchor_motion = None
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
@@ -798,7 +805,8 @@ def run_tabletop(args) -> int:
             )
             print(
                 "CONTROL ACQUIRED — exact measured 29-joint state held with dual-Dex3 "
-                "gravity feedforward; observing the fixed cube and planning all motion",
+                "gravity feedforward; observing the fixed cube and planning the reversible "
+                "supported escape",
                 flush=True,
             )
             loaded_frames = _collect_frames(
@@ -829,49 +837,38 @@ def run_tabletop(args) -> int:
                 fixture=presentation.fixture,
             )
             loaded_request_path = task_run / "loaded_request.json"
-            execution_path = task_run / "execution_plan.json"
+            escape_path = task_run / "supported_escape.json"
             loaded_request.write_json(loaded_request_path)
             try:
                 planner.request(
-                    "plan-tabletop-lifecycle",
+                    "plan-supported-escape",
                     request_path=loaded_request_path,
-                    output_path=execution_path,
+                    output_path=escape_path,
                     control_check=driver.check,
                 )
             except (PlannerRequestRejected, RuntimeError) as error:
                 driver.check()
-                raise TabletopTaskRejected(
-                    f"complete lifecycle planning failed: {error}"
-                ) from error
-            execution = TabletopExecutionPlan.from_json(execution_path)
-            escape = execution.supported_escape
-            task = execution.task
-            # Keep the component artifacts independently inspectable even though the
-            # worker planned them as one transaction.
+                raise TabletopTaskRejected(f"supported escape planning failed: {error}") from error
+            escape = SupportedEscapePlan.from_json(escape_path)
             clearance_request = request_at_clearance(loaded_request, escape)
-            clearance_request.write_json(task_run / "clearance_request.json")
-            escape.write_json(task_run / "supported_escape.json")
-            task.write_json(task_run / "task_plan.json")
-            retention_test_lift_mm = 1000.0 * float(
-                task.planner_provenance["retention_test_lift_actual_m"]
-            )
-            payload_lift_mm = 1000.0 * float(clearance_request.lift_m)
+            clearance_request.write_json(task_run / "initial_clearance_request.json")
             pose_set = pose_set_from_trajectories(
                 arm=arm,
-                trajectories=execution.trajectories,
+                trajectories=(escape.outbound, escape.inbound),
                 reference_full_q=loaded_state.position,
                 robot_model=model.name,
                 urdf_sha256=model.sha256,
-                source="NVlabs/curobo_complete_tabletop_lifecycle",
+                source="NVlabs/curobo_reversible_supported_escape",
             )
             synchronized.install_validated_plan(
                 pose_set=pose_set,
-                approved_validation_report_sha256=execution.content_sha256,
+                approved_validation_report_sha256=escape.content_sha256,
                 validated_reference_state=loaded_state,
             )
             print(
-                f"COMPLETE PLAN FROZEN — grasp {task.selected_candidate_id}; ten "
-                "connected CuRobo trajectories return exactly to the supported handoff",
+                "REVERSIBLE SUPPORTED ESCAPE FROZEN — the table-normal lift and its "
+                "exact reverse return to handoff are validated. The only executable "
+                "grasp task will be planned from a fresh fixed-cube observation at clearance",
                 flush=True,
             )
             initial_left = held_hands.left.position
@@ -879,7 +876,95 @@ def run_tabletop(args) -> int:
             grasp_stall = None
             retention_evidence = None
             retention_route = None
+            _execute_trajectory(
+                synchronized,
+                driver,
+                escape.outbound,
+                plan_sha256=escape.content_sha256,
+                control_config=control_config,
+            )
+            try:
+                clearance_frames = _collect_frames(
+                    rclpy,
+                    node,
+                    camera,
+                    count=args.observation_frames,
+                    timeout_s=10.0,
+                    control_check=driver.check,
+                )
+                boundary_state = synchronized.observe_state()
+                boundary_hands = dex_controller.observer.observe()
+                boundary_observation = observe_resting_cube(
+                    [item.image_bgr for item in clearance_frames],
+                    camera_info=expected_camera,
+                    detector=detector,
+                    snapshot=_snapshot(boundary_state, boundary_hands),
+                    minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
+                    maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
+                )
+                cube_anchor_motion = camera_motion_from_fixed_cube(
+                    loaded_observation.camera_T_object,
+                    boundary_observation.camera_T_object,
+                )
+                clearance_request = request_at_clearance_observation(
+                    loaded_request,
+                    escape,
+                    boundary_observation,
+                )
+                clearance_request_path = task_run / "clearance_request.json"
+                clearance_request.write_json(clearance_request_path)
+                replanned_execution_path = task_run / "execution_plan.json"
+                planner.request(
+                    "replan-tabletop-at-clearance",
+                    request_path=clearance_request_path,
+                    output_path=replanned_execution_path,
+                    control_check=driver.check,
+                )
+                replanned_execution = TabletopExecutionPlan.from_json(replanned_execution_path)
+                replanned_task = replanned_execution.task
+                replanned_pose_set = pose_set_from_trajectories(
+                    arm=arm,
+                    trajectories=replanned_execution.trajectories,
+                    reference_full_q=boundary_state.position,
+                    robot_model=model.name,
+                    urdf_sha256=model.sha256,
+                    source="NVlabs/curobo_fixed_cube_clearance_replan",
+                )
+                synchronized.replace_validated_remaining_plan(
+                    pose_set=replanned_pose_set,
+                    approved_validation_report_sha256=(replanned_execution.content_sha256),
+                    validated_reference_state=boundary_state,
+                )
+            except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+                driver.check()
+                _execute_trajectory(
+                    synchronized,
+                    driver,
+                    escape.inbound,
+                    plan_sha256=escape.content_sha256,
+                    control_config=control_config,
+                )
+                rejection_return_completed = True
+                raise TabletopTaskRejected(
+                    f"fixed-cube clearance-boundary replan failed: {error}"
+                ) from error
+
+            execution = replanned_execution
+            task = replanned_task
             normal_routes, recovery_routes = _trajectory_maps(execution)
+            task.write_json(task_run / "task_plan.json")
+            retention_test_lift_mm = 1000.0 * float(
+                task.planner_provenance["retention_test_lift_actual_m"]
+            )
+            payload_lift_mm = 1000.0 * float(clearance_request.lift_m)
+            print(
+                "CLEARANCE-BOUNDARY REPLAN INSTALLED — fixed-cube anchor measured "
+                f"{cube_anchor_motion['translation_norm_mm']:.2f} mm / "
+                f"{cube_anchor_motion['rotation_deg']:.2f} deg camera motion; selected "
+                f"grasp {task.selected_candidate_id}; required hand/table execution "
+                f"margin={clearance_request.minimum_hand_plane_clearance_m * 1000.0:.1f} mm",
+                flush=True,
+            )
 
             def execute_phase(
                 name: str,
@@ -958,7 +1043,6 @@ def run_tabletop(args) -> int:
                 execute_phase("__handoff__", use_mpc=False)
                 rejection_return_completed = True
 
-            execute_phase("clearance")
             open_active_hand(f"{arm}-hand pregrasp open")
             execute_phase("move_to_pregrasp")
             execute_phase("grasp_approach")
@@ -1088,7 +1172,9 @@ def run_tabletop(args) -> int:
                 "arm": arm,
                 "presentation_id": presentation.presentation_id,
                 "selected_candidate_id": task.selected_candidate_id,
+                "supported_escape_plan_sha256": escape.content_sha256,
                 "execution_plan_sha256": execution.content_sha256,
+                "cube_anchor_motion": cube_anchor_motion,
                 "motion_controller": args.motion_controller,
                 "mpc_phase_count": len(mpc_phases),
                 "mpc_window_count": sum(
@@ -1100,6 +1186,9 @@ def run_tabletop(args) -> int:
                 "terminal_action": guard.terminal_action,
                 "table_collision_policy": "local_manipulation_geometry_plane",
                 "open_transit_table_patch_dimensions_m": list(patch_dimensions),
+                "minimum_hand_plane_clearance_m": (
+                    clearance_request.minimum_hand_plane_clearance_m
+                ),
                 "calibration_validation_claim": False,
             }
             print(
@@ -1238,26 +1327,35 @@ def run_tabletop(args) -> int:
                     "error": str(error),
                 }
         status["cleanup_errors"] = cleanup_errors
+        status.setdefault(
+            "minimum_hand_plane_clearance_m",
+            float(task_config["table"]["minimum_hand_plane_clearance_m"]),
+        )
+        if cube_anchor_motion is not None:
+            status.setdefault("cube_anchor_motion", cube_anchor_motion)
         try:
             if preflight_frames:
                 _save_frames(task_run / "preflight", preflight_frames)
             if loaded_frames:
                 _save_frames(task_run / "loaded_observation", loaded_frames)
+            if clearance_frames:
+                _save_frames(task_run / "clearance_observation", clearance_frames)
+            if cube_anchor_motion is not None:
+                atomic_write_json(task_run / "cube_anchor_motion.json", cube_anchor_motion)
             if mpc_phases:
+                phase_plan_sha256 = {
+                    name: document["preparation"]["plan_sha256"]
+                    for name, document in mpc_phases.items()
+                    if document["preparation"] is not None
+                }
                 atomic_write_json(
                     task_run / "mpc_lifecycle.json",
                     {
                         "schema_version": 1,
                         "controller": "curobo_mpc",
                         "run_status": status["status"],
-                        "plan_sha256": next(
-                            (
-                                document["preparation"]["plan_sha256"]
-                                for document in mpc_phases.values()
-                                if document["preparation"] is not None
-                            ),
-                            None,
-                        ),
+                        "plan_sha256s": sorted(set(phase_plan_sha256.values())),
+                        "phase_plan_sha256": phase_plan_sha256,
                         "phase_order": list(mpc_phases),
                         "phases": mpc_phases,
                     },

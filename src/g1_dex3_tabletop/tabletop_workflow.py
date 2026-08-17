@@ -36,6 +36,11 @@ def load_task_config(path: str | Path) -> dict[str, Any]:
     maximum_velocity = float(document.get("motion", {}).get("maximum_arm_velocity_rad_s", 0.0))
     if not np.isfinite(maximum_velocity) or maximum_velocity <= 0.0:
         raise ValueError("tabletop maximum arm velocity must be positive and finite")
+    minimum_hand_clearance = float(
+        document.get("table", {}).get("minimum_hand_plane_clearance_m", 0.0)
+    )
+    if not np.isfinite(minimum_hand_clearance) or minimum_hand_clearance <= 0.0:
+        raise ValueError("tabletop minimum hand-plane clearance must be positive and finite")
     return document
 
 
@@ -77,6 +82,7 @@ def build_tabletop_request(
         open_transit_table_patch_dimensions_m=tuple(
             task["table"]["open_transit_patch_dimensions_m"]
         ),
+        minimum_hand_plane_clearance_m=float(task["table"]["minimum_hand_plane_clearance_m"]),
         supported_escape_m=float(task["motion"]["supported_escape_m"]),
         retention_test_lift_m=float(task["motion"]["retention_test_lift_m"]),
         lift_m=float(task["motion"]["payload_lift_m"]),
@@ -90,18 +96,40 @@ def request_at_clearance(
 ) -> TabletopTaskRequest:
     """Use the exact supported-escape endpoint as the task planning state."""
 
+    return request_at_clearance_observation(
+        loaded_request,
+        escape,
+        loaded_request.observation,
+    )
+
+
+def request_at_clearance_observation(
+    loaded_request: TabletopTaskRequest,
+    escape: SupportedEscapePlan,
+    observation: TabletopObservation,
+) -> TabletopTaskRequest:
+    """Bind a fresh fixed-cube observation to the exact clearance command.
+
+    The camera/object pose and all nonselected robot coordinates come from the
+    stationary boundary observation. The selected arm remains the exact
+    collision-validated escape endpoint so the replanned task has bitwise
+    command continuity with the trajectory already executed.
+    """
+
     if escape.request_sha256 != loaded_request.content_sha256:
         raise ValueError("supported escape belongs to a different loaded request")
-    q29 = np.asarray(loaded_request.observation.snapshot.measured_q29_rad).copy()
+    source = observation
+    if source.camera_profile_sha256 != loaded_request.observation.camera_profile_sha256:
+        raise ValueError("clearance observation uses a different camera profile")
+    q29 = np.asarray(source.snapshot.measured_q29_rad).copy()
     q29[np.asarray(arm_indices(loaded_request.arm))] = np.asarray(
         escape.outbound.command_q_rad[-1]
     )
     snapshot = RobotSnapshot(
         measured_q29_rad=tuple(q29),
-        left_dex3_q_rad=loaded_request.observation.snapshot.left_dex3_q_rad,
-        right_dex3_q_rad=loaded_request.observation.snapshot.right_dex3_q_rad,
+        left_dex3_q_rad=source.snapshot.left_dex3_q_rad,
+        right_dex3_q_rad=source.snapshot.right_dex3_q_rad,
     )
-    source = loaded_request.observation
     observation = TabletopObservation(
         snapshot=snapshot,
         camera_T_object=source.camera_T_object,
@@ -124,6 +152,7 @@ def request_at_clearance(
         open_transit_table_patch_dimensions_m=(
             loaded_request.open_transit_table_patch_dimensions_m
         ),
+        minimum_hand_plane_clearance_m=loaded_request.minimum_hand_plane_clearance_m,
         supported_escape_m=loaded_request.supported_escape_m,
         retention_test_lift_m=loaded_request.retention_test_lift_m,
         lift_m=loaded_request.lift_m,

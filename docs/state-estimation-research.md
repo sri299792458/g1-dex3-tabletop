@@ -231,6 +231,15 @@ For the tabletop cube task, this becomes a concrete contract:
    the remaining CuRobo stages. Continuous trajectory deformation remains a
    later control experiment.
 
+The first production integration now implements the supported-lift boundary:
+the fixed AprilCube is observed after loaded ownership and again at clearance.
+Only the reversible escape exists before that motion. The second observation
+replaces the camera/object and measured locked-body state, while the selected
+arm coordinate is pinned to the exact escape command endpoint. CuRobo then
+plans the executable grasp lifecycle. This corrects the measured loaded-to-lift
+camera/body change without claiming continuous state estimation or permitting
+the cube itself to move.
+
 ## Candidate upstream implementations
 
 - Unitree's own G1 low-level example subscribes to both `rt/lowstate` and

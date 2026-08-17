@@ -587,6 +587,80 @@ class PoseExecutor:
             now,
         )
 
+    def replace_validated_remaining_plan(
+        self,
+        *,
+        pose_set: PoseSet,
+        approved_validation_report_sha256: str,
+        validated_reference_state: RobotStateSample,
+    ) -> None:
+        """Atomically replace future routes at an already-reached plan boundary.
+
+        Unlike loaded-handoff installation, this does not rebase ownership,
+        body commands, the opposite-arm hold, or gravity feedforward. The new
+        plan must contain the current named boundary at the exact active arm
+        command, and the live complete state must still match the state used by
+        the planner.
+        """
+
+        if self.state not in {ExecutorState.READY, ExecutorState.HOLDING}:
+            raise RuntimeError("a remaining plan can only be replaced while ready or holding")
+        if self.current_pose_id in {None, HANDOFF_POSE_ID} or self._pending_pose_id is not None:
+            raise RuntimeError("remaining-plan replacement requires a reached non-handoff pose")
+        if self._command_q14 is None or self._weight != 1.0:
+            raise RuntimeError("remaining-plan replacement requires full command ownership")
+        if not _SHA256_PATTERN.fullmatch(approved_validation_report_sha256):
+            raise ValueError("approved validation report hash must be lowercase SHA-256")
+        if pose_set.robot_model != self.pose_set.robot_model:
+            raise ValueError("replacement pose set belongs to a different robot model")
+        if pose_set.mode_machine != self.pose_set.mode_machine:
+            raise ValueError("replacement pose set uses a different mode machine")
+        if pose_set.urdf_sha256 != self.pose_set.urdf_sha256:
+            raise ValueError("replacement pose set belongs to a different URDF")
+        if pose_set.calibration_arm != self.pose_set.calibration_arm:
+            raise ValueError("replacement pose set uses a different calibration arm")
+        if not validated_reference_state.is_mode5:
+            raise ValueError("validated plan reference is not mode_machine=5")
+
+        matching = [pose for pose in pose_set.poses if pose.id == self.current_pose_id]
+        if len(matching) != 1:
+            raise ValueError("replacement plan does not contain the current boundary exactly once")
+        current_command = self.calibration_command_q
+        boundary_error = float(
+            np.max(np.abs(np.asarray(matching[0].command_calibration_q) - current_command))
+        )
+        if boundary_error > _COMMAND_COMPLETION_EPSILON_RAD:
+            raise ValueError(
+                f"replacement boundary differs from the current command by {boundary_error:.9f}rad"
+            )
+
+        now = self.clock.monotonic()
+        live_state = self.transport.observe()
+        self._validate_fresh_state(live_state, now)
+        reference_drift = float(
+            np.max(np.abs(live_state.position - validated_reference_state.position))
+        )
+        if reference_drift > self.config.settled_position_spread_rad:
+            raise ValueError(
+                "boundary state changed after path validation by "
+                f"{reference_drift:.4f}rad; limit is "
+                f"{self.config.settled_position_spread_rad:.4f}rad"
+            )
+
+        self.pose_set = pose_set
+        self.approved_validation_report_sha256 = approved_validation_report_sha256
+        self._calibration_goal_q = current_command.copy()
+        self._goal_q14 = self._command_q14.copy()
+        self._reset_settle_window()
+        self._send(now)
+        self._transition(
+            self.state,
+            "boundary-corrected remaining plan installed at "
+            f"{self.current_pose_id}; live reference drift {reference_drift:.4f}rad; "
+            f"command continuity {boundary_error:.9f}rad",
+            now,
+        )
+
     def tick(self) -> ExecutorState:
         now = self.clock.monotonic()
         if self.state in {ExecutorState.STOPPED, ExecutorState.OBSERVING}:

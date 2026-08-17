@@ -34,10 +34,14 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _validate_strict_supported_escape_self_collision,
 )
 from g1_dex3_tabletop.tabletop_contracts import SupportedEscapePlan, TabletopObservation
-from g1_dex3_tabletop.tabletop_perception import observe_resting_cube
+from g1_dex3_tabletop.tabletop_perception import (
+    camera_motion_from_fixed_cube,
+    observe_resting_cube,
+)
 from g1_dex3_tabletop.tabletop_workflow import (
     build_tabletop_request,
     request_at_clearance,
+    request_at_clearance_observation,
 )
 
 
@@ -180,6 +184,7 @@ def test_task_config_uses_only_a_local_open_transit_table_patch() -> None:
     assert request.open_transit_table_patch_dimensions_m == (0.400, 0.400, 0.020)
     assert request.maximum_arm_velocity_rad_s == 0.100
     assert request.retention_test_lift_m == 0.010
+    assert request.minimum_hand_plane_clearance_m == 0.005
 
 
 def test_tabletop_trajectory_is_retimed_to_task_velocity() -> None:
@@ -646,3 +651,67 @@ def test_clearance_request_uses_exact_escape_endpoint(arm, joint_slice) -> None:
     escape = SupportedEscapePlan(loaded.content_sha256, outbound, inbound, 0.1, {})
     result = request_at_clearance(loaded, escape)
     assert result.observation.snapshot.measured_q29_rad[joint_slice] == (0.2,) * 7
+
+
+def test_clearance_replan_uses_fresh_cube_and_body_but_exact_arm_endpoint() -> None:
+    source = _observation()
+    from g1_dex3_tabletop.tabletop_contracts import TabletopTaskRequest
+
+    loaded = TabletopTaskRequest(
+        source,
+        "left",
+        tuple(tuple(row) for row in _identity()),
+        {},
+        "e" * 64,
+        "config/tabletop/x.yaml",
+        "f" * 64,
+    )
+    outbound = PlannedTrajectory(
+        "__handoff__",
+        "clearance",
+        (0.0, 1.0),
+        ((0.0,) * 7, (0.2,) * 7),
+        ((0.0,) * 7, (0.2,) * 7),
+        1.0,
+    )
+    inbound = PlannedTrajectory(
+        "clearance",
+        "__handoff__",
+        (0.0, 1.0),
+        ((0.2,) * 7, (0.0,) * 7),
+        ((0.2,) * 7, (0.0,) * 7),
+        0.0,
+    )
+    escape = SupportedEscapePlan(loaded.content_sha256, outbound, inbound, 0.1, {})
+    fresh_q = np.linspace(-0.2, 0.2, 29)
+    fresh_pose = np.eye(4)
+    fresh_pose[0, 3] = 0.01
+    fresh = TabletopObservation(
+        RobotSnapshot(tuple(fresh_q), (0.3,) * 7, (0.4,) * 7),
+        tuple(tuple(row) for row in fresh_pose),
+        source.camera_profile_sha256,
+        ("1" * 64, "2" * 64, "3" * 64),
+        0.2,
+        0.1,
+    )
+
+    result = request_at_clearance_observation(loaded, escape, fresh)
+
+    assert result.observation.snapshot.measured_q29_rad[15:22] == (0.2,) * 7
+    assert result.observation.snapshot.measured_q29_rad[:15] == tuple(fresh_q[:15])
+    assert result.observation.snapshot.right_dex3_q_rad == (0.4,) * 7
+    assert result.observation.camera_T_object == fresh.camera_T_object
+    assert result.observation.source_frame_sha256 == fresh.source_frame_sha256
+
+
+def test_fixed_cube_anchor_reports_camera_motion_in_cube_frame() -> None:
+    reference = np.eye(4)
+    current = np.eye(4)
+    # Moving the camera +10 mm along cube X makes the cube appear at -10 mm.
+    current[0, 3] = -0.010
+
+    result = camera_motion_from_fixed_cube(reference, current)
+
+    assert result["anchor"] == "fixed_tabletop_aprilcube"
+    assert result["translation_norm_mm"] == pytest.approx(10.0)
+    assert result["translation_object_xyz_mm"] == pytest.approx([10.0, 0.0, 0.0])

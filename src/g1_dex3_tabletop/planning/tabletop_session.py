@@ -17,10 +17,16 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
 from g1_dex3_tabletop.tabletop_contracts import (
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
+    SupportedEscapePlan,
     TabletopExecutionPlan,
     TabletopTaskRequest,
+    combine_tabletop_plans,
 )
-from g1_dex3_tabletop.tabletop_workflow import assemble_execution_plan, request_at_clearance
+from g1_dex3_tabletop.tabletop_workflow import (
+    assemble_execution_plan,
+    request_at_clearance,
+    request_at_clearance_observation,
+)
 
 
 class TabletopPlanningSession:
@@ -29,6 +35,7 @@ class TabletopPlanningSession:
     def __init__(self) -> None:
         self._loaded_request: TabletopTaskRequest | None = None
         self._clearance_request: TabletopTaskRequest | None = None
+        self._supported_escape: SupportedEscapePlan | None = None
         self._execution: TabletopExecutionPlan | None = None
         self._retention_validator: RetentionRouteValidator | None = None
         self._phase_mpc: TabletopPhaseMPC | None = None
@@ -51,6 +58,7 @@ class TabletopPlanningSession:
         )
         self._loaded_request = request
         self._clearance_request = clearance_request
+        self._supported_escape = escape
         self._execution = execution
         report("building reusable measured-contact collision checker")
         self._retention_validator = RetentionRouteValidator(clearance_request, task)
@@ -59,6 +67,28 @@ class TabletopPlanningSession:
             f"build={self._retention_validator.cache_build_s:.3f}s"
         )
         return execution
+
+    def plan_escape(
+        self,
+        request: TabletopTaskRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> SupportedEscapePlan:
+        """Freeze only the supported lift and exact reverse needed to reach clearance."""
+
+        report = progress or (lambda _message: None)
+        escape = plan_supported_escape(request, progress=report)
+        controller = self._phase_mpc
+        if controller is not None:
+            controller.close()
+        self._phase_mpc = None
+        self._active_phase_mpc = None
+        self._loaded_request = request
+        self._clearance_request = request_at_clearance(request, escape)
+        self._supported_escape = escape
+        self._execution = None
+        self._retention_validator = None
+        return escape
 
     def validate_retention_route(
         self,
@@ -79,6 +109,52 @@ class TabletopPlanningSession:
         if request.task_plan.content_sha256 != self._execution.task.content_sha256:
             raise ValueError("retention request differs from the worker's frozen task plan")
         return self._retention_validator.validate(request, progress=progress)
+
+    def replan_at_clearance(
+        self,
+        request: TabletopTaskRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> TabletopExecutionPlan:
+        """Replace only the task using a fresh fixed-cube clearance observation."""
+
+        if self._loaded_request is None or self._supported_escape is None:
+            raise RuntimeError(
+                "clearance replan requires a supported escape planned in this worker"
+            )
+        expected = request_at_clearance_observation(
+            self._loaded_request,
+            self._supported_escape,
+            request.observation,
+        )
+        if request.content_sha256 != expected.content_sha256:
+            raise ValueError(
+                "clearance replan changed more than the boundary observation and exact "
+                "supported-escape endpoint"
+            )
+        report = progress or (lambda _message: None)
+        task = plan_tabletop_task(request, progress=report)
+        execution = combine_tabletop_plans(
+            loaded_request=self._loaded_request,
+            clearance_request=request,
+            supported_escape=self._supported_escape,
+            task=task,
+        )
+        report("rebuilding measured-contact checker for the boundary-corrected task")
+        retention_validator = RetentionRouteValidator(request, task)
+        controller = self._phase_mpc
+        if controller is not None:
+            controller.close()
+        self._phase_mpc = None
+        self._active_phase_mpc = None
+        self._clearance_request = request
+        self._execution = execution
+        self._retention_validator = retention_validator
+        report(
+            "boundary-corrected lifecycle ready; measured-contact checker build="
+            f"{retention_validator.cache_build_s:.3f}s"
+        )
+        return execution
 
     def prepare_mpc_phase(
         self,

@@ -19,9 +19,10 @@ rejected approaches, and remaining physical limits.
   not create robot command publishers.
 - CUDA planning runs in one persistent separate Python 3.11 process per task.
   It is started and warmed before SPACE, never imports Unitree transport code,
-  and remains alive for complete lifecycle planning plus measured-contact
-  validation. ROS/control runs in Python 3.10 and keeps publishing through the
-  commissioned fixed-rate Unitree controller while planning is in progress.
+  and remains alive for the reversible supported escape, clearance-boundary
+  task replan, MPC, and measured-contact validation. ROS/control runs in Python
+  3.10 and keeps publishing through the commissioned fixed-rate Unitree
+  controller while planning is in progress.
 - Hardware commands require the exact harness/workspace acknowledgement and a
   second interactive SPACE after a read-only live preflight.
 - Standing calibration uses `rt/arm_sdk`, full gravity feedforward, measured
@@ -226,8 +227,11 @@ complete-scene collision.
 Before SPACE, this verifies the seated stationary state, both Dex3 states,
 camera profile, and cube observation without creating publishers. After SPACE,
 it acquires exact measured 29-joint lowcmd control, applies dual-Dex3 gravity
-feedforward, observes the cube again in the loaded state, and sends one complete
-lifecycle request to the already-warm isolated CuRobo worker for:
+feedforward, and observes the fixed cube in the loaded state. The worker first
+freezes only the supported escape and its exact reverse. After that lift reaches
+clearance, the controller holds the exact command, observes the unchanged cube
+again, and plans the only grasp lifecycle eligible for execution from that fresh
+camera/body state:
 
 1. a straight supported-hand escape along the observed support-plane normal;
 2. bounded branch-aware complete-path selection from the 15 shared
@@ -237,6 +241,12 @@ lifecycle request to the already-warm isolated CuRobo worker for:
 4. a collision-aware 27-sphere conservative payload lift, exact reverse
    replacement, release, retreat, clearance return, and exact reverse
    supported return.
+
+The cube is the task-local table anchor during this boundary update; it must not
+move between the loaded and clearance observations. The run records both image
+bursts, both hash-bound requests, and the inferred camera motion in the cube
+frame. A failed boundary observation or task replan follows the already-frozen
+clearance-to-handoff reverse and stops without opening the hand.
 
 Physical closure does not require the fingers to reproduce the exact final
 PhysX joint vector. The live controller first observes finger motion in the
@@ -273,6 +283,13 @@ model: an overlap aborts before changing motion and prints the link pair and
 penetration in millimetres so the operator can reposition the robot and rerun.
 There is no start-state collision exception. Use `--arm left` to run the same
 shared grasp set and lifecycle with the left Dex3.
+
+For every post-escape wrist/hand route, merely positive table clearance is not
+accepted. `config/tabletop/task.yaml` requires 5 mm, matching the commissioned
+minimum collision clearance used by the calibration route validator. The same
+hash-bound floor is applied to frozen open/closed planning, the measured-contact
+payload-route check, and every MPC window. It does not apply to the resting cube
+or its conservative payload proxy at initial support contact.
 
 For initial physical commissioning, `config/tabletop/task.yaml` limits every
 selected-arm trajectory to `0.100 rad/s`. The limit is hash-bound into each

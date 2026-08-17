@@ -1,11 +1,13 @@
 # Phase-aware tabletop MPC
 
-The tabletop workflow can execute the ten normal arm motions with CuRobo MPC
-instead of replaying each frozen trajectory verbatim. The frozen lifecycle is
-still required: it supplies the selected grasp, a complete collision-checked
-route, exact phase boundaries, and the reverse recovery trajectories. MPC uses
-that route as its local reference and replans short arm-command windows from
-fresh measured joint states.
+After the reversible supported escape and fixed-cube boundary replan, the
+tabletop workflow can execute every remaining normal arm motion with CuRobo MPC
+instead of replaying each frozen trajectory verbatim. The boundary-corrected
+frozen lifecycle supplies the selected grasp, a complete collision-checked
+route, exact phase boundaries, and reverse recovery trajectories. MPC uses that
+route as its local reference and replans short arm-command windows from fresh
+measured joint states. The outbound supported escape itself remains the exact
+trajectory that established the observation boundary.
 
 The isolated CUDA worker never publishes robot commands. Each returned window
 is hash-bound to the frozen execution plan and then installed atomically in the
@@ -55,6 +57,12 @@ optional exact presenter-mesh check. A window marked infeasible never enters
 the command buffer. A planner or controller failure follows the existing
 fail-closed PC2 takeover path. Normal grasp rejection uses the already-frozen
 reverse recovery trajectories rather than MPC.
+
+Non-supported phases require the request's 5 mm selected-hand/table margin;
+`> 0 mm` is not considered execution-ready. Supported motion retains its
+separate start-relative policy because the hand begins and ends physically
+supported, while the resting/just-attached cube is intentionally allowed to
+touch its support plane.
 
 ## Hardware selection
 

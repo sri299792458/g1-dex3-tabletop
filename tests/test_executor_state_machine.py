@@ -519,6 +519,51 @@ def test_loaded_plan_install_rejects_state_drift_after_validation() -> None:
     assert executor.approved_validation_report_sha256 == REPORT_HASH
 
 
+def test_reached_boundary_can_atomically_replace_only_the_remaining_plan() -> None:
+    _clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    executor.start_pose(
+        "pose_001",
+        approval=approval(executor, HANDOFF_POSE_ID, "pose_001"),
+        operator_confirmed=True,
+    )
+    advance_until(transport, executor, ExecutorState.READY)
+    reference = transport.observe()
+    replacement = pose_set()
+
+    executor.replace_validated_remaining_plan(
+        pose_set=replacement,
+        approved_validation_report_sha256="c" * 64,
+        validated_reference_state=reference,
+    )
+
+    assert executor.current_pose_id == "pose_001"
+    assert executor.pose_set is replacement
+    assert executor.approved_validation_report_sha256 == "c" * 64
+    assert "boundary-corrected remaining plan installed" in executor.events[-1].reason
+
+
+def test_remaining_plan_replacement_rejects_boundary_command_discontinuity() -> None:
+    _clock, _transport, executor = subject()
+    executor.adopt_owned_control(previous_command_q14=np.zeros(14))
+    executor.current_pose_id = "pose_001"
+    reference = executor.transport.observe()
+    changed = replace(
+        pose_set(),
+        poses=(pose("pose_001", np.full(7, 0.081)),),
+    )
+
+    with pytest.raises(ValueError, match="replacement boundary differs"):
+        executor.replace_validated_remaining_plan(
+            pose_set=changed,
+            approved_validation_report_sha256="c" * 64,
+            validated_reference_state=reference,
+        )
+
+    assert executor.approved_validation_report_sha256 == REPORT_HASH
+
+
 def test_motion_uses_replay_target_without_changing_measured_pose() -> None:
     clock = ManualClock(1.0)
     transport = FakeArmTransport(clock=clock, initial_full_q=np.zeros(29))

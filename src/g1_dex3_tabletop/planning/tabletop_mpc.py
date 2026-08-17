@@ -957,7 +957,7 @@ class TabletopPhaseMPC:
                 - COLLISION_ACTIVATION_DISTANCE_M
             )
         else:
-            hand_floor = 0.0
+            hand_floor = self.clearance_request.minimum_hand_plane_clearance_m
         diagnostics["required_hand_plane_clearance_m"] = hand_floor
         if hand_clearance < hand_floor:
             diagnostics.update(

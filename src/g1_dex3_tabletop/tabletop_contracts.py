@@ -315,6 +315,7 @@ class TabletopTaskRequest:
     fixture: TabletopFixture | None = None
     object_dimensions_m: tuple[float, ...] = (0.040, 0.040, 0.040)
     open_transit_table_patch_dimensions_m: tuple[float, ...] = (0.400, 0.400, 0.020)
+    minimum_hand_plane_clearance_m: float = 0.005
     supported_escape_m: float = 0.100
     retention_test_lift_m: float = 0.010
     lift_m: float = 0.100
@@ -367,6 +368,11 @@ class TabletopTaskRequest:
         )
         if any(value <= 0 for value in self.open_transit_table_patch_dimensions_m):
             raise ValueError("open-transit table patch dimensions must be positive")
+        if (
+            not np.isfinite(self.minimum_hand_plane_clearance_m)
+            or self.minimum_hand_plane_clearance_m <= 0.0
+        ):
+            raise ValueError("minimum hand-plane clearance must be positive and finite")
         for name in (
             "supported_escape_m",
             "retention_test_lift_m",
@@ -406,6 +412,7 @@ class TabletopTaskRequest:
             "open_transit_table_patch_dimensions_m": list(
                 self.open_transit_table_patch_dimensions_m
             ),
+            "minimum_hand_plane_clearance_m": self.minimum_hand_plane_clearance_m,
             "supported_escape_m": self.supported_escape_m,
             "retention_test_lift_m": self.retention_test_lift_m,
             "lift_m": self.lift_m,

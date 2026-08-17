@@ -1655,10 +1655,11 @@ def _plan_open_branch(
         down=down,
         include_payload=False,
     )
-    if open_clearance < 0.0:
+    if open_clearance < request.minimum_hand_plane_clearance_m:
         raise _BranchRejected(
             "open_route_table_plane",
-            f"clearance={open_clearance:.4f}m at {open_link} sample {open_sample}",
+            f"clearance={open_clearance:.4f}m at {open_link} sample {open_sample}; "
+            f"required={request.minimum_hand_plane_clearance_m:.4f}m",
         )
     return _OpenBranchPlan(
         approach=approach,
@@ -1787,10 +1788,11 @@ def _plan_attached_lift(
             down=down,
             include_payload=False,
         )
-        if hand_clearance < 0.0:
+        if hand_clearance < request.minimum_hand_plane_clearance_m:
             raise _BranchRejected(
                 "closed_lift_table_plane",
-                f"clearance={hand_clearance:.4f}m at {hand_link} sample {hand_sample}",
+                f"clearance={hand_clearance:.4f}m at {hand_link} sample {hand_sample}; "
+                f"required={request.minimum_hand_plane_clearance_m:.4f}m",
             )
         payload_clearance, payload_link, payload_sample = _local_plane_clearance(
             planner,
@@ -1941,11 +1943,12 @@ class RetentionRouteValidator:
             down=self.down,
             include_payload=False,
         )
-        if hand_clearance < 0.0:
+        if hand_clearance < self.tabletop.minimum_hand_plane_clearance_m:
             raise RuntimeError(
-                "measured stalled Dex3 posture drives hand geometry through the inferred "
-                f"table plane: clearance={hand_clearance:.4f}m at {hand_link} sample "
-                f"{hand_sample}/{len(route_q) - 1}"
+                "measured stalled Dex3 posture leaves insufficient hand/table execution "
+                f"margin: clearance={hand_clearance:.4f}m at {hand_link} sample "
+                f"{hand_sample}/{len(route_q) - 1}; required="
+                f"{self.tabletop.minimum_hand_plane_clearance_m:.4f}m"
             )
         fixture_clearance = fixture_link = fixture_sample = None
         if self.fixture_mesh is not None:
@@ -1988,6 +1991,7 @@ class RetentionRouteValidator:
                 "elapsed_s": time.monotonic() - started,
                 "cached_kinematics": True,
                 "cache_build_s": self.cache_build_s,
+                "required_hand_plane_clearance_m": (self.tabletop.minimum_hand_plane_clearance_m),
                 "policy": (
                     "frozen split payload arm route; measured contact-stalled active Dex3; "
                     "strict full-robot self-collision, selected wrist/hand table plane, "
@@ -2392,6 +2396,7 @@ def plan_tabletop_task(
                     "full-robot self/cube geometry"
                 ),
                 "table_plane_policy": f"local_{arm}_wrist_hand_payload_only",
+                "required_hand_plane_clearance_m": (request.minimum_hand_plane_clearance_m),
                 "open_transit_table_patch_dimensions_m": list(
                     request.open_transit_table_patch_dimensions_m
                 ),
