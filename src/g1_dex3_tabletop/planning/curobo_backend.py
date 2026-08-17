@@ -310,14 +310,20 @@ def _monotonic_collision_recovery_trajectory(
 class CuroboKinematicCollisionChecker:
     """Reusable CuRobo FK and strict self-collision state for one robot model."""
 
-    def __init__(self, *, robot: dict, device_cfg) -> None:
+    def __init__(self, *, robot: dict | None = None, device_cfg, kinematics_config=None) -> None:
         from curobo._src.cost.cost_self_collision import SelfCollisionCost
         from curobo._src.cost.cost_self_collision_cfg import SelfCollisionCostCfg
         from curobo._src.robot.kinematics.kinematics import Kinematics
         from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
 
+        if (robot is None) == (kinematics_config is None):
+            raise ValueError("provide exactly one of robot or kinematics_config")
         self.device_cfg = device_cfg
-        self.config = KinematicsCfg.from_data_dict(robot["kinematics"], device_cfg=device_cfg)
+        self.config = (
+            kinematics_config
+            if kinematics_config is not None
+            else KinematicsCfg.from_data_dict(robot["kinematics"], device_cfg=device_cfg)
+        )
         self.kinematics = Kinematics(self.config)
         self.cost = SelfCollisionCost(
             SelfCollisionCostCfg(
@@ -356,14 +362,23 @@ class CuroboKinematicCollisionChecker:
         pairs. Only those hits cross the CPU boundary.
         """
 
-        import torch
-
         values = np.asarray(q_samples, dtype=np.float64)
         spheres = self.robot_spheres(values, joint_names=joint_names)
-        self.cost.setup_batch_tensors(len(values), 1)
+        return self.self_collision_pair_penetrations_from_spheres(spheres)
+
+    def self_collision_pair_penetrations_from_spheres(
+        self,
+        spheres,
+    ) -> list[dict[tuple[str, str], float]]:
+        """Group strict self overlaps from one already-computed FK sphere tensor."""
+
+        import torch
+
+        sample_count = int(spheres.shape[0])
+        self.cost.setup_batch_tensors(sample_count, 1)
         self.cost.forward(spheres)
         pair_hits = torch.nonzero(self.cost._pair_distance[:, 0] > 0.0, as_tuple=False)
-        result: list[dict[tuple[str, str], float]] = [{} for _ in values]
+        result: list[dict[tuple[str, str], float]] = [{} for _ in range(sample_count)]
         if pair_hits.numel() == 0:
             return result
 
@@ -371,7 +386,7 @@ class CuroboKinematicCollisionChecker:
         sample_indices = pair_hits[:, 0]
         pair_indices = pair_hits[:, 1]
         hit_sphere_pairs = collision_pairs[pair_indices].to(dtype=torch.long)
-        sphere_values = spheres.reshape(len(values), -1, 4)
+        sphere_values = spheres.reshape(sample_count, -1, 4)
         first = sphere_values[sample_indices, hit_sphere_pairs[:, 0]]
         second = sphere_values[sample_indices, hit_sphere_pairs[:, 1]]
         padding = self.config.self_collision_config.sphere_padding.reshape(-1)

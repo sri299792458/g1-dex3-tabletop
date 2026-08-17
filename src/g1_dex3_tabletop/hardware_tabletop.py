@@ -381,22 +381,66 @@ def _execute_trajectory(
     print(f"completed phase: {trajectory.to_pose_id}", flush=True)
 
 
-def _execute_mpc_approach(
+def _execute_mpc_phase(
     synchronized,
     driver,
     planner,
     *,
     arm: str,
+    trajectory,
     plan_sha256: str,
     control_config,
-) -> list[dict]:
-    """Execute the nominal clearance-to-pregrasp route through rolling MPC."""
+    measured_active_dex3_q_rad=None,
+    phase_record: dict | None = None,
+) -> tuple[dict, list[dict]]:
+    """Execute one normal frozen route through phase-aware rolling MPC."""
+
+    phase = trajectory.to_pose_id
+    try:
+        preparation_event = planner.request_payload(
+            "prepare-mpc-phase",
+            payload={
+                "phase": phase,
+                "measured_active_dex3_q_rad": (
+                    None
+                    if measured_active_dex3_q_rad is None
+                    else list(measured_active_dex3_q_rad)
+                ),
+            },
+            control_check=driver.check,
+            timeout_s=30.0,
+        )
+    except (PlannerRequestRejected, RuntimeError) as error:
+        driver.check()
+        raise RuntimeError(f"CuRobo MPC preparation failed for {phase}: {error}") from error
+    preparation = dict(preparation_event["payload"])
+    if phase_record is not None:
+        phase_record["preparation"] = preparation
+    if preparation["reused_warm_model"]:
+        preparation_detail = (
+            "reconfigured the one warmed solver in "
+            f"{1000.0 * preparation['reconfiguration_time_s']:.1f}ms; "
+            "no solver construction or CUDA graph rebuild"
+        )
+    else:
+        preparation_detail = (
+            f"built {preparation['physical_mode']} collision model in "
+            f"{preparation['preparation_time_s']:.3f}s "
+            f"(construction={preparation['build_time_s']:.3f}s, "
+            f"CUDA setup={preparation['setup_time_s']:.3f}s)"
+        )
+    print(
+        f"CUROBO MPC {phase} READY — {preparation_detail}; fixed-rate robot "
+        "control remained active",
+        flush=True,
+    )
 
     def request_window() -> MPCCommandWindow:
         state, active_command = synchronized.observe_control_input()
         event = planner.request_payload(
-            "step-open-approach-mpc",
+            "step-mpc-phase",
             payload={
+                "phase": phase,
                 "measured_command_q_rad": state.arm_q(arm).tolist(),
                 "measured_dq_rad_s": state.arm_dq(arm).tolist(),
                 "active_command_q_rad": active_command.tolist(),
@@ -409,14 +453,21 @@ def _execute_mpc_approach(
 
     windows: list[dict] = []
     first = request_window()
-    accepted = synchronized.start_streaming_trajectory(
-        from_pose_id="clearance",
-        to_pose_id="move_to_pregrasp",
-        window=first,
-        plan_sha256=plan_sha256,
-        operator_confirmed=True,
-    )
+    try:
+        accepted = synchronized.start_streaming_trajectory(
+            from_pose_id=trajectory.from_pose_id,
+            to_pose_id=trajectory.to_pose_id,
+            window=first,
+            plan_sha256=plan_sha256,
+            operator_confirmed=True,
+        )
+    except BaseException:
+        if phase_record is not None:
+            phase_record["rejected_window"] = first.to_dict()
+        raise
     windows.append(accepted.to_dict())
+    if phase_record is not None:
+        phase_record["windows"].append(accepted.to_dict())
     replan_lead_s = control_config.state_freshness_timeout_s
     while synchronized.state is ExecutorState.MOVING:
         driver.check()
@@ -427,12 +478,20 @@ def _execute_mpc_approach(
             time.sleep(0.01)
             continue
         window = request_window()
-        accepted = synchronized.update_streaming_trajectory(window=window)
+        try:
+            accepted = synchronized.update_streaming_trajectory(window=window)
+        except BaseException:
+            if phase_record is not None:
+                phase_record["rejected_window"] = window.to_dict()
+            raise
         windows.append(accepted.to_dict())
+        if phase_record is not None:
+            phase_record["windows"].append(accepted.to_dict())
         if accepted.generation % 10 == 0:
             print(
-                "CuRobo MPC approach progress: "
-                f"window={accepted.generation}, solve={accepted.solve_time_s:.3f}s, "
+                "CuRobo MPC progress: "
+                f"phase={phase}, window={accepted.generation}, "
+                f"solve={accepted.solve_time_s:.3f}s, "
                 f"remaining={accepted.duration_s:.3f}s",
                 flush=True,
             )
@@ -440,13 +499,15 @@ def _execute_mpc_approach(
         synchronized,
         driver,
         timeout_s=control_config.motion_timeout_s,
-        label="move_to_pregrasp MPC terminal settle",
+        label=f"{phase} MPC terminal settle",
     )
     print(
-        f"completed phase: move_to_pregrasp through {len(windows)} validated MPC windows",
+        f"completed phase: {phase} through {len(windows)} validated MPC windows",
         flush=True,
     )
-    return windows
+    if phase_record is not None:
+        phase_record["completed"] = True
+    return preparation, windows
 
 
 def _restore_seated_control(*, driver, dex_controller, guard, synchronized) -> None:
@@ -569,6 +630,7 @@ def run_tabletop(args) -> int:
         "commands_robot": False,
         "arm": arm,
         "presentation_id": presentation.presentation_id,
+        "motion_controller": args.motion_controller,
     }
     primary_error: BaseException | None = None
     rejection_return_completed = False
@@ -576,8 +638,7 @@ def run_tabletop(args) -> int:
     node = rclpy_module = None
     raw_recorder = None
     guard = synchronized = driver = planner = None
-    mpc_preparation = None
-    mpc_windows: list[dict] = []
+    mpc_phases: dict[str, dict] = {}
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
@@ -783,26 +844,6 @@ def run_tabletop(args) -> int:
                     f"complete lifecycle planning failed: {error}"
                 ) from error
             execution = TabletopExecutionPlan.from_json(execution_path)
-            if args.approach_controller == "mpc":
-                try:
-                    mpc_event = planner.request_payload(
-                        "prepare-open-approach-mpc",
-                        payload={},
-                        control_check=driver.check,
-                        timeout_s=30.0,
-                    )
-                except (PlannerRequestRejected, RuntimeError) as error:
-                    driver.check()
-                    raise TabletopTaskRejected(
-                        f"CuRobo MPC preparation failed: {error}"
-                    ) from error
-                mpc_preparation = dict(mpc_event["payload"])
-                print(
-                    "CUROBO MPC READY — CUDA graphs and the exact open-hand scene "
-                    f"were warmed in {mpc_preparation['setup_time_s']:.3f}s; "
-                    "the 250 Hz robot controller remains in the parent process",
-                    flush=True,
-                )
             escape = execution.supported_escape
             task = execution.task
             # Keep the component artifacts independently inspectable even though the
@@ -840,7 +881,33 @@ def run_tabletop(args) -> int:
             retention_route = None
             normal_routes, recovery_routes = _trajectory_maps(execution)
 
-            def execute_phase(name: str) -> None:
+            def execute_phase(
+                name: str,
+                *,
+                measured_active_dex3_q_rad=None,
+                use_mpc: bool = True,
+            ) -> None:
+                if args.motion_controller == "mpc" and use_mpc:
+                    phase_record = {
+                        "completed": False,
+                        "preparation": None,
+                        "windows": [],
+                    }
+                    mpc_phases[name] = phase_record
+                    preparation, windows = _execute_mpc_phase(
+                        synchronized,
+                        driver,
+                        planner,
+                        arm=arm,
+                        trajectory=normal_routes[name],
+                        plan_sha256=execution.content_sha256,
+                        control_config=control_config,
+                        measured_active_dex3_q_rad=measured_active_dex3_q_rad,
+                        phase_record=phase_record,
+                    )
+                    assert phase_record["preparation"] == preparation
+                    assert phase_record["windows"] == windows
+                    return
                 _execute_trajectory(
                     synchronized,
                     driver,
@@ -875,11 +942,11 @@ def run_tabletop(args) -> int:
                 if from_test_lift:
                     execute_recovery("retention_test_lift", "payload_replace")
                     open_active_hand("release after failed retention test")
-                    execute_phase("grasp_retreat")
+                    execute_phase("grasp_retreat", use_mpc=False)
                 else:
                     open_active_hand("open after rejected grasp attempt")
                     execute_recovery("grasp_approach", "grasp_retreat")
-                execute_phase("return_to_clearance")
+                execute_phase("return_to_clearance", use_mpc=False)
                 _command_fingers(
                     dex_controller,
                     driver,
@@ -888,22 +955,12 @@ def run_tabletop(args) -> int:
                     right=initial_right,
                     label="initial finger posture restoration after task rejection",
                 )
-                execute_phase("__handoff__")
+                execute_phase("__handoff__", use_mpc=False)
                 rejection_return_completed = True
 
             execute_phase("clearance")
             open_active_hand(f"{arm}-hand pregrasp open")
-            if args.approach_controller == "mpc":
-                mpc_windows = _execute_mpc_approach(
-                    synchronized,
-                    driver,
-                    planner,
-                    arm=arm,
-                    plan_sha256=execution.content_sha256,
-                    control_config=control_config,
-                )
-            else:
-                execute_phase("move_to_pregrasp")
+            execute_phase("move_to_pregrasp")
             execute_phase("grasp_approach")
             active_close_target = task.close_target_active_dex3_q_rad
             try:
@@ -968,7 +1025,10 @@ def run_tabletop(args) -> int:
                 f"{retention_test_lift_mm:.1f} mm test lift",
                 flush=True,
             )
-            execute_phase("retention_test_lift")
+            execute_phase(
+                "retention_test_lift",
+                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+            )
             try:
                 retention_evidence = dex_controller.verify_grasp_stall_persistence(
                     safety_heartbeat=lambda: (driver.check(), guard.pulse()),
@@ -990,9 +1050,18 @@ def run_tabletop(args) -> int:
                 "the test lift; continuing the full payload lift",
                 flush=True,
             )
-            execute_phase("payload_lift")
-            execute_phase("payload_lower")
-            execute_phase("payload_replace")
+            execute_phase(
+                "payload_lift",
+                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+            )
+            execute_phase(
+                "payload_lower",
+                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+            )
+            execute_phase(
+                "payload_replace",
+                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+            )
             open_active_hand("cube release after exact replacement")
             execute_phase("grasp_retreat")
             execute_phase("return_to_clearance")
@@ -1013,18 +1082,6 @@ def run_tabletop(args) -> int:
                 guard=guard,
                 synchronized=synchronized,
             )
-            if mpc_windows:
-                atomic_write_json(
-                    task_run / "mpc_approach.json",
-                    {
-                        "schema_version": 1,
-                        "controller": "curobo_mpc",
-                        "phase": "move_to_pregrasp",
-                        "plan_sha256": execution.content_sha256,
-                        "preparation": mpc_preparation,
-                        "windows": mpc_windows,
-                    },
-                )
             status = {
                 "status": "completed",
                 "commands_robot": True,
@@ -1032,8 +1089,11 @@ def run_tabletop(args) -> int:
                 "presentation_id": presentation.presentation_id,
                 "selected_candidate_id": task.selected_candidate_id,
                 "execution_plan_sha256": execution.content_sha256,
-                "approach_controller": args.approach_controller,
-                "mpc_window_count": len(mpc_windows),
+                "motion_controller": args.motion_controller,
+                "mpc_phase_count": len(mpc_phases),
+                "mpc_window_count": sum(
+                    len(document["windows"]) for document in mpc_phases.values()
+                ),
                 "grasp_stall": grasp_stall.to_dict(),
                 "retention_evidence": retention_evidence.to_dict(),
                 "retention_route_validation_sha256": retention_route.content_sha256,
@@ -1069,6 +1129,7 @@ def run_tabletop(args) -> int:
                 "commands_robot": bool(transport is not None and transport.command_count),
                 "arm": arm,
                 "presentation_id": presentation.presentation_id,
+                "motion_controller": args.motion_controller,
                 "error_type": type(error).__name__,
                 "error": f"task rejection recovery failed after {rejection}: {error}",
             }
@@ -1078,6 +1139,7 @@ def run_tabletop(args) -> int:
             "commands_robot": bool(transport is not None and transport.command_count),
             "arm": arm,
             "presentation_id": presentation.presentation_id,
+            "motion_controller": args.motion_controller,
             "reason": str(rejection),
             "terminal_action": guard.terminal_action,
             "frozen_reverse_return_completed": rejection_return_completed,
@@ -1101,6 +1163,7 @@ def run_tabletop(args) -> int:
             "commands_robot": bool(transport is not None and transport.command_count),
             "arm": arm,
             "presentation_id": presentation.presentation_id,
+            "motion_controller": args.motion_controller,
             "error_type": type(error).__name__,
             "error": str(error),
         }
@@ -1180,6 +1243,25 @@ def run_tabletop(args) -> int:
                 _save_frames(task_run / "preflight", preflight_frames)
             if loaded_frames:
                 _save_frames(task_run / "loaded_observation", loaded_frames)
+            if mpc_phases:
+                atomic_write_json(
+                    task_run / "mpc_lifecycle.json",
+                    {
+                        "schema_version": 1,
+                        "controller": "curobo_mpc",
+                        "run_status": status["status"],
+                        "plan_sha256": next(
+                            (
+                                document["preparation"]["plan_sha256"]
+                                for document in mpc_phases.values()
+                                if document["preparation"] is not None
+                            ),
+                            None,
+                        ),
+                        "phase_order": list(mpc_phases),
+                        "phases": mpc_phases,
+                    },
+                )
             atomic_write_json(task_run / "status.json", status)
         except BaseException as error:
             if primary_error is None:

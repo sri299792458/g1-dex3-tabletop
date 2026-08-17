@@ -167,12 +167,12 @@ def build_parser() -> argparse.ArgumentParser:
     tabletop.add_argument("--output-root", type=Path, default=ROOT / "runs")
     tabletop.add_argument("--observation-frames", type=int, default=5)
     tabletop.add_argument(
-        "--approach-controller",
+        "--motion-controller",
         choices=("trajectory", "mpc"),
         default="trajectory",
         help=(
-            "controller for the collision-free clearance-to-pregrasp phase; "
-            "mpc uses continuously replenished CuRobo windows"
+            "arm-motion controller for every normal tabletop phase; mpc uses "
+            "phase-aware continuously replenished CuRobo windows"
         ),
     )
     tabletop.add_argument(

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 import numpy as np
 
 from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
-from g1_dex3_tabletop.planning.tabletop_mpc import TabletopOpenApproachMPC
+from g1_dex3_tabletop.planning.tabletop_mpc import TabletopPhaseMPC, mpc_phase_spec
 from g1_dex3_tabletop.planning.tabletop_planner import (
     RetentionRouteValidator,
     plan_supported_escape,
@@ -26,10 +27,12 @@ class TabletopPlanningSession:
     """Plan and validate one lifecycle without restarting Python or CUDA."""
 
     def __init__(self) -> None:
+        self._loaded_request: TabletopTaskRequest | None = None
         self._clearance_request: TabletopTaskRequest | None = None
         self._execution: TabletopExecutionPlan | None = None
         self._retention_validator: RetentionRouteValidator | None = None
-        self._open_approach_mpc: TabletopOpenApproachMPC | None = None
+        self._phase_mpc: TabletopPhaseMPC | None = None
+        self._active_phase_mpc: TabletopPhaseMPC | None = None
 
     def plan_lifecycle(
         self,
@@ -46,6 +49,7 @@ class TabletopPlanningSession:
             supported_escape=escape,
             task=task,
         )
+        self._loaded_request = request
         self._clearance_request = clearance_request
         self._execution = execution
         report("building reusable measured-contact collision checker")
@@ -76,35 +80,93 @@ class TabletopPlanningSession:
             raise ValueError("retention request differs from the worker's frozen task plan")
         return self._retention_validator.validate(request, progress=progress)
 
-    def prepare_open_approach_mpc(self) -> dict:
-        """Create and warm the exact-model MPC before the live approach."""
+    def prepare_mpc_phase(
+        self,
+        phase: str,
+        *,
+        measured_active_dex3_q_rad: np.ndarray | None = None,
+    ) -> dict:
+        """Create or reuse the exact physical MPC model for one motion phase."""
 
-        if self._clearance_request is None or self._execution is None:
+        if (
+            self._loaded_request is None
+            or self._clearance_request is None
+            or self._execution is None
+        ):
             raise RuntimeError("MPC preparation requires a lifecycle planned in this worker")
-        if self._open_approach_mpc is not None:
-            raise RuntimeError("open-approach MPC was already prepared")
-        controller = TabletopOpenApproachMPC(
+        spec = mpc_phase_spec(phase)
+        measured = (
+            None
+            if measured_active_dex3_q_rad is None
+            else np.asarray(measured_active_dex3_q_rad, dtype=np.float64)
+        )
+        controller = self._phase_mpc
+        if controller is not None:
+            if not controller.can_select_phase(
+                phase,
+                measured_active_dex3_q_rad=measured,
+            ):
+                raise ValueError(f"warmed MPC cannot represent physical phase {phase}")
+            switch = controller.select_phase(
+                phase,
+                measured_active_dex3_q_rad=measured,
+            )
+            self._active_phase_mpc = controller
+            return {
+                "build_time_s": 0.0,
+                "preparation_time_s": switch["reconfiguration_time_s"],
+                "setup_time_s": 0.0,
+                "phase": phase,
+                "physical_mode": spec.mode,
+                "reused_warm_model": True,
+                "kinematics_cache_hit": switch["kinematics_cache_hit"],
+                "kinematics_resolve_time_s": switch["kinematics_resolve_time_s"],
+                "optimizer_prewarm_time_s": switch["optimizer_prewarm_time_s"],
+                "reconfiguration_time_s": switch["reconfiguration_time_s"],
+                "plan_sha256": self._execution.content_sha256,
+            }
+        build_started = time.perf_counter()
+        controller = TabletopPhaseMPC(
             self._clearance_request,
             self._execution,
+            phase=phase,
+            loaded_request=self._loaded_request,
+            measured_active_dex3_q_rad=measured,
         )
+        build_s = time.perf_counter() - build_started
         try:
             setup_s = controller.setup_at_frozen_route_start()
         except BaseException:
             controller.close()
             raise
-        self._open_approach_mpc = controller
+        self._phase_mpc = controller
+        self._active_phase_mpc = controller
         return {
+            "build_time_s": build_s,
+            "preparation_time_s": build_s + setup_s,
             "setup_time_s": setup_s,
-            "phase": "move_to_pregrasp",
+            "phase": phase,
+            "physical_mode": spec.mode,
+            "reused_warm_model": False,
+            "kinematics_cache_hit": True,
+            "kinematics_resolve_time_s": 0.0,
+            "optimizer_prewarm_time_s": 0.0,
+            "reconfiguration_time_s": 0.0,
             "plan_sha256": self._execution.content_sha256,
         }
 
-    def step_open_approach_mpc(self, payload: dict) -> MPCCommandWindow:
+    def step_mpc_phase(self, payload: dict) -> MPCCommandWindow:
         """Optimize one window from a fresh measured state and active command."""
 
-        if self._open_approach_mpc is None:
-            raise RuntimeError("open-approach MPC has not been prepared")
-        return self._open_approach_mpc.next_nominal_window(
+        if self._active_phase_mpc is None:
+            raise RuntimeError("tabletop phase MPC has not been prepared")
+        requested_phase = str(payload["phase"])
+        if requested_phase != self._active_phase_mpc.spec.phase:
+            raise ValueError(
+                f"MPC step requests {requested_phase} while "
+                f"{self._active_phase_mpc.spec.phase} is prepared"
+            )
+        return self._active_phase_mpc.next_nominal_window(
             measured_command_q_rad=np.asarray(payload["measured_command_q_rad"], dtype=np.float64),
             measured_dq_rad_s=np.asarray(payload["measured_dq_rad_s"], dtype=np.float64),
             active_command_q_rad=np.asarray(payload["active_command_q_rad"], dtype=np.float64),
@@ -117,6 +179,8 @@ class TabletopPlanningSession:
         )
 
     def close(self) -> None:
-        if self._open_approach_mpc is not None:
-            self._open_approach_mpc.close()
-            self._open_approach_mpc = None
+        controller = self._phase_mpc
+        self._phase_mpc = None
+        self._active_phase_mpc = None
+        if controller is not None:
+            controller.close()

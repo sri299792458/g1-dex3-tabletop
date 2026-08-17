@@ -96,6 +96,39 @@ class _BranchRejected(RuntimeError):
         self.reason = reason
 
 
+def prewarm_tabletop_model_resolution() -> float:
+    """Pay one-time CuRobo/CUDA model startup before robot ownership.
+
+    The live joint and finger values still produce a freshly resolved model.
+    This command-free warmup only moves CUDA module loading and the first G1
+    topology construction ahead of the operator approval boundary.
+    """
+
+    import torch
+    from curobo.types import DeviceCfg
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CuRobo tabletop model warmup requires a CUDA device")
+    started = time.monotonic()
+    snapshot = RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7)
+    robot, _reference = build_tabletop_robot_config(
+        arm="left",
+        snapshot=snapshot,
+        joint_position_offsets_rad={},
+        active_finger_q_rad=dex3_execution_profile("left")[0],
+    )
+    checker = CuroboKinematicCollisionChecker(
+        robot=robot,
+        device_cfg=DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32),
+    )
+    torch.cuda.synchronize()
+    del checker
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return time.monotonic() - started
+
+
 def _contact_links(arm: str) -> tuple[str, ...]:
     return tuple(f"{arm}_hand_{suffix}_link" for suffix in ("thumb_2", "middle_1", "index_1"))
 
@@ -114,11 +147,10 @@ def _selected_open_transit_world_robot(
 ) -> dict[str, Any]:
     """Scope open-transit world obstacles to the selected wrist and hand.
 
-    CuRobo applies one world-collision sphere set to every scene object. Its
-    per-link ``collision_sphere_buffer`` is compensated in the self-collision
-    padding, so making unrelated world radii negative leaves the strict
-    self-collision geometry unchanged. The generated route is still checked
-    afterward against the strict full-robot cube model and table-plane guard.
+    CuRobo applies one sphere set to world and self collision. Making unrelated
+    radii negative therefore makes this optimizer model deliberately
+    permissive; every generated route is checked afterward against the strict
+    full-robot self-collision, cube, fixture, and table-plane guards.
     """
 
     robot = copy.deepcopy(strict_robot)
@@ -138,6 +170,110 @@ def _selected_open_transit_world_robot(
         buffers[link_name] = -maximum_radius - WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M
     kinematics["collision_sphere_buffer"] = buffers
     return robot
+
+
+def _resolved_motion_robot(
+    *,
+    checker: CuroboKinematicCollisionChecker,
+    source_robot: dict[str, Any],
+    arm: str,
+    scope_world_to_selected_hand: bool,
+):
+    """Clone one parsed strict model into an independent optimizer model.
+
+    Loading the G1 URDF and its 766 collision spheres costs roughly two
+    seconds on the commissioned laptop.  The strict checker and motion
+    optimizer need independent tensors, but they do not need to parse the
+    identical kinematic tree twice.  Clone the already-resolved tensors,
+    retain only the moving grasp query frame, and optionally reproduce the
+    open-transit world-sphere policy exactly.
+    """
+
+    import torch
+    from curobo._src.robot.kinematics.kinematics_cfg import KinematicsCfg
+    from curobo._src.robot.types.self_collision_params import SelfCollisionKinematicsCfg
+    from curobo._src.types.robot import RobotCfg
+
+    source_config = checker.config
+    params = source_config.kinematics_config.clone()
+    frame = grasp_frame(arm)
+    if frame not in params.tool_frames:
+        raise ValueError(f"resolved CuRobo model lacks grasp frame {frame}")
+    frame_count = len(params.tool_frames)
+    frame_index = params.tool_frames.index(frame)
+    params.tool_frames = [frame]
+    params.tool_frame_map = (
+        params.tool_frame_map[frame_index : frame_index + 1].clone().contiguous()
+    )
+    joint_affects = params.joint_affects_endeffector.reshape(-1, frame_count)
+    params.joint_affects_endeffector = (
+        joint_affects[:, frame_index : frame_index + 1].clone().contiguous().reshape(-1)
+    )
+
+    if scope_world_to_selected_hand:
+        selected_links = set(_local_table_plane_links(arm))
+        raw = source_robot["kinematics"]
+        raw_spheres = raw["collision_spheres"]
+        reserved_links = set((raw.get("extra_collision_spheres") or {}).keys())
+        for link_name in params.link_name_to_idx_map:
+            indices = params.get_sphere_index_from_link_name(link_name)
+            if indices.numel() == 0 or link_name in selected_links:
+                continue
+            if link_name in reserved_links or link_name not in raw_spheres:
+                # CuRobo reserves payload spheres that do not appear in the
+                # source sphere dictionary.  Keep them disabled before grasp.
+                radii = torch.full(
+                    (indices.numel(),),
+                    -100.0,
+                    dtype=params.link_spheres.dtype,
+                    device=params.link_spheres.device,
+                )
+            else:
+                maximum_radius = max(
+                    (float(item["radius"]) for item in raw_spheres[link_name]),
+                    default=0.0,
+                )
+                buffer = -maximum_radius - WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M
+                radii = checker.device_cfg.to_device(
+                    [float(item["radius"]) + buffer for item in raw_spheres[link_name]]
+                )
+                if radii.numel() != indices.numel():
+                    raise RuntimeError(
+                        f"resolved sphere count differs for {link_name}: "
+                        f"{radii.numel()} != {indices.numel()}"
+                    )
+            params.link_spheres[:, indices, 3] = radii
+            params.reference_link_spheres[:, indices, 3] = radii
+
+    strict_self = source_config.self_collision_config
+    independent_self = None
+    if strict_self is not None:
+        independent_self = SelfCollisionKinematicsCfg(
+            num_spheres=strict_self.num_spheres,
+            sphere_padding=strict_self.sphere_padding.clone(),
+            collision_pairs=strict_self.collision_pairs.clone(),
+            _num_checks_per_thread_large_collision_pairs=(
+                strict_self._num_checks_per_thread_large_collision_pairs
+            ),
+            _max_threads_per_block_large_collision_pairs=(
+                strict_self._max_threads_per_block_large_collision_pairs
+            ),
+            _max_threads_per_block_small_collision_pairs=(
+                strict_self._max_threads_per_block_small_collision_pairs
+            ),
+            _num_checks_per_thread_small_collision_pairs=(
+                strict_self._num_checks_per_thread_small_collision_pairs
+            ),
+        )
+    resolved = KinematicsCfg(
+        device_cfg=source_config.device_cfg,
+        tool_frames=[frame],
+        kinematics_config=params,
+        self_collision_config=independent_self,
+        kinematics_parser=source_config.kinematics_parser,
+        generator_config=source_config.generator_config,
+    )
+    return RobotCfg(kinematics=resolved, device_cfg=checker.device_cfg)
 
 
 def _validate_strict_supported_escape_self_collision(
@@ -637,12 +773,18 @@ def _world_cuboid_clearances(
     device_cfg,
     disabled_links: set[str],
     checker: CuroboKinematicCollisionChecker | None = None,
+    sphere_array: np.ndarray | None = None,
 ) -> list[dict[tuple[str, str], float]]:
     """Return signed robot-sphere clearances to nearby named scene cuboids."""
 
     values = np.asarray(q_samples, dtype=np.float64)
     active = checker or CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
-    spheres = active.robot_spheres(values).detach().cpu().numpy().reshape(len(values), -1, 4)
+    if sphere_array is None:
+        spheres = active.robot_spheres(values).detach().cpu().numpy().reshape(len(values), -1, 4)
+    else:
+        spheres = np.asarray(sphere_array, dtype=np.float64)
+        if spheres.ndim != 3 or spheres.shape[0] != len(values) or spheres.shape[2] != 4:
+            raise ValueError("precomputed world-clearance spheres must have shape N x S x 4")
     sphere_link_indices = (
         active.config.kinematics_config.link_sphere_idx_map.detach().cpu().numpy().reshape(-1)
     )
@@ -662,27 +804,31 @@ def _world_cuboid_clearances(
                 0.5 * np.asarray(document["dims"], dtype=np.float64),
             )
         )
-    result: list[dict[tuple[str, str], float]] = []
-    for sample in spheres:
-        grouped: dict[tuple[str, str], float] = {}
-        for object_name, center, rotation, half_extents in cuboids:
-            for sphere, link_name in zip(sample, sphere_links, strict=True):
-                if sphere[3] <= 0.0 or link_name in disabled_links:
-                    continue
-                local = rotation.T @ (sphere[:3] - center)
-                offset = np.abs(local) - half_extents
-                signed_box_distance = float(
-                    np.linalg.norm(np.maximum(offset, 0.0)) + min(np.max(offset), 0.0)
-                )
-                clearance = signed_box_distance - float(sphere[3])
-                if clearance < COLLISION_ACTIVATION_DISTANCE_M:
-                    key = (link_name, object_name)
-                    grouped[key] = min(grouped.get(key, float("inf")), clearance)
-        result.append(grouped)
+    enabled_links = np.asarray(
+        [name not in disabled_links for name in sphere_links],
+        dtype=bool,
+    )
+    enabled = (spheres[..., 3] > 0.0) & enabled_links[None, :]
+    result: list[dict[tuple[str, str], float]] = [{} for _ in values]
+    for object_name, center, rotation, half_extents in cuboids:
+        local = (spheres[..., :3] - center[None, None, :]) @ rotation
+        offset = np.abs(local) - half_extents[None, None, :]
+        signed_box_distance = np.linalg.norm(np.maximum(offset, 0.0), axis=-1) + np.minimum(
+            np.max(offset, axis=-1),
+            0.0,
+        )
+        clearances = signed_box_distance - spheres[..., 3]
+        hits = np.argwhere(enabled & (clearances < COLLISION_ACTIVATION_DISTANCE_M))
+        for sample_index, sphere_index in hits:
+            link_name = sphere_links[int(sphere_index)]
+            key = (link_name, object_name)
+            clearance = float(clearances[sample_index, sphere_index])
+            grouped = result[int(sample_index)]
+            grouped[key] = min(grouped.get(key, float("inf")), clearance)
     return result
 
 
-def _planner(robot: dict[str, Any], scene: dict[str, Any], *, max_goalset: int, seed: int):
+def _planner(robot, scene: dict[str, Any], *, max_goalset: int, seed: int):
     import torch
     from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
     from curobo.types import DeviceCfg
@@ -861,6 +1007,35 @@ def _try_branch_pool(
             continue
         return branch, result, failures
     return None, None, failures
+
+
+def _pregrasp_endpoint_self_collision_reasons(
+    branches: list[_PregraspBranch],
+    *,
+    checker: CuroboKinematicCollisionChecker,
+) -> list[str | None]:
+    """Name exact strict endpoint collisions before trajectory optimization.
+
+    The open-transit optimizer deliberately scopes world spheres to the moving
+    hand.  Its IK pool can therefore contain an endpoint that the independent
+    strict full-robot checker must reject.  No trajectory can make an invalid
+    terminal configuration valid, so detect those endpoints in one batched FK
+    call instead of spending seconds planning a route that will be discarded.
+    """
+
+    if not branches:
+        return []
+    samples = checker.self_collision_pair_penetrations(
+        np.stack([branch.model_q_rad for branch in branches], axis=0)
+    )
+    reasons: list[str | None] = []
+    for pairs in samples:
+        if not pairs:
+            reasons.append(None)
+            continue
+        pair, penetration = max(pairs.items(), key=lambda item: item[1])
+        reasons.append(f"{pair[0]}/{pair[1]}={penetration * 1000.0:.3f}mm")
+    return reasons
 
 
 def _goalset_ik_failure_diagnostic(
@@ -1098,17 +1273,25 @@ def plan_supported_escape(
         joint_position_offsets_rad=request.joint_position_offsets_rad,
         active_finger_q_rad=initial_fingers,
     )
-    robot = copy.deepcopy(strict_robot)
     planner = None
     strict_checker = None
     started = time.monotonic()
+    strict_model_resolution_s = 0.0
+    optimizer_model_clone_s = 0.0
+    optimizer_setup_s = 0.0
+    pose_planning_s = 0.0
     try:
-        # The torso pose is independent of the active arm coordinates.
-        planner, device_cfg = _planner(robot, {}, max_goalset=1, seed=request.random_seed)
-        strict_checker = CuroboKinematicCollisionChecker(
-            robot=strict_robot,
-            device_cfg=device_cfg,
-        )
+        import torch
+        from curobo.types import DeviceCfg
+
+        # Reading the fixed torso and live grasp transforms requires FK, not a
+        # complete trajectory optimizer. Reuse the strict checker that is
+        # required for the route validation below instead of cold-starting and
+        # immediately destroying a throwaway MotionPlanner.
+        device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+        stage_started = time.monotonic()
+        strict_checker = CuroboKinematicCollisionChecker(robot=strict_robot, device_cfg=device_cfg)
+        strict_model_resolution_s = time.monotonic() - stage_started
         names = arm_joint_names(arm)
         reference = np.asarray(reference_tuple)
         start_collision_samples = _self_collision_pair_penetrations(
@@ -1119,11 +1302,19 @@ def plan_supported_escape(
         )
         _validate_strict_supported_escape_self_collision(start_collision_samples)
         state = _joint_state(device_cfg, reference, names)
-        base_T_torso = _base_T_torso(planner, state)
-        base_T_grasp = _base_T_grasp(planner, state, arm=arm)
-        planner.destroy()
-        planner = None
-        _use_moving_grasp_frame_only(robot, arm=arm)
+        kinematics = strict_checker.kinematics.compute_kinematics(state)
+        base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
+        base_T_grasp = (
+            kinematics.tool_poses[grasp_frame(arm)].get_matrix()[0].detach().cpu().numpy()
+        )
+        stage_started = time.monotonic()
+        motion_robot = _resolved_motion_robot(
+            checker=strict_checker,
+            source_robot=strict_robot,
+            arm=arm,
+            scope_world_to_selected_hand=False,
+        )
+        optimizer_model_clone_s = time.monotonic() - stage_started
         if isinstance(request, CharucoSupportedEscapeRequest):
             scene = {}
             plane_point, down = _table_from_charuco_board(request, base_T_torso)
@@ -1132,7 +1323,14 @@ def plan_supported_escape(
             scene = _base_scene(request, base_T_torso, include_cube=True)
             plane_point, _base_T_object, down = _table_from_resting_object(request, base_T_torso)
             plane_source = "resting AprilCube"
-        planner, device_cfg = _planner(robot, scene, max_goalset=1, seed=request.random_seed)
+        stage_started = time.monotonic()
+        planner, device_cfg = _planner(
+            motion_robot,
+            scene,
+            max_goalset=1,
+            seed=request.random_seed,
+        )
+        optimizer_setup_s = time.monotonic() - stage_started
         state = _joint_state(device_cfg, reference, names)
         target = base_T_grasp.copy()
         target[:3, 3] -= request.supported_escape_m * down
@@ -1146,9 +1344,11 @@ def plan_supported_escape(
             axis="z", non_terminal_scale=1.0, project_distance_to_goal=False
         )
         planner.update_tool_pose_criteria({grasp_frame(arm): criterion})
+        stage_started = time.monotonic()
         try:
             result = planner.plan_pose(goal, state, max_attempts=8)
         finally:
+            pose_planning_s = time.monotonic() - stage_started
             planner.update_tool_pose_criteria({grasp_frame(arm): ToolPoseCriteria()})
         if result is None or not bool(result.success.any()):
             reason = _pose_failure_reason(planner, goal, state, result)
@@ -1222,6 +1422,12 @@ def plan_supported_escape(
                 **model_source_hashes(),
                 "curobo_commit": CUROBO_COMMIT,
                 "elapsed_s": time.monotonic() - started,
+                "stage_timings_s": {
+                    "strict_model_resolution": strict_model_resolution_s,
+                    "optimizer_model_clone": optimizer_model_clone_s,
+                    "optimizer_setup": optimizer_setup_s,
+                    "pose_planning": pose_planning_s,
+                },
                 "execution_maximum_arm_velocity_rad_s": (request.maximum_arm_velocity_rad_s),
                 "policy": (
                     f"straight table-normal escape from {plane_source}; "
@@ -1831,18 +2037,37 @@ def plan_tabletop_task(
     )
     started = time.monotonic()
     planner = None
+    strict_model_resolution_s = 0.0
+    optimizer_model_clone_s = 0.0
+    open_optimizer_setup_s = 0.0
+    goalset_ik_s = 0.0
+    endpoint_precheck_s = 0.0
+    open_branch_planning_s = 0.0
+    attached_lift_planning_s = 0.0
     try:
+        import torch
+        from curobo.types import DeviceCfg
+
         query_robot, _ = build_tabletop_robot_config(
             arm=arm,
             snapshot=request.observation.snapshot,
             joint_position_offsets_rad=request.joint_position_offsets_rad,
             active_finger_q_rad=tuple(open_q),
         )
-        planner, device_cfg = _planner(query_robot, {}, max_goalset=1, seed=request.random_seed)
+        # The torso transform is an FK query. Building a full MotionPlanner for
+        # this one read added a second cold CUDA initialization to every task.
+        # This checker is also the strict full-robot validator used by every
+        # candidate branch, so no temporary model is needed.
+        device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+        stage_started = time.monotonic()
+        strict_open_checker = CuroboKinematicCollisionChecker(
+            robot=query_robot,
+            device_cfg=device_cfg,
+        )
+        strict_model_resolution_s = time.monotonic() - stage_started
         state = _joint_state(device_cfg, reference_model, arm_joint_names(arm))
-        base_T_torso = _base_T_torso(planner, state)
-        planner.destroy()
-        planner = None
+        kinematics = strict_open_checker.kinematics.compute_kinematics(state)
+        base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
 
         plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
         grasp_matrices = [base_T_object @ _candidate_transform(item) for item in candidates]
@@ -1856,7 +2081,23 @@ def plan_tabletop_task(
         lift_plan: _LiftBranchPlan | None = None
         branch_attempt_count = 0
         search_round = 0
-        strict_open_checker: CuroboKinematicCollisionChecker | None = None
+        open_robot = query_robot
+        _use_moving_grasp_frame_only(open_robot, arm=arm)
+        transit_robot = _selected_open_transit_world_robot(open_robot, arm=arm)
+        stage_started = time.monotonic()
+        resolved_transit_robot = _resolved_motion_robot(
+            checker=strict_open_checker,
+            source_robot=query_robot,
+            arm=arm,
+            scope_world_to_selected_hand=True,
+        )
+        optimizer_model_clone_s = time.monotonic() - stage_started
+        scene = _base_scene(
+            request,
+            base_T_torso,
+            include_cube=True,
+            include_open_transit_table_patch=True,
+        )
 
         while remaining_indices:
             search_round += 1
@@ -1867,33 +2108,22 @@ def plan_tabletop_task(
             pregrasp_matrices = [
                 _pregrasp_matrix(matrix, approach_distance_m) for matrix in subset_matrices
             ]
-            open_robot, _ = build_tabletop_robot_config(
-                arm=arm,
-                snapshot=request.observation.snapshot,
-                joint_position_offsets_rad=request.joint_position_offsets_rad,
-                active_finger_q_rad=tuple(open_q),
-            )
-            _use_moving_grasp_frame_only(open_robot, arm=arm)
-            transit_robot = _selected_open_transit_world_robot(open_robot, arm=arm)
-            scene = _base_scene(
-                request,
-                base_T_torso,
-                include_cube=True,
-                include_open_transit_table_patch=True,
-            )
             current_candidate_count = len(subset_candidates)
 
             def create_open_planner(
-                current_transit_robot=transit_robot,
+                current_transit_robot=resolved_transit_robot,
                 current_scene=scene,
                 candidate_count=current_candidate_count,
             ):
+                nonlocal open_optimizer_setup_s
+                setup_started = time.monotonic()
                 current_planner, current_device = _planner(
                     current_transit_robot,
                     current_scene,
                     max_goalset=candidate_count,
                     seed=request.random_seed,
                 )
+                open_optimizer_setup_s += time.monotonic() - setup_started
                 current_state = _joint_state(
                     current_device,
                     reference_model,
@@ -1902,13 +2132,10 @@ def plan_tabletop_task(
                 return current_planner, current_device, current_state
 
             planner, device_cfg, state = create_open_planner()
-            if strict_open_checker is None:
-                strict_open_checker = CuroboKinematicCollisionChecker(
-                    robot=open_robot,
-                    device_cfg=device_cfg,
-                )
             pregrasp_goals = _goalset(pregrasp_matrices, device_cfg, arm=arm)
+            stage_started = time.monotonic()
             branches = _enumerate_pregrasp_branches(planner, pregrasp_goals, state)
+            goalset_ik_s += time.monotonic() - stage_started
             if not branches:
                 diagnostic = _goalset_ik_failure_diagnostic(
                     planner=planner,
@@ -1927,6 +2154,16 @@ def plan_tabletop_task(
                     f"candidates; prior branch rejections={branch_rejections}; {diagnostic}"
                 )
             represented_local_indices = sorted({branch.goalset_local_index for branch in branches})
+            stage_started = time.monotonic()
+            endpoint_collision_reasons = _pregrasp_endpoint_self_collision_reasons(
+                branches,
+                checker=strict_open_checker,
+            )
+            endpoint_precheck_s += time.monotonic() - stage_started
+            endpoint_collision_by_seed = {
+                branch.solver_seed_index: reason
+                for branch, reason in zip(branches, endpoint_collision_reasons, strict=True)
+            }
             report(
                 f"CuRobo pregrasp IK round {search_round}: {len(branches)}/{IK_SEEDS} "
                 f"collision-valid branches across {len(represented_local_indices)} "
@@ -1939,9 +2176,17 @@ def plan_tabletop_task(
                 current_matrices=subset_matrices,
                 current_open_robot=open_robot,
                 current_strict_checker=strict_open_checker,
+                current_endpoint_collisions=endpoint_collision_by_seed,
             ) -> tuple[_OpenBranchPlan, _LiftBranchPlan]:
                 nonlocal planner, device_cfg, state, branch_attempt_count
+                nonlocal open_branch_planning_s, attached_lift_planning_s
                 branch_attempt_count += 1
+                endpoint_collision = current_endpoint_collisions[branch.solver_seed_index]
+                if endpoint_collision is not None:
+                    raise _BranchRejected(
+                        "pregrasp_endpoint_strict_self_collision",
+                        endpoint_collision,
+                    )
                 if planner is None:
                     planner, device_cfg, state = create_open_planner()
                 branch_start_state = _fresh_branch_start_state(
@@ -1951,35 +2196,43 @@ def plan_tabletop_task(
                 )
                 selected_local = branch.goalset_local_index
                 candidate = current_candidates[selected_local]
-                branch_open = _plan_open_branch(
-                    planner=planner,
-                    device_cfg=device_cfg,
-                    state=branch_start_state,
-                    reference_command_q=reference,
-                    reference_model_q=reference_model,
-                    pregrasp_model_q=branch.model_q_rad,
-                    grasp_matrix=current_matrices[selected_local],
-                    open_robot=current_open_robot,
-                    strict_checker=current_strict_checker,
-                    request=request,
-                    base_T_torso=base_T_torso,
-                    plane_point=plane_point,
-                    down=down,
-                    arm=arm,
-                )
+                branch_started = time.monotonic()
+                try:
+                    branch_open = _plan_open_branch(
+                        planner=planner,
+                        device_cfg=device_cfg,
+                        state=branch_start_state,
+                        reference_command_q=reference,
+                        reference_model_q=reference_model,
+                        pregrasp_model_q=branch.model_q_rad,
+                        grasp_matrix=current_matrices[selected_local],
+                        open_robot=current_open_robot,
+                        strict_checker=current_strict_checker,
+                        request=request,
+                        base_T_torso=base_T_torso,
+                        plane_point=plane_point,
+                        down=down,
+                        arm=arm,
+                    )
+                finally:
+                    open_branch_planning_s += time.monotonic() - branch_started
                 _cleanup(planner)
                 planner = None
-                branch_lift = _plan_attached_lift(
-                    request=request,
-                    selected=candidate,
-                    close_target_q=close_target_q,
-                    contact_command_q=branch_open.grasp.command_q_rad[-1],
-                    contact_model_q=np.asarray(branch_open.grasp.model_q_rad[-1]),
-                    base_T_torso=base_T_torso,
-                    plane_point=plane_point,
-                    down=down,
-                    arm=arm,
-                )
+                lift_started = time.monotonic()
+                try:
+                    branch_lift = _plan_attached_lift(
+                        request=request,
+                        selected=candidate,
+                        close_target_q=close_target_q,
+                        contact_command_q=branch_open.grasp.command_q_rad[-1],
+                        contact_model_q=np.asarray(branch_open.grasp.model_q_rad[-1]),
+                        base_T_torso=base_T_torso,
+                        plane_point=plane_point,
+                        down=down,
+                        arm=arm,
+                    )
+                finally:
+                    attached_lift_planning_s += time.monotonic() - lift_started
                 return branch_open, branch_lift
 
             branch, complete, failures = _try_branch_pool(
@@ -2095,11 +2348,21 @@ def plan_tabletop_task(
                 "presentation_id": request.presentation_id,
                 "fixture": (None if request.fixture is None else request.fixture.to_dict()),
                 "elapsed_s": time.monotonic() - started,
+                "stage_timings_s": {
+                    "strict_model_resolution": strict_model_resolution_s,
+                    "optimizer_model_clone": optimizer_model_clone_s,
+                    "open_optimizer_setup": open_optimizer_setup_s,
+                    "goalset_ik": goalset_ik_s,
+                    "strict_pregrasp_endpoint_check": endpoint_precheck_s,
+                    "open_branch_planning_and_validation": open_branch_planning_s,
+                    "attached_lift_planning_and_validation": attached_lift_planning_s,
+                },
                 "grasp_shortlist_sha256": request.grasp_shortlist_sha256,
                 "candidate_count": len(candidates),
                 "execution_maximum_arm_velocity_rad_s": (request.maximum_arm_velocity_rad_s),
                 "selection_policy": (
-                    "bounded_curobo_pregrasp_ik_branch_search_with_complete_lifecycle_validation"
+                    "bounded_curobo_pregrasp_ik_branch_search_with_strict_endpoint_and_"
+                    "complete_lifecycle_validation"
                 ),
                 "pregrasp_ik_search_rounds": selected_round,
                 "pregrasp_ik_branches_tested": branch_attempt_count,
@@ -2123,9 +2386,10 @@ def plan_tabletop_task(
                     "optional presenter fixed from the observed aligned cube pose"
                 ),
                 "open_transit_world_scope": (
-                    f"{arm} wrist/hand only during patch steering; CuRobo per-link "
-                    "world buffers preserve full self-collision padding; generated "
-                    "route revalidated against strict full-robot self/cube geometry"
+                    f"{arm} wrist/hand only during patch steering; this optimizer "
+                    "sphere set is deliberately permissive; every IK endpoint and "
+                    "generated route is independently revalidated against strict "
+                    "full-robot self/cube geometry"
                 ),
                 "table_plane_policy": f"local_{arm}_wrist_hand_payload_only",
                 "open_transit_table_patch_dimensions_m": list(

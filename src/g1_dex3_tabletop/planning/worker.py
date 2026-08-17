@@ -20,6 +20,7 @@ from g1_dex3_tabletop.planning.tabletop_mpc import benchmark_from_paths
 from g1_dex3_tabletop.planning.tabletop_planner import (
     plan_supported_escape,
     plan_tabletop_task,
+    prewarm_tabletop_model_resolution,
     validate_retention_route,
 )
 from g1_dex3_tabletop.planning.tabletop_session import TabletopPlanningSession
@@ -82,17 +83,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark = subparsers.add_parser(
         "benchmark-tabletop-mpc",
-        help="offline exact-model MPC benchmark of a retained clearance-to-pregrasp route",
+        help="offline phase-aware MPC replay of a complete retained tabletop lifecycle",
     )
-    benchmark.add_argument("--request", type=Path, required=True)
+    benchmark.add_argument("--loaded-request", type=Path, required=True)
+    benchmark.add_argument("--clearance-request", type=Path, required=True)
     benchmark.add_argument("--plan", type=Path, required=True)
     benchmark.add_argument("--output", type=Path, required=True)
     benchmark.add_argument("--maximum-steps", type=int, default=300)
     waist = subparsers.add_parser(
         "analyze-waist-yaw",
-        help=(
-            "compare locked-waist and bounded waist-yaw pregrasp IK on a retained request"
-        ),
+        help=("compare locked-waist and bounded waist-yaw pregrasp IK on a retained request"),
     )
     waist.add_argument("--request", type=Path, required=True)
     waist.add_argument("--output", type=Path, required=True)
@@ -122,14 +122,17 @@ def _serve_tabletop() -> int:
     import torch
 
     cuda_available = bool(torch.cuda.is_available())
+    model_prewarm_s = None
     if cuda_available:
         torch.cuda.init()
+        model_prewarm_s = prewarm_tabletop_model_resolution()
     session = TabletopPlanningSession()
     _emit(
         {
             "type": "ready",
             "cuda_available": cuda_available,
             "device": torch.cuda.get_device_name(0) if cuda_available else None,
+            "model_prewarm_s": model_prewarm_s,
         }
     )
     try:
@@ -146,8 +149,13 @@ def _serve_tabletop() -> int:
                 def progress(text: str, *, event_id: int = request_id) -> None:
                     _emit({"type": "progress", "id": event_id, "message": text})
 
-                if command == "prepare-open-approach-mpc":
-                    payload = session.prepare_open_approach_mpc()
+                if command == "prepare-mpc-phase":
+                    request_payload = message["payload"]
+                    measured_fingers = request_payload.get("measured_active_dex3_q_rad")
+                    payload = session.prepare_mpc_phase(
+                        str(request_payload["phase"]),
+                        measured_active_dex3_q_rad=measured_fingers,
+                    )
                     event = {
                         "type": "result",
                         "id": request_id,
@@ -155,8 +163,8 @@ def _serve_tabletop() -> int:
                         "operation": command,
                         "payload": payload,
                     }
-                elif command == "step-open-approach-mpc":
-                    window = session.step_open_approach_mpc(message["payload"])
+                elif command == "step-mpc-phase":
+                    window = session.step_mpc_phase(message["payload"])
                     event = {
                         "type": "result",
                         "id": request_id,
@@ -168,9 +176,7 @@ def _serve_tabletop() -> int:
                     request_path = Path(message["request"])
                     output_path = Path(message["output"])
                     if output_path.exists():
-                        raise FileExistsError(
-                            f"planner output already exists: {output_path}"
-                        )
+                        raise FileExistsError(f"planner output already exists: {output_path}")
                     if command == "plan-tabletop-lifecycle":
                         request = TabletopTaskRequest.from_json(request_path)
                         result = session.plan_lifecycle(request, progress=progress)
@@ -181,9 +187,7 @@ def _serve_tabletop() -> int:
                         request = RetentionRouteValidationRequest.from_json(request_path)
                         result = session.validate_retention_route(request, progress=progress)
                     else:
-                        raise ValueError(
-                            f"unsupported persistent planner command: {command}"
-                        )
+                        raise ValueError(f"unsupported persistent planner command: {command}")
                     result.write_json(output_path)
                     event = {
                         "type": "result",
@@ -225,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.output.exists():
                 raise FileExistsError(f"planner output already exists: {args.output}")
             result = benchmark_from_paths(
-                args.request,
+                args.loaded_request,
+                args.clearance_request,
                 args.plan,
                 args.output,
                 maximum_steps=args.maximum_steps,

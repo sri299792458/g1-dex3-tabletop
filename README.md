@@ -186,6 +186,13 @@ cd /home/kanth042/g1-dex3-tabletop
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
+The default replays the complete frozen CuRobo trajectory lifecycle. To use
+the phase-aware rolling CuRobo controller for every normal arm motion, add
+`--motion-controller mpc`. Finger contact/retention transitions and rejection
+recovery remain with the existing state machine. The physical phase mapping,
+window checks, retained offline replay, and current limitations are documented
+in [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
+
 The direct-table behavior above remains the default. For the separate 50 mm
 tripod presenter, tape its base to the table and place the cube centred and
 yaw-aligned on the three pads, then add exactly one argument:

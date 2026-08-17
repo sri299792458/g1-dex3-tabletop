@@ -25,6 +25,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _local_plane_clearance,
     _local_table_plane_links,
     _planned_trajectory,
+    _pregrasp_endpoint_self_collision_reasons,
     _PregraspBranch,
     _selected_open_transit_world_robot,
     _split_lift_trajectory,
@@ -395,6 +396,29 @@ def test_complete_branch_search_does_not_discard_candidate_after_first_failure()
         }
     ]
     assert any(message.startswith("rejected candidate_0 IK branch 1/2") for message in reports)
+
+
+def test_pregrasp_endpoint_collisions_are_batched_and_named() -> None:
+    branches = [
+        _PregraspBranch(0, 2, np.asarray([0.1] * 7), 0.001, 0.01),
+        _PregraspBranch(1, 7, np.asarray([0.2] * 7), 0.001, 0.01),
+    ]
+
+    class Checker:
+        @staticmethod
+        def self_collision_pair_penetrations(samples):
+            np.testing.assert_allclose(samples, [[0.1] * 7, [0.2] * 7])
+            return [
+                {("left_elbow_link", "torso_link"): 0.004612},
+                {},
+            ]
+
+    reasons = _pregrasp_endpoint_self_collision_reasons(
+        branches,
+        checker=Checker(),
+    )
+
+    assert reasons == ["left_elbow_link/torso_link=4.612mm", None]
 
 
 def test_rejected_branch_cannot_mutate_the_next_branch_start(monkeypatch) -> None:

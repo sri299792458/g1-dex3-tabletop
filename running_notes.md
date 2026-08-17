@@ -3256,3 +3256,165 @@ the full two-color plate and check the marker with the detector.
 - Verification after the study: planner-environment focused tests `10 passed`;
   control-environment repository tests `317 passed, 6 skipped`; Ruff and Git
   whitespace checks pass.
+
+## 2026-08-16 — Complete phase-aware CuRobo MPC lifecycle
+
+- The initial MPC checkpoint replaced only `clearance -> move_to_pregrasp`.
+  That was not a complete tabletop controller because the cube changes from a
+  world obstacle, to intended finger contact, to an attached payload, and back
+  to a world obstacle after release.
+- The persistent worker distinguishes supported, open-free, open-contact, and
+  attached-payload modes across all ten normal lifecycle routes. It retains
+  one warmed controller per physical mode: the reverse open-contact,
+  open-free, and supported legs reuse the exact models built outbound instead
+  of destroying and reconstructing them. The attached model is still created
+  only after the measured physical finger stall is known, and its four
+  connected payload motions share that one instance.
+- No finger or task logic moved into MPC. The existing descriptor-defined open
+  and close commands, measured contact stall, retained-route validation,
+  post-lift retention evidence, release, initial-finger restoration, and
+  seated takeover remain unchanged. Task-rejection recovery deliberately uses
+  the frozen reverse trajectories.
+- Attached phases build the same deterministic conservative 3 x 3 x 3 cube
+  sphere cover used by the frozen planner, expressed in the selected grasp
+  frame. The actual first-contact Dex3 posture is locked into the runtime MPC
+  model; it is not replaced by a simulated candidate posture.
+- Every returned window is independently rechecked before the controller can
+  accept it: strict full-robot self collision; the existing non-contact-link
+  cube activation-distance policy; selected wrist/hand table plane; payload
+  plane relative to the existing start allowance; and optional exact fixture
+  mesh. Contact-link exceptions exactly follow the frozen grasp approach.
+- The first implementation repeated FK three times per window. Complete
+  latency was about 72--75 ms on average with rare 102--108 ms windows, too
+  close to the unchanged 100 ms state-age contract. The checker now computes
+  FK once and reuses those spheres for all checks; cuboid distances were
+  vectorized without changing the collision threshold or geometry.
+- Exact command-free replay used retained run `tabletop_20260815T224443Z`.
+  After physical-mode caching and removal of duplicate FK-only model builds,
+  all ten phases completed with 239 accepted windows, zero rejected windows,
+  and a maximum endpoint error of `0.004800 rad`. Complete computation fell
+  from the original `56.81 s` to `36.80 s`. Rolling solves consumed `11.73 s`
+  and overlap physical motion; the four cold models required `22.84 s` of
+  construction and CUDA setup. The largest individual window took `87.2 ms`.
+  All three reverse modes were cache hits, and the four-model set fit on the
+  24 GB GPU.
+- Initial lifecycle planning also used full MotionPlanner instances for two FK
+  reads before immediately destroying them. Those reads now use the strict
+  kinematics/collision checkers already required by route validation. A cold
+  like-for-like replay retained the same grasp candidate and reduced planning
+  from `28.88 s` to `25.04 s`; IK, trajectory optimization, collision policy,
+  and returned paths are unchanged.
+- `run-tabletop --motion-controller mpc` selects this full normal-motion path.
+  Default trajectory execution remains available. MPC runs store one
+  `mpc_lifecycle.json` with preparation and every validated window grouped by
+  phase. The artifact is flushed after robot ownership is resolved even for a
+  failed run, so live control performs no file writes and the rejected window
+  is still retained.
+- This is nominal route-tracking MPC, not yet visual/table-state correction.
+  The experimental camera anchoring path and hardware waist-yaw command remain
+  disabled. No robot command was sent while implementing or benchmarking this
+  change.
+- Final offline verification: control environment `325 passed, 6 skipped`;
+  planner-environment focused suite `44 passed`; all changed Python files pass
+  Ruff lint/format checks and `git diff --check` passes. The user-owned dirty
+  `third_party/aprilcube` submodule was not modified.
+
+## 2026-08-17 — One warmed CuRobo solver for the complete lifecycle
+
+- Profiling showed the dominant avoidable MPC cost was not Dex3 collision
+  checking or per-window validation. It was constructing and CUDA-warming four
+  solver instances for supported, open-free, open-contact, and attached modes:
+  `22.84 s` before the first complete lifecycle was ready.
+- The worker now constructs one fixed-shape solver. It preallocates the union
+  scene and reserved payload spheres, then switches physical phases by copying
+  resolved kinematic/collision tensor values in place and toggling existing
+  obstacles. CUDA graph addresses, active seven-joint shape, and collision
+  cache capacity remain fixed.
+- Initial and open Dex3 postures are resolved before setup. The actual
+  contact-stalled posture is necessarily unknown until grasp closure; its
+  folded fixed transforms are resolved once (`1.82 s` in the retained replay)
+  and reused through all attached-payload phases.
+- One action seed is retained per physical mode. This matters on the reverse
+  path: the first implementation discarded the prior open-contact seed and a
+  different optimized retreat put a thumb proxy `0.291 mm` below the strict
+  table plane. The strict checker rejected it. Restoring the prior mode seed
+  recovered a valid return without restoring multiple solver/CUDA instances.
+- An independent GPU-tensor audit rebuilt the former mode-specific models and
+  compared each against the switched solver. Fixed transforms, joint maps,
+  locked joints, collision-pair tensors, self-collision padding, and attached
+  payload matched exactly. Open-hand collision-sphere radii matched within
+  `3.73e-9 m` float32 roundoff. This audit also corrected misleading prose:
+  CuRobo uses one optimizer sphere set for world and self collision; the
+  independent strict full-robot post-check is what enforces complete geometry
+  before a window can enter the controller.
+- Command-free replay of retained run `tabletop_20260815T224443Z` completed all
+  ten phases with `237` accepted windows, zero rejected windows, maximum
+  endpoint error `0.004950 rad`, and maximum velocity below `0.1 rad/s`.
+  Final preparation fell from `22.84 s` to `14.19 s` (`37.9%`); complete
+  benchmark wall time fell from `36.80 s` to `27.75 s` (`24.6%`). Rolling solve
+  work was essentially unchanged at `11.55 s`.
+- An intermediate single-solver build produced cold first windows as high as
+  `94.6 ms`, leaving too little transport margin under the unchanged `100 ms`
+  source-state age gate. Cold solves now run during phase preparation while the
+  existing controller holds the robot and before any live state timestamp is
+  sampled. The final lifecycle's largest live window was `64.1 ms`; no timeout
+  or collision threshold was relaxed.
+- No robot command was sent. The benchmark and tensor audit are offline uses of
+  retained request and execution-plan artifacts.
+- Final verification: control environment `326 passed, 6 skipped`; planner
+  environment `325 passed, 1 skipped`; changed Python files pass Ruff lint and
+  format checks; `git diff --check` passes. The user-owned dirty
+  `third_party/aprilcube` submodule remains untouched.
+
+## 2026-08-17 — Initial lifecycle planning profile and resolved-model reuse
+
+- A cold, command-free profile used retained run
+  `tabletop_20260815T224443Z`. The prior artifact spent `9.419 s` planning the
+  supported escape and `13.507 s` planning the task: `22.926 s` before the
+  measured-contact checker. The assumption that all of this was irreducible
+  live planning was incorrect.
+- Resolving NVIDIA's complete G1/Dex3 kinematic tree and 766 collision spheres
+  took roughly `1.8 s` per warm CUDA model (and longer for the process's first
+  CUDA model). Constructing a MotionPlanner around an already-resolved
+  `RobotCfg` took only about `0.04--0.06 s`. The strict checker and optimizer
+  were parsing identical kinematic trees independently.
+- The strict model is now resolved once per physical finger posture. The
+  optimizer receives an independent clone of its tensors, with its one moving
+  grasp frame and exact open-transit sphere policy applied in place. Collision
+  pairs, padding, tool maps, joint influence maps, and all 766 sphere values
+  were compared with a separately parsed former optimizer model and matched
+  exactly. The strict and optimizer tensors have distinct storage, so temporary
+  contact-link changes cannot weaken the strict checker.
+- The retained IK pool's first two branches ended in strict torso collisions:
+  `11.834 mm` at the left wrist and `39.312 mm` at the left elbow. Previously
+  CuRobo spent several seconds planning each permissive route before the strict
+  post-check rejected it. All IK endpoints are now strict-checked in one
+  batched FK call (`~1.1 ms`). An invalid terminal configuration is rejected
+  before trajectory optimization; valid branches remain in their original
+  order and still receive every existing route check.
+- The same grasp candidate and rejection ordering were retained. The resolved
+  model clone alone reproduced every old trajectory sample exactly. With the
+  endpoint check enabled, CuRobo generates a different but fully validated
+  redundant-arm path to the same selected grasp because the two doomed solver
+  calls no longer advance its optimizer state.
+- Final cold replays varied with first-CUDA initialization but consistently
+  reduced the task stage to about `9.0 s`; one complete profiled lifecycle was
+  `19.96 s` including the `1.80 s` measured-contact checker, versus about
+  `24.78 s` for the retained baseline plus that checker. No tolerance,
+  collision policy, candidate pool, or planning attempt limit was relaxed.
+- The process's first model resolution included about `3.7 s` of one-time
+  CuRobo/CUDA initialization. The persistent worker now performs one
+  command-free generic G1/Dex3 model warmup before it reports `ready`, while no
+  command publisher exists and before the operator presses Space. A retained
+  replay then resolved the actual live-posture model in `1.75 s` instead of
+  `5.40 s`; post-approval lifecycle plus contact-checker time was `16.37 s`.
+  The live model is still freshly resolved from the measured joints and Dex3
+  state—the dummy warmup supplies no kinematic result to planning.
+- The new plan artifacts include compact per-stage timings. After these fixes,
+  the genuine remaining work is approximately `8.1 s` of pose/c-space planning
+  plus goal-set IK and approximately `7.3 s` of live-posture model resolution
+  in the profiled initial stages. The largest individual solves are the
+  supported escape and attached-payload lift; Python collision validation is
+  only milliseconds and is not worth further optimization.
+- No robot command was sent. Retained-run planning and all tensor comparisons
+  were performed offline.

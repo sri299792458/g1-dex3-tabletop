@@ -420,6 +420,44 @@ def test_executor_rejects_infeasible_mpc_window_before_motion() -> None:
     assert executor.state is ExecutorState.READY
 
 
+def test_executor_never_replaces_active_stream_with_infeasible_mpc_window() -> None:
+    clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    executor.start_streaming_trajectory(
+        from_pose_id=HANDOFF_POSE_ID,
+        to_pose_id="pose_001",
+        window=mpc_window(
+            clock,
+            generation=0,
+            start_q=np.zeros(7),
+            end_q=np.full(7, 0.01),
+            terminal=False,
+        ),
+        plan_sha256=REPORT_HASH,
+        operator_confirmed=True,
+    )
+    for _ in range(5):
+        transport.step(0.02)
+        executor.tick()
+    generation_before = executor.streaming_trajectory_status()["generation"]
+
+    with pytest.raises(ValueError, match="infeasible"):
+        executor.update_streaming_trajectory(
+            window=mpc_window(
+                clock,
+                generation=1,
+                start_q=np.zeros(7),
+                end_q=np.full(7, 0.02),
+                terminal=False,
+                feasible=False,
+            )
+        )
+
+    assert executor.state is ExecutorState.MOVING
+    assert executor.streaming_trajectory_status()["generation"] == generation_before
+
+
 def test_loaded_handoff_can_atomically_install_a_new_validated_plan() -> None:
     clock, transport, executor = subject()
 
