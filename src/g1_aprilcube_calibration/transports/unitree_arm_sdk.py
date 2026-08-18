@@ -233,6 +233,7 @@ class UnitreeTorsoIMUObserver:
         lowstate_observer: UnitreeLowStateObserver | None = None,
         bindings: UnitreeSDKBindings | None = None,
         clock: MonotonicClock | None = None,
+        on_sample: Callable[[IMUOrientationSample], None] | None = None,
     ) -> None:
         if lowstate_observer is not None:
             if lowstate_observer.config != config:
@@ -247,6 +248,7 @@ class UnitreeTorsoIMUObserver:
             raise RuntimeError("Unitree SDK bindings do not provide HG IMUState")
         self.config = config
         self.clock = clock or SystemClock()
+        self._on_sample = on_sample
         self._lock = threading.Lock()
         self._latest: IMUOrientationSample | None = None
         self._last_error: str | None = None
@@ -271,6 +273,8 @@ class UnitreeTorsoIMUObserver:
                 return
             self._latest = sample
             self._last_error = None
+        if self._on_sample is not None:
+            self._on_sample(sample)
 
     def observe(self) -> IMUOrientationSample:
         with self._lock:

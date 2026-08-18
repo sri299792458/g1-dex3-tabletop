@@ -4,22 +4,30 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 
 import numpy as np
 
+from g1_aprilcube_calibration.joint_map import arm_indices
 from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
 from g1_dex3_tabletop.planning.tabletop_mpc import TabletopPhaseMPC, mpc_phase_spec
 from g1_dex3_tabletop.planning.tabletop_planner import (
     RetentionRouteValidator,
+    ReusableOpenPlanner,
     plan_supported_escape,
+    plan_tabletop_pregrasp,
     plan_tabletop_task,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
+    PregraspRemainingPlan,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
     TabletopExecutionPlan,
+    TabletopPregraspPlan,
+    TabletopTaskPlan,
     TabletopTaskRequest,
+    build_pregrasp_remaining_plan,
     combine_tabletop_plans,
 )
 from g1_dex3_tabletop.tabletop_workflow import (
@@ -36,10 +44,13 @@ class TabletopPlanningSession:
         self._loaded_request: TabletopTaskRequest | None = None
         self._clearance_request: TabletopTaskRequest | None = None
         self._supported_escape: SupportedEscapePlan | None = None
+        self._pregrasp_plan: TabletopPregraspPlan | None = None
         self._execution: TabletopExecutionPlan | None = None
+        self._active_task: TabletopTaskPlan | None = None
         self._retention_validator: RetentionRouteValidator | None = None
         self._phase_mpc: TabletopPhaseMPC | None = None
         self._active_phase_mpc: TabletopPhaseMPC | None = None
+        self._open_planner = ReusableOpenPlanner()
 
     def plan_lifecycle(
         self,
@@ -59,7 +70,9 @@ class TabletopPlanningSession:
         self._loaded_request = request
         self._clearance_request = clearance_request
         self._supported_escape = escape
+        self._pregrasp_plan = None
         self._execution = execution
+        self._active_task = task
         report("building reusable measured-contact collision checker")
         self._retention_validator = RetentionRouteValidator(clearance_request, task)
         report(
@@ -86,9 +99,51 @@ class TabletopPlanningSession:
         self._loaded_request = request
         self._clearance_request = request_at_clearance(request, escape)
         self._supported_escape = escape
+        self._pregrasp_plan = None
         self._execution = None
+        self._active_task = None
         self._retention_validator = None
         return escape
+
+    def plan_pregrasp_at_clearance(
+        self,
+        request: TabletopTaskRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> TabletopPregraspPlan:
+        """Plan only a reversible route from the observed clearance boundary."""
+
+        if self._loaded_request is None or self._supported_escape is None:
+            raise RuntimeError(
+                "clearance pregrasp planning requires a supported escape in this worker"
+            )
+        expected = request_at_clearance_observation(
+            self._loaded_request,
+            self._supported_escape,
+            request.observation,
+        )
+        if request.content_sha256 != expected.content_sha256:
+            raise ValueError(
+                "clearance pregrasp request changed more than the boundary observation "
+                "and exact supported-escape endpoint"
+            )
+        report = progress or (lambda _message: None)
+        pregrasp = plan_tabletop_pregrasp(
+            request,
+            open_planner_cache=self._open_planner,
+            progress=report,
+        )
+        controller = self._phase_mpc
+        if controller is not None:
+            controller.close()
+        self._phase_mpc = None
+        self._active_phase_mpc = None
+        self._clearance_request = request
+        self._pregrasp_plan = pregrasp
+        self._execution = None
+        self._active_task = None
+        self._retention_validator = None
+        return pregrasp
 
     def validate_retention_route(
         self,
@@ -100,13 +155,13 @@ class TabletopPlanningSession:
 
         if (
             self._clearance_request is None
-            or self._execution is None
+            or self._active_task is None
             or self._retention_validator is None
         ):
             raise RuntimeError("retention validation requires a lifecycle planned in this worker")
         if request.tabletop_request.content_sha256 != self._clearance_request.content_sha256:
             raise ValueError("retention request differs from the worker's clearance request")
-        if request.task_plan.content_sha256 != self._execution.task.content_sha256:
+        if request.task_plan.content_sha256 != self._active_task.content_sha256:
             raise ValueError("retention request differs from the worker's frozen task plan")
         return self._retention_validator.validate(request, progress=progress)
 
@@ -133,6 +188,7 @@ class TabletopPlanningSession:
                 "supported-escape endpoint"
             )
         report = progress or (lambda _message: None)
+        self._open_planner.close()
         task = plan_tabletop_task(request, progress=report)
         execution = combine_tabletop_plans(
             loaded_request=self._loaded_request,
@@ -148,13 +204,74 @@ class TabletopPlanningSession:
         self._phase_mpc = None
         self._active_phase_mpc = None
         self._clearance_request = request
+        self._pregrasp_plan = None
         self._execution = execution
+        self._active_task = task
         self._retention_validator = retention_validator
         report(
             "boundary-corrected lifecycle ready; measured-contact checker build="
             f"{retention_validator.cache_build_s:.3f}s"
         )
         return execution
+
+    def replan_at_pregrasp(
+        self,
+        request: TabletopTaskRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> PregraspRemainingPlan:
+        """Correct the frozen task once at the reached stationary pregrasp."""
+
+        if self._clearance_request is None or self._pregrasp_plan is None:
+            raise RuntimeError("pregrasp replan requires a pregrasp route in this worker")
+        if request.estimated_planning_state is None:
+            raise ValueError("pregrasp replan requires an estimated camera planning state")
+        original = replace(request, estimated_planning_state=None)
+        if original.content_sha256 != self._clearance_request.content_sha256:
+            raise ValueError("pregrasp replan changed more than the estimated boundary state")
+        expected_command = np.asarray(
+            self._pregrasp_plan.outbound.command_q_rad[-1], dtype=np.float64
+        )
+        measured_command = np.asarray(request.planning_snapshot.measured_q29_rad)[
+            np.asarray(arm_indices(request.arm))
+        ]
+        command_error = float(np.max(np.abs(expected_command - measured_command)))
+        if command_error > 1.0e-8:
+            raise ValueError(
+                "pregrasp estimated request does not preserve the exact active command; "
+                f"error={command_error:.9f}rad"
+            )
+        report = progress or (lambda _message: None)
+        selected_candidate_id = self._pregrasp_plan.selected_candidate_id
+        try:
+            task = plan_tabletop_task(
+                request,
+                required_candidate_id=selected_candidate_id,
+                open_planner_cache=self._open_planner,
+                progress=report,
+            )
+        finally:
+            self._open_planner.close()
+        remaining = build_pregrasp_remaining_plan(
+            prior_pregrasp_plan=self._pregrasp_plan,
+            estimated_request=request,
+            task=task,
+        )
+        report("rebuilding measured-contact checker for the pregrasp-corrected task")
+        validator = RetentionRouteValidator(request, task)
+        controller = self._phase_mpc
+        if controller is not None:
+            controller.close()
+        self._phase_mpc = None
+        self._active_phase_mpc = None
+        self._clearance_request = request
+        self._active_task = task
+        self._retention_validator = validator
+        report(
+            "pregrasp-corrected remaining lifecycle ready; measured-contact checker build="
+            f"{validator.cache_build_s:.3f}s"
+        )
+        return remaining
 
     def prepare_mpc_phase(
         self,
@@ -170,6 +287,10 @@ class TabletopPlanningSession:
             or self._execution is None
         ):
             raise RuntimeError("MPC preparation requires a lifecycle planned in this worker")
+        if self._active_task is not None and (
+            self._active_task.content_sha256 != self._execution.task.content_sha256
+        ):
+            raise RuntimeError("MPC preparation is unavailable after the pregrasp boundary replan")
         spec = mpc_phase_spec(phase)
         measured = (
             None
@@ -255,6 +376,7 @@ class TabletopPlanningSession:
         )
 
     def close(self) -> None:
+        self._open_planner.close()
         controller = self._phase_mpc
         self._phase_mpc = None
         self._active_phase_mpc = None

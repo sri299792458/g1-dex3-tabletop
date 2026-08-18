@@ -21,10 +21,13 @@ from g1_aprilcube_calibration.transforms import invert_transform
 from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.state_estimation import (
     ESTIMATOR_NAMES,
+    WAIST_JOINT_INDICES,
     AnchoredCameraPoseEstimators,
+    AnchoredCameraStateEstimator,
     CameraPoseAnchor,
     ProprioceptiveSample,
     pose_error,
+    rotation_from_wxyz,
 )
 from g1_dex3_tabletop.state_estimation_replay import (
     DEFAULT_BUNDLE,
@@ -53,7 +56,7 @@ class ContinuousBoardObservation:
 @dataclass(frozen=True, slots=True)
 class StateSeries:
     lowstate_time_ns: np.ndarray
-    q29_rad: np.ndarray
+    waist_q_rad: np.ndarray
     pelvis_quaternion_wxyz: np.ndarray
     torso_time_ns: np.ndarray
     torso_quaternion_wxyz: np.ndarray
@@ -74,7 +77,7 @@ class StateSeries:
     def sample(self, timestamp_ns: int) -> tuple[ProprioceptiveSample, dict[str, float]]:
         q, pelvis_quaternion, pelvis_gap_ms = _interpolate_vector_and_quaternion(
             self.lowstate_time_ns,
-            self.q29_rad,
+            self.waist_q_rad,
             self.pelvis_quaternion_wxyz,
             timestamp_ns,
         )
@@ -87,9 +90,9 @@ class StateSeries:
         return (
             ProprioceptiveSample(
                 timestamp_ns=timestamp_ns,
-                q29_rad=q,
-                navigation_R_pelvis_imu=_rotation_from_wxyz(pelvis_quaternion),
-                navigation_R_torso_imu=_rotation_from_wxyz(torso_quaternion),
+                waist_q_rad=q,
+                navigation_R_pelvis_imu=rotation_from_wxyz(pelvis_quaternion),
+                navigation_R_torso_imu=rotation_from_wxyz(torso_quaternion),
             ),
             {
                 "lowstate_nearest_gap_ms": pelvis_gap_ms,
@@ -109,13 +112,6 @@ def _normalize_wxyz(value: np.ndarray) -> np.ndarray:
     if norm < 1.0e-9:
         raise ValueError("quaternion norm is zero")
     return quaternion / norm
-
-
-def _rotation_from_wxyz(value: np.ndarray) -> np.ndarray:
-    from scipy.spatial.transform import Rotation
-
-    quaternion = _normalize_wxyz(value)
-    return Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix()
 
 
 def _slerp_wxyz(first: np.ndarray, second: np.ndarray, alpha: float) -> np.ndarray:
@@ -207,7 +203,7 @@ def _read_state_series(bag_directory: Path) -> StateSeries:
     reader.set_filter(rosbag2_py.StorageFilter(topics=["/lowstate", "/secondary_imu", "/lowcmd"]))
     low_times: list[int] = []
     low_ticks: list[int] = []
-    q29: list[np.ndarray] = []
+    waist_q: list[np.ndarray] = []
     pelvis_quaternion: list[np.ndarray] = []
     torso_times: list[int] = []
     torso_quaternion: list[np.ndarray] = []
@@ -226,8 +222,11 @@ def _read_state_series(bag_directory: Path) -> StateSeries:
             previous_tick = tick
             low_times.append(record_time_ns)
             low_ticks.append(tick)
-            q29.append(
-                np.asarray([state.q for state in message.motor_state[:29]], dtype=np.float64)
+            waist_q.append(
+                np.asarray(
+                    [message.motor_state[index].q for index in WAIST_JOINT_INDICES],
+                    dtype=np.float64,
+                )
             )
             pelvis_quaternion.append(np.asarray(message.imu_state.quaternion, dtype=np.float64))
         elif topic == "/secondary_imu":
@@ -252,7 +251,7 @@ def _read_state_series(bag_directory: Path) -> StateSeries:
     torso_time_values = np.asarray(torso_times, dtype=np.int64)
     return StateSeries(
         lowstate_time_ns=low_time_values,
-        q29_rad=np.stack(q29),
+        waist_q_rad=np.stack(waist_q),
         pelvis_quaternion_wxyz=np.stack(pelvis_quaternion),
         torso_time_ns=torso_time_values,
         torso_quaternion_wxyz=np.stack(torso_quaternion),
@@ -452,6 +451,8 @@ def _evaluate_continuous(
         reference_T_camera=baseline_board_T_camera,
         sample=baseline_sample,
     )
+    global_observer = AnchoredCameraStateEstimator(estimators)
+    global_observer.reset(global_anchor)
     evaluated: list[dict[str, Any]] = []
     outside_state_range_count = 0
     after_evaluation_window_count = 0
@@ -467,6 +468,14 @@ def _evaluate_continuous(
             continue
         sample, gaps = state_series.sample(timestamp_ns)
         predicted = estimators.predict_all(global_anchor, sample)
+        production_prediction = global_observer.estimate(sample).reference_T_camera
+        if not np.allclose(
+            production_prediction,
+            predicted["hybrid_pelvis_position_torso_orientation"],
+            atol=1.0e-12,
+            rtol=0.0,
+        ):
+            raise RuntimeError("standalone camera observer diverged from the validated hybrid")
         evaluated.append(
             {
                 "observation": observation,
@@ -504,17 +513,15 @@ def _evaluate_continuous(
             reference_T_camera=anchor_item["observation"].board_T_camera,
             sample=anchor_item["sample"],
         )
+        observer = AnchoredCameraStateEstimator(estimators)
+        observer.reset(anchor)
         period_start_ns = anchor_item["timestamp_ns"]
         all_errors: list[dict[str, Any]] = []
         boundary_errors: list[dict[str, Any]] = []
         realized_intervals_s: list[float] = []
         current_period: list[dict[str, Any]] = []
         for item in evaluated[1:]:
-            prediction = estimators.predict(
-                anchor,
-                item["sample"],
-                "hybrid_pelvis_position_torso_orientation",
-            )
+            prediction = observer.estimate(item["sample"]).reference_T_camera
             error = pose_error(prediction, item["observation"].board_T_camera)
             all_errors.append(error)
             current_period.append(error)
@@ -526,6 +533,7 @@ def _evaluate_continuous(
                 reference_T_camera=item["observation"].board_T_camera,
                 sample=item["sample"],
             )
+            observer.reset(anchor)
             period_start_ns = item["timestamp_ns"]
             current_period = []
         if current_period:

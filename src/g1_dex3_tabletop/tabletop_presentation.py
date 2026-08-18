@@ -26,6 +26,7 @@ class TabletopPresentation:
     applicable_hand_sides: tuple[str, ...]
     grasp_shortlist_path: Path
     fixture: TabletopFixture | None
+    object_profile_ids: tuple[str, ...] | None = None
     config_path: Path | None = None
 
     def require_arm(self, arm: str) -> None:
@@ -33,6 +34,13 @@ class TabletopPresentation:
         if selected not in self.applicable_hand_sides:
             raise ValueError(
                 f"presentation {self.presentation_id!r} is not qualified for {selected}"
+            )
+
+    def require_object_profile(self, profile_id: str) -> None:
+        if self.object_profile_ids is not None and profile_id not in self.object_profile_ids:
+            raise ValueError(
+                f"presentation {self.presentation_id!r} is not qualified for object "
+                f"profile {profile_id!r}"
             )
 
 
@@ -63,6 +71,7 @@ def load_tabletop_presentation(
             applicable_hand_sides=("left", "right"),
             grasp_shortlist_path=shortlist,
             fixture=None,
+            object_profile_ids=None,
         )
     if direct_shortlist_override is not None:
         raise ValueError("--grasp-shortlist is available only with --presentation direct")
@@ -77,6 +86,9 @@ def load_tabletop_presentation(
     sides = tuple(validate_arm_side(value) for value in document["applicable_hand_sides"])
     if len(set(sides)) != len(sides):
         raise ValueError("tabletop presentation repeats an applicable hand side")
+    object_profile_ids = tuple(str(value) for value in document["object_profile_ids"])
+    if not object_profile_ids or len(set(object_profile_ids)) != len(object_profile_ids):
+        raise ValueError("tabletop presentation object-profile contract is invalid")
     shortlist = _repository_path(document["grasp_shortlist"], label="grasp shortlist")
     fixture_data = dict(document["fixture"])
     mesh = _repository_path(fixture_data["mesh_path"], label="fixture mesh")
@@ -88,5 +100,6 @@ def load_tabletop_presentation(
         applicable_hand_sides=sides,
         grasp_shortlist_path=shortlist,
         fixture=fixture,
+        object_profile_ids=object_profile_ids,
         config_path=config_path,
     )

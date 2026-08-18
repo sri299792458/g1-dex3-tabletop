@@ -165,14 +165,16 @@ def test_torso_imu_observer_reuses_factory_and_normalizes_orientation(sdk):
     )
     clock = ManualClock(2.0)
     lowstate = UnitreeLowStateObserver(config(), bindings=bindings, clock=clock)
+    received = []
     torso = UnitreeTorsoIMUObserver(
-        config(), lowstate_observer=lowstate, clock=clock
+        config(), lowstate_observer=lowstate, clock=clock, on_sample=received.append
     )
 
     assert initialized == [(4, "enp3s0")]
     Subscriber.instances[1].emit(SimpleNamespace(quaternion=[2.0, 0.0, 0.0, 0.0]))
     sample = torso.observe()
     np.testing.assert_allclose(sample.quaternion_wxyz, [1.0, 0.0, 0.0, 0.0])
+    assert received == [sample]
     assert sample.receipt_monotonic_s == 2.0
     torso.close()
     lowstate.close()

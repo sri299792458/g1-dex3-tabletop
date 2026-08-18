@@ -10,17 +10,20 @@ from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
 from g1_aprilcube_calibration.timestamp_pairing import ImageTiming
-from g1_dex3_tabletop.hardware_tabletop import _save_frames
+from g1_dex3_tabletop.hardware_tabletop import _return_to_clearance_phases, _save_frames
+from g1_dex3_tabletop.planning import tabletop_planner
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
+from g1_dex3_tabletop.planning.curobo_backend import sample_linear_joint_sweep
 from g1_dex3_tabletop.planning.tabletop_planner import (
     _anchor_trajectory_start,
     _base_scene,
+    _batched_ik_failure_diagnostic,
     _BranchRejected,
     _canonical_resting_cube_pose,
     _cuboid_cover_spheres,
     _enumerate_pregrasp_branches,
+    _FixedCloseSweepValidator,
     _fresh_branch_start_state,
-    _goalset_ik_failure_diagnostic,
     _load_shortlist,
     _local_plane_clearance,
     _local_table_plane_links,
@@ -31,9 +34,11 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _split_lift_trajectory,
     _table_from_resting_object,
     _try_branch_pool,
+    _validate_open_route_segments,
     _validate_strict_supported_escape_self_collision,
 )
 from g1_dex3_tabletop.tabletop_contracts import SupportedEscapePlan, TabletopObservation
+from g1_dex3_tabletop.tabletop_object import load_tabletop_object_profile
 from g1_dex3_tabletop.tabletop_perception import (
     camera_motion_from_fixed_cube,
     observe_resting_cube,
@@ -62,6 +67,55 @@ def _observation() -> TabletopObservation:
 
 def test_supported_escape_accepts_only_strict_collision_free_samples() -> None:
     assert _validate_strict_supported_escape_self_collision([{}, {}, {}]) is None
+
+
+def test_cube_contact_links_are_disabled_only_during_final_grasp_approach(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def validate(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return 0.030, "transit_link", 1
+        return 0.020, "grasp_link", 2
+
+    monkeypatch.setattr(tabletop_planner, "_validate_open_route", validate)
+    result = _validate_open_route_segments(
+        planner=object(),
+        device_cfg=object(),
+        transit_q=np.zeros((3, 7)),
+        grasp_q=np.zeros((4, 7)),
+        open_robot={},
+        strict_checker=object(),
+        request=object(),
+        base_T_torso=np.eye(4),
+        plane_point=np.zeros(3),
+        down=np.asarray((0.0, 0.0, -1.0)),
+        arm="left",
+    )
+
+    assert calls[0]["disabled_cube_links"] == set()
+    assert calls[1]["disabled_cube_links"] == {
+        "left_hand_thumb_2_link",
+        "left_hand_middle_1_link",
+        "left_hand_index_1_link",
+    }
+    assert result == (0.020, "grasp_link", 4)
+
+
+def test_corrected_return_executes_both_post_retreat_legs() -> None:
+    corrected = {
+        "return_to_pregrasp": object(),
+        "return_to_clearance": object(),
+    }
+    legacy = {"return_to_clearance": object()}
+
+    assert _return_to_clearance_phases(corrected) == (
+        "return_to_pregrasp",
+        "return_to_clearance",
+    )
+    assert _return_to_clearance_phases(legacy) == ("return_to_clearance",)
 
 
 def test_float32_planner_start_is_anchored_to_exact_serialized_state() -> None:
@@ -101,6 +155,176 @@ def test_planner_start_anchor_rejects_a_real_discontinuity() -> None:
             command_q_rad=np.asarray((0.01,) * 7),
             model_q_rad=np.asarray((0.01,) * 7),
         )
+
+
+def test_linear_finger_sweep_has_exact_endpoints_and_bounded_steps() -> None:
+    start = np.zeros(7)
+    target = np.asarray((0.0, -0.5984, -0.99731429, 0.8976, 0.99731429, 0.2, 0.3))
+
+    sweep = sample_linear_joint_sweep(start, target)
+
+    np.testing.assert_array_equal(sweep[0], start)
+    np.testing.assert_array_equal(sweep[-1], target)
+    assert np.max(np.abs(np.diff(sweep, axis=0))) <= 0.02
+
+
+def test_fixed_close_sweep_rejects_table_crossing_before_pregrasp(monkeypatch) -> None:
+    class FakeSphereTensor:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.zeros((3, 1, 4), dtype=np.float64)
+
+    class FakeChecker:
+        config = SimpleNamespace(kinematics_config=object())
+
+        def robot_spheres(self, values, *, joint_names):
+            assert values.shape == (3, 14)
+            assert len(joint_names) == 14
+            return FakeSphereTensor()
+
+        @staticmethod
+        def self_collision_pair_penetrations_from_spheres(_spheres):
+            return [{}, {}, {}]
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_planner._local_plane_clearance_from_spheres",
+        lambda *_args, **_kwargs: (-0.0038, "left_hand_index_1_link", 2),
+    )
+    validator = _FixedCloseSweepValidator.__new__(_FixedCloseSweepValidator)
+    validator.request = SimpleNamespace(
+        minimum_hand_plane_clearance_m=0.005,
+        fixture=object(),
+    )
+    validator.arm = "left"
+    validator.plane_point = np.zeros(3)
+    validator.down = np.asarray((0.0, 0.0, -1.0))
+    validator.finger_sweep = np.zeros((3, 7))
+    validator.active_joint_names = tuple(f"joint_{index}" for index in range(14))
+    validator.checker = FakeChecker()
+    validator.fixture_checker = None
+
+    with pytest.raises(_BranchRejected) as caught:
+        validator.validate(np.zeros(7), {})
+
+    assert caught.value.stage == "fixed_close_sweep_table_plane"
+    assert "left_hand_index_1_link" in caught.value.reason
+    assert "-0.0038m" in caught.value.reason
+    assert "required=0.0050m" in caught.value.reason
+
+
+def test_direct_fixed_close_uses_exact_qualified_hand_clearance(monkeypatch) -> None:
+    class FakeSphereTensor:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.zeros((3, 1, 4), dtype=np.float64)
+
+    class FakeChecker:
+        config = SimpleNamespace(kinematics_config=object())
+
+        def robot_spheres(self, values, *, joint_names):
+            assert values.shape == (3, 14)
+            assert len(joint_names) == 14
+            return FakeSphereTensor()
+
+        @staticmethod
+        def self_collision_pair_penetrations_from_spheres(_spheres):
+            return [{}, {}, {}]
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_planner._local_plane_clearance_from_spheres",
+        lambda *_args, **_kwargs: (0.012, "left_wrist_yaw_link", 1),
+    )
+    validator = _FixedCloseSweepValidator.__new__(_FixedCloseSweepValidator)
+    validator.request = SimpleNamespace(
+        minimum_hand_plane_clearance_m=0.005,
+        fixture=None,
+    )
+    validator.arm = "left"
+    validator.plane_point = np.zeros(3)
+    validator.down = np.asarray((0.0, 0.0, -1.0))
+    validator.finger_sweep = np.zeros((3, 7))
+    validator.active_joint_names = tuple(f"joint_{index}" for index in range(14))
+    validator.checker = FakeChecker()
+    validator.fixture_checker = None
+    candidate = {
+        "execution_evidence": {
+            "fixed_close_sweep_table_clearance_m": 0.0061,
+            "fixed_close_sweep_minimum_link": "right_hand_index_1_link",
+            "fixed_close_sweep_minimum_sample": 2,
+        }
+    }
+
+    result = validator.validate(np.zeros(7), candidate)
+
+    assert result.minimum_plane_clearance_m == pytest.approx(0.0061)
+    assert result.minimum_plane_link == "left_hand_index_1_link"
+    assert result.minimum_plane_sample == 2
+
+
+def test_fixed_close_sweep_rejects_cuda_fixture_collision(monkeypatch) -> None:
+    class FakeSphereTensor:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return np.zeros((3, 1, 4), dtype=np.float64)
+
+    kinematics_config = object()
+
+    class FakeChecker:
+        config = SimpleNamespace(kinematics_config=kinematics_config)
+
+        def robot_spheres(self, values, *, joint_names):
+            assert values.shape == (3, 14)
+            assert len(joint_names) == 14
+            return FakeSphereTensor()
+
+        @staticmethod
+        def self_collision_pair_penetrations_from_spheres(_spheres):
+            return [{}, {}, {}]
+
+    class FakeFixtureChecker:
+        def first_collision(self, spheres, *, kinematics_config):
+            assert isinstance(spheres, FakeSphereTensor)
+            assert kinematics_config is FakeChecker.config.kinematics_config
+            return 0.0044, "left_hand_middle_1_link", 2
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_planner._local_plane_clearance_from_spheres",
+        lambda *_args, **_kwargs: (0.012, "left_wrist_yaw_link", 1),
+    )
+    validator = _FixedCloseSweepValidator.__new__(_FixedCloseSweepValidator)
+    validator.request = SimpleNamespace(
+        minimum_hand_plane_clearance_m=0.005,
+        fixture=object(),
+    )
+    validator.arm = "left"
+    validator.plane_point = np.zeros(3)
+    validator.down = np.asarray((0.0, 0.0, -1.0))
+    validator.finger_sweep = np.zeros((3, 7))
+    validator.active_joint_names = tuple(f"joint_{index}" for index in range(14))
+    validator.checker = FakeChecker()
+    validator.fixture_checker = FakeFixtureChecker()
+
+    with pytest.raises(_BranchRejected) as caught:
+        validator.validate(np.zeros(7), {})
+
+    assert caught.value.stage == "fixed_close_sweep_fixture"
+    assert "left_hand_middle_1_link=4.400mm" in caught.value.reason
+    assert "sample 2/2" in caught.value.reason
 
 
 def test_supported_escape_reports_live_start_collision_in_millimetres() -> None:
@@ -178,12 +402,13 @@ def test_task_config_uses_only_a_local_open_transit_table_patch() -> None:
         calibration_bundle_path=bundle_path,
         grasp_shortlist_path=shortlist,
         task_config_path=task,
+        object_dimensions_m=(0.040, 0.040, 0.040),
     )
     assert "physical_table_dimensions_m" not in request.to_dict()
     assert "physical_table_thickness_m" not in request.to_dict()
     assert request.open_transit_table_patch_dimensions_m == (0.400, 0.400, 0.020)
     assert request.maximum_arm_velocity_rad_s == 0.100
-    assert request.retention_test_lift_m == 0.010
+    assert request.retention_test_lift_m == 0.030
     assert request.minimum_hand_plane_clearance_m == 0.005
 
 
@@ -228,36 +453,54 @@ def test_validated_lift_split_preserves_every_sample_and_exact_join() -> None:
     assert payload_lift.sample_time_s == pytest.approx((0.0, 1.0, 2.0))
 
 
-def test_committed_task_shortlist_and_detector_share_the_40mm_cube_contract() -> None:
+@pytest.mark.parametrize(
+    ("profile_id", "dimensions_m", "candidate_count", "top_marker_id"),
+    (
+        ("cube40-r3", (0.040, 0.040, 0.040), 5, 4),
+        ("cube60-r3", (0.060, 0.060, 0.060), 57, 14),
+    ),
+)
+def test_object_profile_binds_detector_mesh_dimensions_and_shortlist(
+    profile_id,
+    dimensions_m,
+    candidate_count,
+    top_marker_id,
+) -> None:
     root = Path(__file__).resolve().parents[1]
     bundle_path = root / "config/calibrations/dex3_shared_20260812_selected_free.json"
-    shortlist_path = root / "config/tabletop/cube_dex3_executable_v1/shortlist.yaml"
     task_path = root / "config/tabletop/task.yaml"
-    detector_path = root / "third_party/aprilcube/models/dex3_safe_cube/config.json"
+    profile = load_tabletop_object_profile(profile_id)
     bundle = CalibrationBundle.load(bundle_path)
     request = build_tabletop_request(
         arm="right",
         observation=_observation(),
         calibration_bundle=bundle,
         calibration_bundle_path=bundle_path,
-        grasp_shortlist_path=shortlist_path,
+        grasp_shortlist_path=profile.direct_grasp_shortlist_path,
         task_config_path=task_path,
+        object_dimensions_m=profile.dimensions_m,
     )
 
-    shortlist, candidates = _load_shortlist(request)
-    detector = json.loads(detector_path.read_text(encoding="utf-8"))
+    _shortlist, candidates = _load_shortlist(request)
+    detector = json.loads(profile.detector_config_path.read_text(encoding="utf-8"))
 
-    assert request.object_dimensions_m == (0.040, 0.040, 0.040)
-    assert shortlist["object_mesh"] == (
-        "third_party/aprilcube/models/dex3_safe_cube/mujoco/cube.obj"
+    assert request.object_dimensions_m == dimensions_m
+    assert len(candidates) == candidate_count
+    assert all(
+        item["execution_evidence"]["qualification_model"]
+        == "stationary_cube_fixed_descriptor_close"
+        for item in candidates
     )
-    assert shortlist["object_mesh_sha256"] == (
-        "27c8460e40a85475e87c3cc0d6090c3c9500de4fa7f5728a2462fc099ef3d927"
+    assert (
+        min(
+            item["execution_evidence"]["fixed_close_sweep_table_clearance_m"]
+            for item in candidates
+        )
+        >= request.minimum_hand_plane_clearance_m
     )
-    assert len(candidates) == 15
     assert detector["dict"] == "4x4_100"
-    assert detector["box_dims"] == [40.0, 40.0, 40.0]
-    assert detector["faces"]["+Z"] == [4]
+    assert detector["box_dims"] == [1000.0 * value for value in dimensions_m]
+    assert detector["faces"]["+Z"] == [top_marker_id]
 
 
 def test_cube_observation_defines_plane_and_configured_open_transit_patch() -> None:
@@ -340,31 +583,50 @@ def test_cube_observation_still_rejects_a_cube_not_resting_on_a_face() -> None:
         _canonical_resting_cube_pose(tilted)
 
 
-def test_pregrasp_enumeration_preserves_multiple_branches_for_one_candidate() -> None:
+def test_pregrasp_enumeration_gives_each_candidate_independent_seeds(monkeypatch) -> None:
     class Result:
-        success = np.asarray([[True, True, False]])
+        success = np.asarray(
+            [
+                [True, True, False],
+                [True, True, True],
+            ]
+        )
         solution = np.asarray(
-            [[[0.1] * 7, [0.2] * 7, [0.3] * 7]],
+            [
+                [[0.2] * 7, [0.1] * 7, [0.3] * 7],
+                [[0.4] * 7, [0.400000001] * 7, [0.05] * 7],
+            ],
             dtype=np.float64,
         )
-        position_error = np.asarray([[0.001, 0.002, 0.003]])
-        rotation_error = np.asarray([[0.01, 0.02, 0.03]])
-        goalset_index = np.asarray([[[1], [1], [0]]])
+        position_error = np.asarray([[0.002, 0.001, 0.003], [0.004, 0.004, 0.0005]])
+        rotation_error = np.asarray([[0.02, 0.01, 0.03], [0.04, 0.04, 0.005]])
 
     class Solver:
         def solve_pose(self, goals, *, return_seeds, current_state):
             assert goals == "goals"
             assert return_seeds > 0
-            assert current_state == "start"
+            assert current_state == "batched-start"
             return Result()
 
-    planner = SimpleNamespace(ik_solver=Solver())
-    branches = _enumerate_pregrasp_branches(planner, "goals", "start")
+    state = SimpleNamespace(position=np.zeros((1, 7)))
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_planner._repeat_joint_state",
+        lambda current, count: "batched-start" if current is state and count == 2 else None,
+    )
+    branches, result = _enumerate_pregrasp_branches(
+        Solver(),
+        "goals",
+        state,
+        candidate_count=2,
+    )
 
-    assert [branch.goalset_local_index for branch in branches] == [1, 1]
-    assert [branch.solver_seed_index for branch in branches] == [0, 1]
-    np.testing.assert_allclose(branches[0].model_q_rad, [0.1] * 7)
-    np.testing.assert_allclose(branches[1].model_q_rad, [0.2] * 7)
+    assert isinstance(result, Result)
+    assert [branch.candidate_local_index for branch in branches] == [1, 0, 0, 1]
+    assert [branch.solver_seed_index for branch in branches] == [2, 1, 0, 0]
+    np.testing.assert_allclose(branches[0].model_q_rad, [0.05] * 7)
+    np.testing.assert_allclose(branches[1].model_q_rad, [0.1] * 7)
+    np.testing.assert_allclose(branches[2].model_q_rad, [0.2] * 7)
+    np.testing.assert_allclose(branches[3].model_q_rad, [0.4] * 7)
 
 
 def test_complete_branch_search_does_not_discard_candidate_after_first_failure() -> None:
@@ -395,6 +657,8 @@ def test_complete_branch_search_does_not_discard_candidate_after_first_failure()
         {
             "candidate_id": "candidate_0",
             "pool_branch_index": 1,
+            "candidate_branch_index": 1,
+            "candidate_branch_count": 2,
             "solver_seed_index": 2,
             "stage": "attached_payload_lift",
             "reason": "first branch cannot lift",
@@ -475,31 +739,17 @@ def test_rejected_branch_cannot_mutate_the_next_branch_start(monkeypatch) -> Non
     np.testing.assert_allclose(starts[1].position, reference)
 
 
-def test_goalset_failure_diagnostic_names_candidate_and_collision_pairs(monkeypatch) -> None:
+def test_batched_ik_failure_diagnostic_names_candidate_and_collision_pairs(monkeypatch) -> None:
     class Result:
-        position_error = np.asarray([[0.0, 0.02]])
-        rotation_error = np.asarray([[0.0, 0.03]])
-        solution = np.asarray([[[0.1] * 7, [0.2] * 7]])
-        goalset_index = np.asarray([[[1], [0]]])
-        success = np.asarray([[False, False]])
-
-    class Solver:
-        config = SimpleNamespace(position_tolerance=0.005, orientation_tolerance=0.05)
-
-        def solve_pose(self, goals, *, return_seeds, current_state):
-            assert goals == "goals"
-            assert return_seeds > 0
-            assert current_state == "state"
-            return Result()
-
-    class Planner:
-        ik_solver = Solver()
-
-        def disable_link_collision(self, links):
-            assert links
-
-        def enable_link_collision(self, links):
-            assert links
+        position_error = np.asarray([[0.02, 0.02], [0.0, 0.02]])
+        rotation_error = np.asarray([[0.03, 0.03], [0.0, 0.03]])
+        solution = np.asarray(
+            [
+                [[0.3] * 7, [0.4] * 7],
+                [[0.1] * 7, [0.2] * 7],
+            ]
+        )
+        success = np.asarray([[False, False], [False, False]])
 
     monkeypatch.setattr(
         "g1_dex3_tabletop.planning.tabletop_planner._self_collision_pair_penetrations",
@@ -515,16 +765,12 @@ def test_goalset_failure_diagnostic_names_candidate_and_collision_pairs(monkeypa
         lambda **_kwargs: [{}],
     )
 
-    message = _goalset_ik_failure_diagnostic(
-        planner=Planner(),
+    message = _batched_ik_failure_diagnostic(
+        result=Result(),
         robot={},
         scene={},
-        goals="goals",
-        state="state",
         candidates=[{"candidate_id": "candidate_0"}, {"candidate_id": "candidate_1"}],
-        remaining=[0, 1],
         device_cfg=None,
-        arm="right",
         disabled_collision_links={"right_hand_thumb_2_link"},
     )
 

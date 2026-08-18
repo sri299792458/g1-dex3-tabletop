@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +12,11 @@ import yaml
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
 from g1_aprilcube_calibration.joint_map import arm_indices, validate_arm_side
+from g1_dex3_tabletop.camera_state_sync import SynchronizedCameraStateInput
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
+from g1_dex3_tabletop.state_estimation import CameraStateEstimate
 from g1_dex3_tabletop.tabletop_contracts import (
+    EstimatedCameraPlanningState,
     SupportedEscapePlan,
     TabletopExecutionPlan,
     TabletopFixture,
@@ -52,6 +56,7 @@ def build_tabletop_request(
     calibration_bundle_path: str | Path,
     grasp_shortlist_path: str | Path,
     task_config_path: str | Path,
+    object_dimensions_m: tuple[float, float, float],
     presentation_id: str = "direct",
     fixture: TabletopFixture | None = None,
 ) -> TabletopTaskRequest:
@@ -78,7 +83,7 @@ def build_tabletop_request(
         grasp_shortlist_sha256=file_sha256(shortlist),
         presentation_id=presentation_id,
         fixture=fixture,
-        object_dimensions_m=tuple(task["object"]["dimensions_m"]),
+        object_dimensions_m=tuple(object_dimensions_m),
         open_transit_table_patch_dimensions_m=tuple(
             task["table"]["open_transit_patch_dimensions_m"]
         ),
@@ -159,6 +164,36 @@ def request_at_clearance_observation(
         maximum_arm_velocity_rad_s=loaded_request.maximum_arm_velocity_rad_s,
         random_seed=loaded_request.random_seed,
     )
+
+
+def request_at_estimated_pregrasp(
+    clearance_request: TabletopTaskRequest,
+    *,
+    snapshot: RobotSnapshot,
+    estimate: CameraStateEstimate,
+    anchor_input: SynchronizedCameraStateInput,
+    current_input: SynchronizedCameraStateInput,
+) -> TabletopTaskRequest:
+    """Bind one propagated camera pose to an exact stationary pregrasp state."""
+
+    if clearance_request.estimated_planning_state is not None:
+        raise ValueError("pregrasp estimate requires the original visual clearance anchor")
+    if estimate.anchor_timestamp_ns != anchor_input.sample.timestamp_ns:
+        raise ValueError("camera estimate and visual-anchor state have different times")
+    if estimate.timestamp_ns != current_input.sample.timestamp_ns:
+        raise ValueError("camera estimate and current state have different times")
+    state = EstimatedCameraPlanningState(
+        snapshot=snapshot,
+        object_T_camera=tuple(
+            tuple(float(value) for value in row) for row in estimate.reference_T_camera
+        ),
+        anchor_observation_sha256=clearance_request.observation.content_sha256,
+        anchor_timestamp_ns=estimate.anchor_timestamp_ns,
+        timestamp_ns=estimate.timestamp_ns,
+        anchor_input_timing=anchor_input.to_dict(),
+        current_input_timing=current_input.to_dict(),
+    )
+    return replace(clearance_request, estimated_planning_state=state)
 
 
 def assemble_execution_plan(

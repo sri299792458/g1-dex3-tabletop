@@ -90,8 +90,86 @@ class TabletopObservation:
             "object_rotation_spread_deg": self.object_rotation_spread_deg,
         }
 
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict())
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> TabletopObservation:
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True)
+class EstimatedCameraPlanningState:
+    """Proprioceptively propagated camera pose at a stationary plan boundary.
+
+    The original visual observation remains unchanged.  This separate record
+    makes it impossible to mistake a propagated pose for a second camera
+    detection, and binds the estimate to the exact visual anchor and measured
+    robot state used to construct it.
+    """
+
+    snapshot: RobotSnapshot
+    object_T_camera: tuple[tuple[float, ...], ...]
+    anchor_observation_sha256: str
+    anchor_timestamp_ns: int
+    timestamp_ns: int
+    anchor_input_timing: dict[str, Any]
+    current_input_timing: dict[str, Any]
+    estimator: str = "hybrid_pelvis_position_torso_orientation"
+    assumption: str = "fixed_pelvis_imu_origin_between_visual_anchor_and_boundary"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "snapshot",
+            self.snapshot
+            if isinstance(self.snapshot, RobotSnapshot)
+            else RobotSnapshot.from_dict(self.snapshot),
+        )
+        object.__setattr__(
+            self,
+            "object_T_camera",
+            _finite_transform(self.object_T_camera, "object_T_camera"),
+        )
+        if len(self.anchor_observation_sha256) != 64:
+            raise ValueError("anchor observation SHA-256 must contain 64 characters")
+        if self.anchor_timestamp_ns < 0 or self.timestamp_ns < self.anchor_timestamp_ns:
+            raise ValueError("estimated planning-state timestamps are invalid")
+        if self.estimator != "hybrid_pelvis_position_torso_orientation":
+            raise ValueError("unsupported camera-state estimator")
+        if self.assumption != ("fixed_pelvis_imu_origin_between_visual_anchor_and_boundary"):
+            raise ValueError("unsupported camera-state translation assumption")
+        for name in ("anchor_input_timing", "current_input_timing"):
+            normalized = json.loads(
+                json.dumps(getattr(self, name), sort_keys=True, allow_nan=False)
+            )
+            if not isinstance(normalized, dict):
+                raise TypeError(f"{name} must be a JSON object")
+            object.__setattr__(self, name, normalized)
+
+    @property
+    def camera_T_object(self) -> tuple[tuple[float, ...], ...]:
+        return _finite_transform(
+            np.linalg.inv(np.asarray(self.object_T_camera, dtype=np.float64)),
+            "camera_T_object",
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "snapshot": self.snapshot.to_dict(),
+            "object_T_camera": [list(row) for row in self.object_T_camera],
+            "anchor_observation_sha256": self.anchor_observation_sha256,
+            "anchor_timestamp_ns": self.anchor_timestamp_ns,
+            "timestamp_ns": self.timestamp_ns,
+            "anchor_input_timing": self.anchor_input_timing,
+            "current_input_timing": self.current_input_timing,
+            "estimator": self.estimator,
+            "assumption": self.assumption,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> EstimatedCameraPlanningState:
         return cls(**data)
 
 
@@ -311,13 +389,14 @@ class TabletopTaskRequest:
     calibration_bundle_sha256: str
     grasp_shortlist_path: str
     grasp_shortlist_sha256: str
+    estimated_planning_state: EstimatedCameraPlanningState | None = None
     presentation_id: str = "direct"
     fixture: TabletopFixture | None = None
     object_dimensions_m: tuple[float, ...] = (0.040, 0.040, 0.040)
     open_transit_table_patch_dimensions_m: tuple[float, ...] = (0.400, 0.400, 0.020)
     minimum_hand_plane_clearance_m: float = 0.005
     supported_escape_m: float = 0.100
-    retention_test_lift_m: float = 0.010
+    retention_test_lift_m: float = 0.030
     lift_m: float = 0.100
     maximum_arm_velocity_rad_s: float = 0.100
     random_seed: int = 17
@@ -345,6 +424,15 @@ class TabletopTaskRequest:
             if isinstance(self.observation, TabletopObservation)
             else TabletopObservation.from_dict(self.observation),
         )
+        if self.estimated_planning_state is not None:
+            state = (
+                self.estimated_planning_state
+                if isinstance(self.estimated_planning_state, EstimatedCameraPlanningState)
+                else EstimatedCameraPlanningState.from_dict(self.estimated_planning_state)
+            )
+            if state.anchor_observation_sha256 != self.observation.content_sha256:
+                raise ValueError("estimated planning state belongs to a different visual anchor")
+            object.__setattr__(self, "estimated_planning_state", state)
         object.__setattr__(
             self,
             "torso_T_camera",
@@ -395,6 +483,18 @@ class TabletopTaskRequest:
     def content_sha256(self) -> str:
         return _hash(self.to_dict(include_hash=False))
 
+    @property
+    def planning_snapshot(self) -> RobotSnapshot:
+        if self.estimated_planning_state is None:
+            return self.observation.snapshot
+        return self.estimated_planning_state.snapshot
+
+    @property
+    def planning_camera_T_object(self) -> tuple[tuple[float, ...], ...]:
+        if self.estimated_planning_state is None:
+            return self.observation.camera_T_object
+        return self.estimated_planning_state.camera_T_object
+
     def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
         result = {
             "schema_version": self.schema_version,
@@ -419,6 +519,8 @@ class TabletopTaskRequest:
             "maximum_arm_velocity_rad_s": self.maximum_arm_velocity_rad_s,
             "random_seed": self.random_seed,
         }
+        if self.estimated_planning_state is not None:
+            result["estimated_planning_state"] = self.estimated_planning_state.to_dict()
         if include_hash:
             result["content_sha256"] = self.content_sha256
         return result
@@ -547,7 +649,7 @@ class TabletopTaskPlan:
 
 @dataclass(frozen=True, slots=True)
 class RetentionRouteValidationRequest:
-    """Collision-check the frozen payload route at the measured stalled hand posture."""
+    """Collision-check the frozen payload route at the measured close posture."""
 
     tabletop_request: TabletopTaskRequest
     task_plan: TabletopTaskPlan
@@ -627,7 +729,7 @@ class RetentionRouteValidationRequest:
 
 @dataclass(frozen=True, slots=True)
 class RetentionRouteValidationResult:
-    """Proof that measured stalled fingers do not invalidate the payload arm route."""
+    """Proof that measured close fingers do not invalidate the payload arm route."""
 
     request_sha256: str
     arm: str
@@ -851,10 +953,11 @@ class TabletopExecutionPlan:
         if recovery_edges != (
             ("grasp_approach", "grasp_retreat"),
             ("retention_test_lift", "payload_replace"),
+            ("move_to_pregrasp", "return_to_clearance"),
         ):
             raise ValueError("tabletop recovery trajectory endpoints are invalid")
         for recovery, normal in zip(
-            self.recovery_trajectories,
+            self.recovery_trajectories[:2],
             (self.trajectories[7], self.trajectories[6]),
             strict=True,
         ):
@@ -864,12 +967,27 @@ class TabletopExecutionPlan:
                 or recovery.model_q_rad != normal.model_q_rad
             ):
                 raise ValueError("tabletop recovery motion differs from its frozen reverse path")
+        expected_pregrasp_return = _reversed_trajectory_with_ids(
+            self.trajectories[1],
+            from_pose_id="move_to_pregrasp",
+            to_pose_id="return_to_clearance",
+        )
+        if self.recovery_trajectories[2] != expected_pregrasp_return:
+            raise ValueError("pregrasp recovery is not the exact outbound reverse")
         recovery_start_errors = (
             float(
                 np.max(
                     np.abs(
                         np.asarray(self.recovery_trajectories[0].command_q_rad[0])
                         - np.asarray(self.trajectories[2].command_q_rad[-1])
+                    )
+                )
+            ),
+            float(
+                np.max(
+                    np.abs(
+                        np.asarray(self.recovery_trajectories[2].command_q_rad[0])
+                        - np.asarray(self.trajectories[1].command_q_rad[-1])
                     )
                 )
             ),
@@ -946,6 +1064,335 @@ class TabletopExecutionPlan:
         atomic_write_json(path, self.to_dict())
 
 
+@dataclass(frozen=True, slots=True)
+class TabletopPregraspPlan:
+    """One validated clearance-to-pregrasp route and its exact reverse."""
+
+    request_sha256: str
+    arm: str
+    selected_candidate_id: str
+    object_T_grasp: tuple[tuple[float, ...], ...]
+    open_active_dex3_q_rad: tuple[float, ...]
+    outbound: PlannedTrajectory
+    inbound: PlannedTrajectory
+    planner_provenance: dict[str, Any]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    kind: str = "g1_tabletop_clearance_to_pregrasp_plan"
+
+    def __post_init__(self) -> None:
+        if len(self.request_sha256) != 64:
+            raise ValueError("request SHA-256 must contain 64 characters")
+        object.__setattr__(self, "arm", validate_arm_side(self.arm))
+        if not self.selected_candidate_id:
+            raise ValueError("pregrasp plan has no grasp candidate")
+        object.__setattr__(
+            self,
+            "object_T_grasp",
+            _finite_transform(self.object_T_grasp, "object_T_grasp"),
+        )
+        object.__setattr__(
+            self,
+            "open_active_dex3_q_rad",
+            _finite_vector(self.open_active_dex3_q_rad, 7, "open_active_dex3_q_rad"),
+        )
+        expected_open, _expected_close = dex3_execution_profile(self.arm)
+        if self.open_active_dex3_q_rad != expected_open:
+            raise ValueError("pregrasp plan open target differs from the Dex3 descriptor")
+        if not isinstance(self.outbound, PlannedTrajectory):
+            object.__setattr__(self, "outbound", PlannedTrajectory.from_dict(self.outbound))
+        if not isinstance(self.inbound, PlannedTrajectory):
+            object.__setattr__(self, "inbound", PlannedTrajectory.from_dict(self.inbound))
+        if (self.outbound.from_pose_id, self.outbound.to_pose_id) != (
+            "clearance",
+            "move_to_pregrasp",
+        ):
+            raise ValueError("pregrasp outbound route has invalid endpoints")
+        if (self.inbound.from_pose_id, self.inbound.to_pose_id) != (
+            "move_to_pregrasp",
+            "return_to_clearance",
+        ):
+            raise ValueError("pregrasp inbound route has invalid endpoints")
+        expected_inbound = _reversed_trajectory_with_ids(
+            self.outbound,
+            from_pose_id="move_to_pregrasp",
+            to_pose_id="return_to_clearance",
+        )
+        if self.inbound != expected_inbound:
+            raise ValueError("pregrasp inbound route is not the exact outbound reverse")
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "request_sha256": self.request_sha256,
+            "arm": self.arm,
+            "selected_candidate_id": self.selected_candidate_id,
+            "object_T_grasp": [list(row) for row in self.object_T_grasp],
+            "open_active_dex3_q_rad": list(self.open_active_dex3_q_rad),
+            "outbound": self.outbound.to_dict(),
+            "inbound": self.inbound.to_dict(),
+            "planner_provenance": self.planner_provenance,
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TabletopPregraspPlan:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        plan = cls(**values)
+        if expected_hash is not None and expected_hash != plan.content_sha256:
+            raise ValueError("pregrasp plan SHA-256 mismatch")
+        return plan
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> TabletopPregraspPlan:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+def _trajectory_with_ids(
+    trajectory: PlannedTrajectory,
+    *,
+    from_pose_id: str,
+    to_pose_id: str,
+) -> PlannedTrajectory:
+    return PlannedTrajectory(
+        from_pose_id=from_pose_id,
+        to_pose_id=to_pose_id,
+        sample_time_s=trajectory.sample_time_s,
+        command_q_rad=trajectory.command_q_rad,
+        model_q_rad=trajectory.model_q_rad,
+        planning_time_s=trajectory.planning_time_s,
+    )
+
+
+def _reversed_trajectory_with_ids(
+    trajectory: PlannedTrajectory,
+    *,
+    from_pose_id: str,
+    to_pose_id: str,
+) -> PlannedTrajectory:
+    duration = trajectory.sample_time_s[-1]
+    return PlannedTrajectory(
+        from_pose_id=from_pose_id,
+        to_pose_id=to_pose_id,
+        sample_time_s=tuple(duration - value for value in reversed(trajectory.sample_time_s)),
+        command_q_rad=tuple(reversed(trajectory.command_q_rad)),
+        model_q_rad=tuple(reversed(trajectory.model_q_rad)),
+        planning_time_s=0.0,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PregraspRemainingPlan:
+    """Hash-bound corrected lifecycle from the reached original pregrasp.
+
+    CuRobo replans the same selected grasp from the exact active pregrasp
+    command.  After replacing the cube, this plan returns through the newly
+    planned pregrasp and then reverses the already validated original
+    clearance-to-pregrasp route exactly.
+    """
+
+    prior_pregrasp_plan_sha256: str
+    estimated_request_sha256: str
+    task: TabletopTaskPlan
+    trajectories: tuple[PlannedTrajectory, ...]
+    recovery_trajectories: tuple[PlannedTrajectory, ...]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    kind: str = "g1_tabletop_pregrasp_corrected_remaining_plan"
+
+    def __post_init__(self) -> None:
+        for name in ("prior_pregrasp_plan_sha256", "estimated_request_sha256"):
+            if len(getattr(self, name)) != 64:
+                raise ValueError(f"{name} must contain 64 characters")
+        if not isinstance(self.task, TabletopTaskPlan):
+            object.__setattr__(self, "task", TabletopTaskPlan.from_dict(self.task))
+        if self.task.request_sha256 != self.estimated_request_sha256:
+            raise ValueError("pregrasp task belongs to a different estimated request")
+        object.__setattr__(
+            self,
+            "trajectories",
+            tuple(
+                item if isinstance(item, PlannedTrajectory) else PlannedTrajectory.from_dict(item)
+                for item in self.trajectories
+            ),
+        )
+        expected_edges = (
+            ("move_to_pregrasp", "estimated_pregrasp"),
+            ("estimated_pregrasp", "grasp_approach"),
+            ("grasp_approach", "retention_test_lift"),
+            ("retention_test_lift", "payload_lift"),
+            ("payload_lift", "payload_lower"),
+            ("payload_lower", "payload_replace"),
+            ("payload_replace", "grasp_retreat"),
+            ("grasp_retreat", "return_to_pregrasp"),
+            ("return_to_pregrasp", "return_to_clearance"),
+        )
+        if tuple((item.from_pose_id, item.to_pose_id) for item in self.trajectories) != (
+            expected_edges
+        ):
+            raise ValueError("pregrasp-corrected remaining lifecycle is disconnected")
+        object.__setattr__(
+            self,
+            "recovery_trajectories",
+            tuple(
+                item if isinstance(item, PlannedTrajectory) else PlannedTrajectory.from_dict(item)
+                for item in self.recovery_trajectories
+            ),
+        )
+        expected_recovery = (
+            ("grasp_approach", "grasp_retreat"),
+            ("retention_test_lift", "payload_replace"),
+            ("estimated_pregrasp", "move_to_pregrasp"),
+            ("move_to_pregrasp", "return_to_clearance"),
+        )
+        if (
+            tuple((item.from_pose_id, item.to_pose_id) for item in self.recovery_trajectories)
+            != expected_recovery
+        ):
+            raise ValueError("pregrasp-corrected recovery routes are invalid")
+        joins = zip(self.trajectories, self.trajectories[1:], strict=False)
+        for first, second in joins:
+            error = float(
+                np.max(
+                    np.abs(
+                        np.asarray(first.command_q_rad[-1]) - np.asarray(second.command_q_rad[0])
+                    )
+                )
+            )
+            if error > 1.0e-8:
+                raise ValueError(f"pregrasp-corrected route is discontinuous by {error:.9f}rad")
+        if self.task.selected_candidate_id == "":
+            raise ValueError("pregrasp-corrected task has no grasp candidate")
+
+    @property
+    def selected_candidate_id(self) -> str:
+        return self.task.selected_candidate_id
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "prior_pregrasp_plan_sha256": self.prior_pregrasp_plan_sha256,
+            "estimated_request_sha256": self.estimated_request_sha256,
+            "task": self.task.to_dict(),
+            "trajectories": [item.to_dict() for item in self.trajectories],
+            "recovery_trajectories": [item.to_dict() for item in self.recovery_trajectories],
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PregraspRemainingPlan:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        plan = cls(**values)
+        if expected_hash is not None and expected_hash != plan.content_sha256:
+            raise ValueError("pregrasp remaining-plan SHA-256 mismatch")
+        return plan
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> PregraspRemainingPlan:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+def build_pregrasp_remaining_plan(
+    *,
+    prior_pregrasp_plan: TabletopPregraspPlan,
+    estimated_request: TabletopTaskRequest,
+    task: TabletopTaskPlan,
+) -> PregraspRemainingPlan:
+    """Map a same-grasp replan onto the reached-boundary execution names."""
+
+    if estimated_request.estimated_planning_state is None:
+        raise ValueError("pregrasp correction requires an estimated planning state")
+    if task.request_sha256 != estimated_request.content_sha256:
+        raise ValueError("pregrasp task belongs to another estimated request")
+    if task.selected_candidate_id != prior_pregrasp_plan.selected_candidate_id:
+        raise ValueError("pregrasp correction changed the selected grasp candidate")
+    old_approach = prior_pregrasp_plan.outbound
+    current_command = np.asarray(old_approach.command_q_rad[-1])
+    new_start = np.asarray(task.trajectories[0].command_q_rad[0])
+    if float(np.max(np.abs(current_command - new_start))) > 1.0e-8:
+        raise ValueError("pregrasp correction does not start at the exact active command")
+
+    corrected = (
+        _trajectory_with_ids(
+            task.trajectories[0],
+            from_pose_id="move_to_pregrasp",
+            to_pose_id="estimated_pregrasp",
+        ),
+        _trajectory_with_ids(
+            task.trajectories[1],
+            from_pose_id="estimated_pregrasp",
+            to_pose_id="grasp_approach",
+        ),
+        *task.trajectories[2:7],
+        _trajectory_with_ids(
+            task.trajectories[7],
+            from_pose_id="grasp_retreat",
+            to_pose_id="return_to_pregrasp",
+        ),
+        _reversed_trajectory_with_ids(
+            old_approach,
+            from_pose_id="return_to_pregrasp",
+            to_pose_id="return_to_clearance",
+        ),
+    )
+    contact_retreat = _trajectory_with_ids(
+        task.trajectories[6],
+        from_pose_id="grasp_approach",
+        to_pose_id="grasp_retreat",
+    )
+    test_lift_replace = _trajectory_with_ids(
+        task.trajectories[5],
+        from_pose_id="retention_test_lift",
+        to_pose_id="payload_replace",
+    )
+    estimated_pregrasp_return = _reversed_trajectory_with_ids(
+        corrected[0],
+        from_pose_id="estimated_pregrasp",
+        to_pose_id="move_to_pregrasp",
+    )
+    boundary_return = pregrasp_to_clearance_return(prior_pregrasp_plan)
+    return PregraspRemainingPlan(
+        prior_pregrasp_plan_sha256=prior_pregrasp_plan.content_sha256,
+        estimated_request_sha256=estimated_request.content_sha256,
+        task=task,
+        trajectories=corrected,
+        recovery_trajectories=(
+            contact_retreat,
+            test_lift_replace,
+            estimated_pregrasp_return,
+            boundary_return,
+        ),
+    )
+
+
+def pregrasp_to_clearance_return(
+    pregrasp_plan: TabletopPregraspPlan,
+) -> PlannedTrajectory:
+    """Return from the original pregrasp by exactly reversing its frozen route."""
+
+    return pregrasp_plan.inbound
+
+
 def combine_tabletop_plans(
     *,
     loaded_request: TabletopTaskRequest,
@@ -982,11 +1429,16 @@ def combine_tabletop_plans(
         model_q_rad=task.trajectories[5].model_q_rad,
         planning_time_s=0.0,
     )
+    pregrasp_return = _reversed_trajectory_with_ids(
+        task.trajectories[0],
+        from_pose_id="move_to_pregrasp",
+        to_pose_id="return_to_clearance",
+    )
     return TabletopExecutionPlan(
         loaded_request_sha256=loaded_request.content_sha256,
         clearance_request_sha256=clearance_request.content_sha256,
         supported_escape=supported_escape,
         task=task,
         trajectories=(supported_escape.outbound, *task.trajectories, inbound),
-        recovery_trajectories=(contact_retreat, test_lift_replace),
+        recovery_trajectories=(contact_retreat, test_lift_replace, pregrasp_return),
     )

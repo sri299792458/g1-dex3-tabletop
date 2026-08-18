@@ -1,8 +1,10 @@
-"""Pure anchored camera-pose estimators for offline G1 research.
+"""Pure anchored camera-pose estimation for the seated G1.
 
-The estimators in this module intentionally expose their contact assumptions.
-They do not claim globally observable odometry and they have no ROS or robot-
-command dependency.
+The estimator intentionally exposes its contact and observability assumptions.
+It does not claim globally observable odometry and has no ROS, CuRobo, MPC, or
+robot-command dependency.  Its input is deliberately limited to the three
+waist joints, the pelvis and torso orientations, and a full visual anchor; it
+accepts no additional sensor streams.
 """
 
 from __future__ import annotations
@@ -14,10 +16,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
-from g1_aprilcube_calibration.joint_map import (
-    G1_29_JOINT_NAMES,
-    validate_full_joint_vector,
-)
+from g1_aprilcube_calibration.joint_map import G1_29_JOINT_NAMES
 from g1_aprilcube_calibration.transforms import invert_transform, validate_transform
 from g1_aprilcube_calibration.urdf_model import URDFModel
 
@@ -36,6 +35,16 @@ ESTIMATOR_NAMES: tuple[EstimatorName, ...] = (
     "fixed_pelvis_imu_origin_fk",
     "hybrid_pelvis_position_torso_orientation",
 )
+SELECTED_ESTIMATOR: EstimatorName = "hybrid_pelvis_position_torso_orientation"
+
+WAIST_JOINT_NAMES: tuple[str, str, str] = (
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+)
+WAIST_JOINT_INDICES: tuple[int, int, int] = tuple(
+    G1_29_JOINT_NAMES.index(name) for name in WAIST_JOINT_NAMES
+)
 
 
 def rotation_from_wxyz(value: np.ndarray) -> np.ndarray:
@@ -52,17 +61,12 @@ def rotation_from_wxyz(value: np.ndarray) -> np.ndarray:
     return Rotation.from_quat(quaternion[[1, 2, 3, 0]]).as_matrix()
 
 
-def proprioceptive_sample(state, torso_imu) -> ProprioceptiveSample:
-    """Build the tested estimator input from fresh live Unitree observations."""
-
-    if state.pelvis_imu_quaternion_wxyz is None:
-        raise ValueError("LowState has no pelvis IMU quaternion")
-    return ProprioceptiveSample(
-        timestamp_ns=int(max(state.receipt_monotonic_s, torso_imu.receipt_monotonic_s) * 1e9),
-        q29_rad=state.position,
-        navigation_R_pelvis_imu=rotation_from_wxyz(state.pelvis_imu_quaternion_wxyz),
-        navigation_R_torso_imu=rotation_from_wxyz(torso_imu.quaternion_wxyz),
-    )
+def _vector(value: np.ndarray, *, size: int, name: str) -> np.ndarray:
+    result = np.asarray(value, dtype=np.float64).reshape(-1).copy()
+    if result.shape != (size,) or not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must contain {size} finite values")
+    result.setflags(write=False)
+    return result
 
 
 def _rotation(value: np.ndarray, *, name: str) -> np.ndarray:
@@ -97,14 +101,18 @@ class ProprioceptiveSample:
     """
 
     timestamp_ns: int
-    q29_rad: np.ndarray
+    waist_q_rad: np.ndarray
     navigation_R_pelvis_imu: np.ndarray
     navigation_R_torso_imu: np.ndarray
 
     def __post_init__(self) -> None:
         if self.timestamp_ns < 0:
             raise ValueError("sample timestamp must be non-negative")
-        object.__setattr__(self, "q29_rad", validate_full_joint_vector(self.q29_rad))
+        object.__setattr__(
+            self,
+            "waist_q_rad",
+            _vector(self.waist_q_rad, size=3, name="waist joint vector"),
+        )
         object.__setattr__(
             self,
             "navigation_R_pelvis_imu",
@@ -130,6 +138,37 @@ class CameraPoseAnchor:
             "reference_T_camera",
             validate_transform(np.asarray(self.reference_T_camera, dtype=np.float64)),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class CameraStateEstimate:
+    """One propagated camera-pose estimate and its explicit provenance."""
+
+    timestamp_ns: int
+    anchor_timestamp_ns: int
+    reference_T_camera: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.timestamp_ns < self.anchor_timestamp_ns:
+            raise ValueError("estimate predates its visual anchor")
+        object.__setattr__(
+            self,
+            "reference_T_camera",
+            validate_transform(np.asarray(self.reference_T_camera, dtype=np.float64)),
+        )
+
+    @property
+    def anchor_age_s(self) -> float:
+        return (self.timestamp_ns - self.anchor_timestamp_ns) / 1.0e9
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "timestamp_ns": self.timestamp_ns,
+            "anchor_timestamp_ns": self.anchor_timestamp_ns,
+            "anchor_age_s": self.anchor_age_s,
+            "reference_T_camera": self.reference_T_camera.tolist(),
+            "estimator": SELECTED_ESTIMATOR,
+        }
 
 
 def pose_error(predicted: np.ndarray, observed: np.ndarray) -> dict[str, object]:
@@ -167,7 +206,7 @@ class AnchoredCameraPoseEstimators:
     def pelvis_T_camera(self, sample: ProprioceptiveSample) -> np.ndarray:
         positions = {
             name: float(value) + float(self.bundle.joint_position_offsets_rad.get(name, 0.0))
-            for name, value in zip(G1_29_JOINT_NAMES, sample.q29_rad, strict=True)
+            for name, value in zip(WAIST_JOINT_NAMES, sample.waist_q_rad, strict=True)
         }
         return validate_transform(
             self.model.transform("pelvis", "torso_link", positions) @ self.bundle.torso_T_camera
@@ -250,6 +289,59 @@ class AnchoredCameraPoseEstimators:
         current_p_torso = reference_p_imu - current_R_torso @ torso_p_imu
         reference_T_current_torso = _transform(current_R_torso, current_p_torso)
         return validate_transform(reference_T_current_torso @ self.bundle.torso_T_camera)
+
+
+class AnchoredCameraStateEstimator:
+    """The one retained hybrid observer, independent of any control consumer.
+
+    A full six-degree-of-freedom visual measurement establishes the reference
+    frame.  Between visual updates, position is propagated with the measured
+    pelvis orientation and three waist joints, while orientation comes from the
+    torso IMU.  The fixed-pelvis-IMU-origin assumption is intentionally not
+    hidden behind a generic odometry interface.
+    """
+
+    def __init__(self, pose_estimators: AnchoredCameraPoseEstimators) -> None:
+        self._pose_estimators = pose_estimators
+        self._anchor: CameraPoseAnchor | None = None
+
+    @property
+    def anchor(self) -> CameraPoseAnchor | None:
+        return self._anchor
+
+    def reset(self, anchor: CameraPoseAnchor) -> CameraStateEstimate:
+        """Install one synchronized full-pose visual anchor."""
+
+        self._anchor = anchor
+        return CameraStateEstimate(
+            timestamp_ns=anchor.sample.timestamp_ns,
+            anchor_timestamp_ns=anchor.sample.timestamp_ns,
+            reference_T_camera=anchor.reference_T_camera,
+        )
+
+    def clear(self) -> None:
+        """Discard the external reference; estimates are impossible afterward."""
+
+        self._anchor = None
+
+    def estimate(self, sample: ProprioceptiveSample) -> CameraStateEstimate:
+        """Propagate the current camera pose from the latest visual anchor."""
+
+        anchor = self._anchor
+        if anchor is None:
+            raise RuntimeError("camera estimator has no visual anchor")
+        if sample.timestamp_ns < anchor.sample.timestamp_ns:
+            raise ValueError("camera-state sample predates the visual anchor")
+        prediction = self._pose_estimators.predict(
+            anchor,
+            sample,
+            SELECTED_ESTIMATOR,
+        )
+        return CameraStateEstimate(
+            timestamp_ns=sample.timestamp_ns,
+            anchor_timestamp_ns=anchor.sample.timestamp_ns,
+            reference_T_camera=prediction,
+        )
 
 
 ESTIMATOR_CONTRACTS: dict[EstimatorName, dict[str, object]] = {

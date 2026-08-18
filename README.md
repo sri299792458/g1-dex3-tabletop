@@ -5,7 +5,7 @@ Focused Unitree G1 software for two connected operations:
 1. automatically collect dorsal-Dex3 calibration observations and solve the
    fixed-marker camera extrinsic with Mike Ferguson's Ceres optimizer;
 2. use a removable calibration bundle and official NVLabs CuRobo to plan and
-   execute a selected-Dex3 40 mm AprilCube pick, 100 mm lift, exact replacement,
+   execute a selected-Dex3 hash-bound AprilCube pick, 100 mm lift, exact replacement,
    retreat, and controller handback.
 
 The repository contains no historical manual-teaching pipeline or custom IK.
@@ -20,16 +20,18 @@ rejected approaches, and remaining physical limits.
 - CUDA planning runs in one persistent separate Python 3.11 process per task.
   It is started and warmed before SPACE, never imports Unitree transport code,
   and remains alive for the reversible supported escape, clearance-boundary
-  task replan, MPC, and measured-contact validation. ROS/control runs in Python
-  3.10 and keeps publishing through the commissioned fixed-rate Unitree
-  controller while planning is in progress.
+  pregrasp selection, corrected remaining-task plan, MPC, and measured-contact
+  validation. The default trajectory path retains one fixed-shape open-hand
+  optimizer across the two planning boundaries. ROS/control runs in Python 3.10
+  and keeps publishing through the commissioned fixed-rate Unitree controller
+  while planning is in progress.
 - Hardware commands require the exact harness/workspace acknowledgement and a
   second interactive SPACE after a read-only live preflight.
 - Standing calibration uses `rt/arm_sdk`, full gravity feedforward, measured
   opposite-arm hold, and the independent PC2 Damp watchdog.
 - Seated tabletop execution uses complete 29-joint `rt/lowcmd` ownership and
   restores Unitree control through the commissioned FSM `0 -> 1 -> 3` path.
-- No contact, contact-geometry rejection, and failed 10 mm retention are task
+- No contact, contact-geometry rejection, and failed 30 mm retention are task
   rejections: the controller opens or lowers as appropriate, follows exact
   frozen reverse trajectories to the supported start, and restores seated FSM
   3. State/transport/controller faults and Ctrl+C retain the independent PC2
@@ -168,12 +170,23 @@ The read-only endpoint, continuous-trajectory, and native-depth replay tools,
 their measured results, observability limits, and proposed task integration are
 documented in
 [`docs/state-estimation-research.md`](docs/state-estimation-research.md).
+The selected hybrid observer is an independent numerical library component,
+not a separate process. It uses only a visual anchor, three waist joints, and
+the pelvis/torso orientations. The default trajectory workflow now anchors it
+to the fixed cube at clearance and consumes one propagated estimate at the
+stationary pregrasp boundary. CuRobo then replans the same selected grasp and
+the complete remaining lifecycle from the exact active command. At clearance,
+only the reversible route to pregrasp is exposed to the controller; candidate
+selection also checks the unexecuted linear grasp approach so an
+already-invalid grasp is not knowingly approached. Depth remains an independent
+recorded/replay measurement rather than an unvalidated estimator input.
 
 ## Tabletop cube task
 
 Physical starting state: G1 seated in FSM 3, both arms supported and stationary
-on the table, the printed 40 mm `dex3_safe_cube` resting flat on any face and
-visible, the complete selected-arm sweep clear, and the RealSense node running.
+on the table, the selected AprilCube resting flat on any face and visible, the
+complete selected-arm sweep clear, and the RealSense node running. The default
+object profile is the printed 40 mm `dex3_safe_cube`.
 Tabletop yaw is free;
 the detected face identity is only a coordinate convention and does not limit
 which face may be on top.
@@ -187,6 +200,19 @@ cd /home/kanth042/g1-dex3-tabletop
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
+For the 60 mm R3 print with 45 mm `DICT_4X4_100` markers 10--15, add one
+argument to the same command:
+
+```bash
+  --object-profile cube60-r3
+```
+
+An object profile hash-binds the detector geometry, exact qualified collision
+mesh, dimensions, and direct-table grasp shortlist. `cube40-r3` contains the
+existing five candidates; `cube60-r3` contains all 57 unchanged candidates
+that passed intrinsic retention and the stationary-cube fixed-close 5 mm table
+contract. No controller or safety setting changes with the profile.
+
 The default replays the complete frozen CuRobo trajectory lifecycle. To use
 the phase-aware rolling CuRobo controller for every normal arm motion, add
 `--motion-controller mpc`. Finger contact/retention transitions and rejection
@@ -194,9 +220,38 @@ recovery remain with the existing state machine. The physical phase mapping,
 window checks, retained offline replay, and current limitations are documented
 in [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 
+With the default `trajectory` controller, the program performs one additional
+stationary correction after reaching pregrasp. The original clearance image
+remains the visual anchor; no hand marker or second cube image is required at
+pregrasp. The clearance transaction serializes only the validated
+clearance-to-pregrasp route and its exact reverse; it does not compute a
+provisional payload lifecycle that will be discarded. The warmed open-hand
+CuRobo optimizer is value-updated and reused for the same-grasp corrected
+remainder. If the synchronized waist/IMU inputs, same-grasp replan, post-plan
+state check, or atomic plan installation fails, the arm exactly reverses the
+already validated pregrasp route and then the supported escape.
+Before that pregrasp route is accepted, the planner holds its exact grasp
+contact arm pose and checks the complete descriptor open-to-close finger sweep
+against strict self collision. For a direct cube, the hand/table result is the
+object profile's hash-bound exact Dex3 collision-mesh sweep, while the live
+wrist retains the 5 mm plane check. Fixture modes retain their live table and
+fixture checks. In fixture mode, the target-fixed hand portion of every
+51-sample close sweep is first checked in CUDA batches; invalid candidates are
+removed before arm IK or trajectory optimization. The surviving arm IK
+endpoints are then strict-collision-checked in one GPU pass before route
+planning. After physical closure, the measured stable-close angles still
+revalidate the frozen payload route before beginning the payload lift.
+Each retained grasp receives one independent CuRobo IK problem with 16 seeds.
+The resulting finite joint-solution pool is then tested by the unchanged
+single-route planner and strict validators; candidates do not compete for one
+shared 16-seed goal set.
+The experimental `mpc` option does not yet consume this boundary estimate and
+prints that limitation explicitly.
+
 The direct-table behavior above remains the default. For the separate 50 mm
 tripod presenter, tape its base to the table and place the cube centred and
-yaw-aligned on the three pads, then add exactly one argument:
+yaw-aligned on the three pads, retain the default `cube40-r3` object profile,
+then add exactly one argument:
 
 ```bash
 ./tools/g1_tabletop_hardware.sh run-tabletop \
@@ -210,9 +265,10 @@ yaw-aligned on the three pads, then add exactly one argument:
 `tripod-h50` changes only the object presentation. It uses the exact printed
 STL as a CuRobo obstacle, derives its base pose from the freshly observed cube,
 and places the table plane 50 mm below the cube bottom. Camera observation,
-calibration, persistent planning, arm/Dex3 control, contact-stall detection,
-10 mm retention test, reverse recovery, seated restoration, and MCAP recording
-are the same shared implementation. Omitting `--presentation tripod-h50`
+calibration, persistent planning, arm/Dex3 control, commissioned empty-close
+obstruction detection, 30 mm lifted retention checkpoint, reverse recovery,
+seated restoration, and MCAP recording are the same shared implementation. Omitting
+`--presentation tripod-h50`
 removes the fixture completely from the request and scene.
 
 The packaged tripod shortlist contains all 372 independently h50-qualified
@@ -221,8 +277,10 @@ they are not robot commands. Every physical grasp uses the one fixed close
 target from the Dex3 descriptor, while contact limits each finger's measured
 travel. Every candidate is qualified for the common 70 mm approach used at
 runtime; 365 and 353 also pass the longer 100 and 150 mm approaches respectively.
-CuRobo receives all 372 in one goal set and chooses using live reachability and
-complete-scene collision.
+CuRobo first checks all 372 fixed hand/fixture sweeps in batches, then gives the
+survivors independent batched arm IK problems and chooses using live
+reachability and complete-scene collision. Expensive trajectory optimization
+is reserved for the ranked strict-endpoint-valid branches.
 
 Before SPACE, this verifies the seated stationary state, both Dex3 states,
 camera profile, and cube observation without creating publishers. After SPACE,
@@ -234,13 +292,20 @@ again, and plans the only grasp lifecycle eligible for execution from that fresh
 camera/body state:
 
 1. a straight supported-hand escape along the observed support-plane normal;
-2. bounded branch-aware complete-path selection from the 15 shared
-   GraspGen-X/Isaac-qualified Dex3 grasps, with the exact side adapter applied
+2. bounded branch-aware complete-path selection from every stationary-cube,
+   fixed-close-qualified grasp in the selected object profile (five for 40 mm,
+   57 for 60 mm), with the exact side adapter applied
    and every rejected IK branch and failure stage recorded;
 3. approach and smooth finger closure toward the fixed descriptor close target;
 4. a collision-aware 27-sphere conservative payload lift, exact reverse
    replacement, release, retreat, clearance return, and exact reverse
    supported return.
+
+The cube begins that lift in intentional contact with the tripod. During the
+direct separation and its exact reverse, only the attached-cube/tripod pair is
+excluded from CuRobo's optimizer world. The closed hand and every other robot
+sphere are independently checked against the exact tripod mesh over the
+generated route; the cube-support exemption does not permit hand contact.
 
 The cube is the task-local table anchor during this boundary update; it must not
 move between the loaded and clearance observations. The run records both image
@@ -249,13 +314,14 @@ frame. A failed boundary observation or task replan follows the already-frozen
 clearance-to-handoff reverse and stops without opening the hand.
 
 Physical closure does not require the fingers to reproduce the exact final
-PhysX joint vector. The live controller first observes finger motion in the
-commanded closing direction, then accepts a contact posture only when at least
-one finger remains more than the commissioned `0.08 rad` endpoint tolerance
-from the empty-hand target and the posture stays within the existing `0.01 rad`
-stability band for `0.5 s`. No other finger is required to reach the target.
-The already-recorded Dex3 pressure fields remain available in the MCAP for
-offline analysis, but pressure is not a live pass/fail signal.
+PhysX joint vector. The selected hand has a separately commissioned measured
+empty-close posture for the exact descriptor close command. During closure,
+starting the low retention lift requires observed commanded-direction finger
+motion, posture spread within `0.01 rad` for `0.5 s`, and at least `0.05 rad`
+shortfall from that empty close on both sides of the grasp: one thumb closing
+joint and one middle/index closing joint. A residual on only one side is an
+empty or pushed-cube result and is rejected. Raw pressure, `tau_est`, and
+velocity remain recorded diagnostics and never decide the live result.
 
 Because the physical contact posture can differ from the simulated posture,
 the same worker rechecks the frozen payload route using the measured finger
@@ -263,15 +329,16 @@ angles; it does not replan or alter the arm samples. Its arm-plus-finger FK and
 self-collision model is built once with the lifecycle and retained in memory.
 In tripod mode this same recheck also measures every robot collision sphere
 against the exact presenter mesh; direct mode incurs no fixture check.
-The planned lift is split at the first sample at least `10 mm` above contact
-without changing any sample. The fixed close target remains commanded during
-that small lift. At its endpoint the controller collects a fresh `0.5 s` stable
-window and requires at least one closing joint still to remain more than
-`0.08 rad` short of the empty-hand target. The fingers may settle farther and
-the blocked-joint set may change; reaching the complete empty-hand target is a
-failed retention test. A failed test follows the exact frozen 10 mm reverse,
-opens on the table, retreats, returns to the supported start, and restores
-seated control.
+The one planned payload lift is split at its first sample at least `30 mm`
+above contact without changing any sample or invoking the planner again. The
+fixed close target remains commanded during this first segment. Only after
+this separation does the controller collect a fresh `0.5 s` stable window and
+repeat the same commissioned empty-close test. The obstructed thumb and
+opposing-finger motor IDs may change as the cube settles, but both sides must
+still exceed the `0.05 rad` shortfall. Losing either side fails the checkpoint.
+Failure keeps the hand closed through the exact frozen 30 mm reverse, opens
+only after returning to support, retreats, returns to the supported start, and
+restores seated control.
 
 Only the moving selected wrist, articulated hand, and payload are checked against
 the locally observed support plane because one cube cannot reveal the table's

@@ -24,10 +24,10 @@ cube changes physical role:
 | `clearance` | initial fingers; cube on table | supported start, cube is a world obstacle |
 | `move_to_pregrasp` | open hand | cube and local table patch are world obstacles |
 | `grasp_approach` | open hand entering contact | designated fingertip links may contact the cube; table and all self-collisions remain checked |
-| `retention_test_lift` | measured contact-stalled fingers | cube is a 27-sphere payload attached to the grasp frame |
-| `payload_lift` | same measured contact | reuses the warm attached-payload model |
-| `payload_lower` | same measured contact | reuses the warm attached-payload model |
-| `payload_replace` | same measured contact | reuses the warm attached-payload model |
+| `retention_test_lift` | measured stable-close fingers | cube is a 27-sphere payload attached to the grasp frame |
+| `payload_lift` | same measured close | reuses the warm attached-payload model |
+| `payload_lower` | same measured close | reuses the warm attached-payload model |
+| `payload_replace` | same measured close | reuses the warm attached-payload model |
 | `grasp_retreat` | cube released; hand open | contact retreat with cube fixed in the world again |
 | `return_to_clearance` | open hand | cube and local table patch are world obstacles |
 | `__handoff__` | initial fingers restored | supported return, cube is a world obstacle |
@@ -42,11 +42,11 @@ restores that mode's last action seed, preserving the useful reverse-path warm
 start without constructing another solver or CUDA graph.
 
 Initial and deterministic open-finger kinematics are resolved before setup.
-The measured contact posture cannot be known earlier; it is resolved once after
-the physical finger stall and then reused for all four connected payload
+The measured close posture cannot be known earlier; it is resolved once after
+the physical close stabilizes and then reused for all four connected payload
 motions. No geometry is approximated to make the switch cheap.
 
-Finger opening, contact-stall acquisition, retention validation, release, and
+Finger opening, stable-close acquisition, retention validation, release, and
 seated-control restoration remain discrete operations in the existing task
 state machine. MPC does not infer or change those transitions.
 

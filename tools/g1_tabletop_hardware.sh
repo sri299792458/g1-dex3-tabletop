@@ -56,15 +56,18 @@ set +u
 source "${ros_prefix}/setup.bash"
 if [[ "${hardware_command}" == "run-tabletop" || \
       "${hardware_command}" == "measure-seat-compliance" ]]; then
-    if [[ ! -f "${local_mcap_prefix}/lib/librosbag2_storage_mcap.so" ]]; then
-        echo "account-local MCAP plugin is unavailable; run ./tools/setup_recording_benchmark.sh once" >&2
-        exit 1
-    fi
     if [[ ! -f "${unitree_ros_setup}" ]]; then
         echo "official Unitree ROS message installation is unavailable: ${unitree_ros_setup}" >&2
         exit 1
     fi
     source "${unitree_ros_setup}"
+fi
+if [[ "${hardware_command}" == "run-tabletop" || \
+      "${hardware_command}" == "measure-seat-compliance" ]]; then
+    if [[ ! -f "${local_mcap_prefix}/lib/librosbag2_storage_mcap.so" ]]; then
+        echo "account-local MCAP plugin is unavailable; run ./tools/setup_recording_benchmark.sh once" >&2
+        exit 1
+    fi
 fi
 set -u
 export CYCLONEDDS_HOME="${cyclone_prefix}"
@@ -86,6 +89,9 @@ if [[ "${hardware_command}" == "run-tabletop" || \
         echo "account-local MCAP storage plugin was not discovered" >&2
         exit 1
     fi
+fi
+if [[ "${hardware_command}" == "run-tabletop" || \
+      "${hardware_command}" == "measure-seat-compliance" ]]; then
     for message_type in \
         unitree_hg/msg/LowState \
         unitree_hg/msg/IMUState \

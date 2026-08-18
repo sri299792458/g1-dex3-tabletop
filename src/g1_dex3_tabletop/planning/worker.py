@@ -19,6 +19,7 @@ from g1_dex3_tabletop.planning.curobo_backend import (
 from g1_dex3_tabletop.planning.tabletop_mpc import benchmark_from_paths
 from g1_dex3_tabletop.planning.tabletop_planner import (
     plan_supported_escape,
+    plan_tabletop_pregrasp,
     plan_tabletop_task,
     prewarm_tabletop_model_resolution,
     validate_retention_route,
@@ -62,12 +63,16 @@ def build_parser() -> argparse.ArgumentParser:
             "plan the reversible supported-table lift from a fixed ChArUco board",
         ),
         (
+            "plan-tabletop-pregrasp",
+            "plan only the reversible clearance-to-pregrasp route",
+        ),
+        (
             "plan-tabletop-task",
             "plan the qualified cube pick, lift, replace, retreat, and return",
         ),
         (
             "validate-retention-route",
-            "recheck the frozen payload route at the measured contact-stalled hand posture",
+            "recheck the frozen payload route at the measured stable-close hand posture",
         ),
         (
             "plan-tabletop-lifecycle",
@@ -186,6 +191,15 @@ def _serve_tabletop() -> int:
                     elif command == "replan-tabletop-at-clearance":
                         request = TabletopTaskRequest.from_json(request_path)
                         result = session.replan_at_clearance(request, progress=progress)
+                    elif command == "plan-tabletop-pregrasp-at-clearance":
+                        request = TabletopTaskRequest.from_json(request_path)
+                        result = session.plan_pregrasp_at_clearance(
+                            request,
+                            progress=progress,
+                        )
+                    elif command == "replan-tabletop-at-pregrasp":
+                        request = TabletopTaskRequest.from_json(request_path)
+                        result = session.replan_at_pregrasp(request, progress=progress)
                     elif command == "plan-charuco-supported-escape":
                         request = CharucoSupportedEscapeRequest.from_json(request_path)
                         result = plan_supported_escape(request, progress=progress)
@@ -287,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
             }
         elif args.command in {
             "plan-supported-escape",
+            "plan-tabletop-pregrasp",
             "plan-tabletop-task",
             "plan-tabletop-lifecycle",
         }:
@@ -298,6 +313,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             elif args.command == "plan-tabletop-task":
                 result = plan_tabletop_task(
+                    request,
+                    progress=lambda message: print(message, file=sys.stderr, flush=True),
+                )
+            elif args.command == "plan-tabletop-pregrasp":
+                result = plan_tabletop_pregrasp(
                     request,
                     progress=lambda message: print(message, file=sys.stderr, flush=True),
                 )

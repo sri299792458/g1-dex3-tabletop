@@ -116,7 +116,7 @@ def _solve_configuration(
     )
     strict_robot, reference_values = build_tabletop_robot_config(
         arm=request.arm,
-        snapshot=request.observation.snapshot,
+        snapshot=request.planning_snapshot,
         joint_position_offsets_rad=request.joint_position_offsets_rad,
         active_finger_q_rad=open_q,
         include_waist_yaw=include_waist,
@@ -128,7 +128,7 @@ def _solve_configuration(
     )
     _use_moving_grasp_frame_only(transit_robot, arm=request.arm)
     device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
-    measured_waist_command = float(request.observation.snapshot.measured_q29_rad[12])
+    measured_waist_command = float(request.planning_snapshot.measured_q29_rad[12])
     start_model_waist = float(
         reference_by_name.get(WAIST_YAW_JOINT_NAME, measured_waist_command)
     )
@@ -346,7 +346,7 @@ def analyze_waist_yaw(
     open_q = dex3_execution_profile(request.arm)[0]
     locked_robot, reference = build_tabletop_robot_config(
         arm=request.arm,
-        snapshot=request.observation.snapshot,
+        snapshot=request.planning_snapshot,
         joint_position_offsets_rad=request.joint_position_offsets_rad,
         active_finger_q_rad=open_q,
     )

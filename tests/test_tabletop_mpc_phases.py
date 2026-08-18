@@ -254,6 +254,50 @@ def test_clearance_replan_atomically_replaces_task_and_resets_old_mpc(monkeypatc
     assert "closed" in events
 
 
+def test_clearance_pregrasp_stage_does_not_create_a_complete_task(monkeypatch) -> None:
+    events = []
+    request = SimpleNamespace(content_sha256="fresh", observation=object())
+    pregrasp = object()
+
+    class Controller:
+        def close(self) -> None:
+            events.append("closed")
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.request_at_clearance_observation",
+        lambda loaded, escape, observation: request,
+    )
+
+    def plan(received, *, open_planner_cache, progress):
+        assert received is request
+        assert open_planner_cache is session._open_planner
+        progress("pregrasp ready")
+        return pregrasp
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.plan_tabletop_pregrasp",
+        plan,
+    )
+    session = TabletopPlanningSession()
+    session._loaded_request = object()
+    session._supported_escape = object()
+    session._execution = object()
+    session._active_task = object()
+    session._retention_validator = object()
+    session._phase_mpc = Controller()
+    session._active_phase_mpc = session._phase_mpc
+
+    assert session.plan_pregrasp_at_clearance(request, progress=events.append) is pregrasp
+    assert session._clearance_request is request
+    assert session._pregrasp_plan is pregrasp
+    assert session._execution is None
+    assert session._active_task is None
+    assert session._retention_validator is None
+    assert session._phase_mpc is None
+    assert session._active_phase_mpc is None
+    assert events == ["pregrasp ready", "closed"]
+
+
 def test_escape_only_session_retains_exact_reverse_for_later_boundary_replan(
     monkeypatch,
 ) -> None:

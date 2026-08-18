@@ -45,8 +45,14 @@ runs/tabletop_<UTC>/
 ├── status.json
 ├── loaded_request.json
 ├── supported_escape.json
-├── task_plan.json
-├── execution_plan.json
+├── clearance_request.json
+├── pregrasp_plan.json
+├── pregrasp_estimated_request.json
+├── pregrasp_remaining_plan.json
+├── pregrasp_corrected_task_plan.json
+├── grasp_close.json
+├── retention_route_validation.json
+├── retention_evidence.json
 ├── planner.log
 └── raw_episode/
     ├── bag/
@@ -56,6 +62,16 @@ runs/tabletop_<UTC>/
     ├── notes.md
     └── recorder.log
 ```
+
+Those five boundary files are produced by the default `trajectory` controller.
+The experimental `mpc` controller instead retains `execution_plan.json` and
+`task_plan.json` because it still plans one frozen lifecycle at clearance.
+Rejected runs contain only the artifacts that were completed before rejection.
+`grasp_close.json` records the stable supported close relative to the
+commissioned empty-close posture. `retention_evidence.json` records the fresh
+post-lift repetition of the same thumb-plus-opposing-finger obstruction test.
+Raw pressure and `tau_est` remain in the official Dex3 state messages inside
+the MCAP as diagnostics; neither signal decides the live grasp result.
 
 The MCAP is the source of truth for asynchronous sensor, measured-state, and
 command streams. Existing run JSON files are the source of truth for task

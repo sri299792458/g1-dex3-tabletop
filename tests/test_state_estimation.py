@@ -11,6 +11,7 @@ from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.state_estimation import (
     ESTIMATOR_NAMES,
     AnchoredCameraPoseEstimators,
+    AnchoredCameraStateEstimator,
     CameraPoseAnchor,
     ProprioceptiveSample,
     pose_error,
@@ -37,13 +38,13 @@ def estimators() -> AnchoredCameraPoseEstimators:
 def _sample(
     *,
     timestamp_ns: int = 1,
-    q29: np.ndarray | None = None,
+    waist_q: np.ndarray | None = None,
     pelvis_rotation: np.ndarray | None = None,
     torso_rotation: np.ndarray | None = None,
 ) -> ProprioceptiveSample:
     return ProprioceptiveSample(
         timestamp_ns=timestamp_ns,
-        q29_rad=np.zeros(29) if q29 is None else q29,
+        waist_q_rad=np.zeros(3) if waist_q is None else waist_q,
         navigation_R_pelvis_imu=(np.eye(3) if pelvis_rotation is None else pelvis_rotation),
         navigation_R_torso_imu=(np.eye(3) if torso_rotation is None else torso_rotation),
     )
@@ -71,9 +72,9 @@ def test_fixed_pelvis_fk_uses_measured_waist(
     estimators: AnchoredCameraPoseEstimators,
 ) -> None:
     reference = _sample()
-    current_q = np.zeros(29)
-    current_q[14] = 0.1
-    current = _sample(timestamp_ns=2, q29=current_q)
+    current_waist = np.zeros(3)
+    current_waist[2] = 0.1
+    current = _sample(timestamp_ns=2, waist_q=current_waist)
     anchor = CameraPoseAnchor(reference_T_camera=np.eye(4), sample=reference)
 
     prediction = estimators.predict(anchor, current, "fixed_pelvis_fk")
@@ -87,12 +88,12 @@ def test_hybrid_takes_position_from_pelvis_and_orientation_from_torso(
     estimators: AnchoredCameraPoseEstimators,
 ) -> None:
     reference = _sample()
-    current_q = np.zeros(29)
-    current_q[13] = 0.04
-    current_q[14] = -0.06
+    current_waist = np.zeros(3)
+    current_waist[1] = 0.04
+    current_waist[2] = -0.06
     current = _sample(
         timestamp_ns=2,
-        q29=current_q,
+        waist_q=current_waist,
         pelvis_rotation=Rotation.from_euler("x", 0.03).as_matrix(),
         torso_rotation=Rotation.from_euler("y", -0.08).as_matrix(),
     )
@@ -104,6 +105,47 @@ def test_hybrid_takes_position_from_pelvis_and_orientation_from_torso(
 
     assert np.allclose(hybrid[:3, 3], pelvis[:3, 3], atol=1.0e-12, rtol=0.0)
     assert np.allclose(hybrid[:3, :3], torso[:3, :3], atol=1.0e-12, rtol=0.0)
+
+
+def test_state_estimator_requires_and_propagates_one_visual_anchor(
+    estimators: AnchoredCameraPoseEstimators,
+) -> None:
+    observer = AnchoredCameraStateEstimator(estimators)
+    reference = _sample(timestamp_ns=1_000)
+    current_waist = np.zeros(3)
+    current_waist[2] = -0.05
+    current = _sample(
+        timestamp_ns=2_000,
+        waist_q=current_waist,
+        pelvis_rotation=Rotation.from_euler("x", 0.03).as_matrix(),
+        torso_rotation=Rotation.from_euler("y", -0.04).as_matrix(),
+    )
+
+    with pytest.raises(RuntimeError, match="no visual anchor"):
+        observer.estimate(current)
+
+    anchored = observer.reset(CameraPoseAnchor(reference_T_camera=np.eye(4), sample=reference))
+    estimate = observer.estimate(current)
+    expected = estimators.predict(
+        observer.anchor,
+        current,
+        "hybrid_pelvis_position_torso_orientation",
+    )
+
+    assert anchored.anchor_age_s == 0.0
+    assert estimate.anchor_age_s == pytest.approx(1.0e-6)
+    np.testing.assert_allclose(estimate.reference_T_camera, expected)
+    assert estimate.to_dict()["estimator"] == "hybrid_pelvis_position_torso_orientation"
+
+
+def test_state_estimator_rejects_samples_before_anchor(
+    estimators: AnchoredCameraPoseEstimators,
+) -> None:
+    observer = AnchoredCameraStateEstimator(estimators)
+    observer.reset(CameraPoseAnchor(reference_T_camera=np.eye(4), sample=_sample(timestamp_ns=2)))
+
+    with pytest.raises(ValueError, match="predates"):
+        observer.estimate(_sample(timestamp_ns=1))
 
 
 def test_pose_error_reports_direction_and_norm() -> None:

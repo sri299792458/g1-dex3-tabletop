@@ -10,13 +10,17 @@ from g1_dex3_tabletop.planning.dex3_handedness import dex3_execution_profile
 from g1_dex3_tabletop.tabletop_contracts import (
     CharucoBoardObservation,
     CharucoSupportedEscapeRequest,
+    EstimatedCameraPlanningState,
+    PregraspRemainingPlan,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
     TabletopExecutionPlan,
     TabletopObservation,
+    TabletopPregraspPlan,
     TabletopTaskPlan,
     TabletopTaskRequest,
+    build_pregrasp_remaining_plan,
     combine_tabletop_plans,
 )
 
@@ -95,6 +99,37 @@ def test_tabletop_request_round_trip_and_hash_guard(tmp_path: Path) -> None:
     document["lift_m"] = 0.2
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
         TabletopTaskRequest.from_dict(document)
+
+
+def test_estimated_planning_state_is_separate_from_visual_observation() -> None:
+    original = request()
+    object_T_camera = [list(row) for row in identity()]
+    object_T_camera[0][3] = 0.012
+    estimated = EstimatedCameraPlanningState(
+        snapshot=RobotSnapshot((0.1,) * 29, (0.2,) * 7, (0.3,) * 7),
+        object_T_camera=object_T_camera,
+        anchor_observation_sha256=original.observation.content_sha256,
+        anchor_timestamp_ns=1_000_000_000,
+        timestamp_ns=2_000_000_000,
+        anchor_input_timing={"timestamp_ns": 1_000_000_000},
+        current_input_timing={"timestamp_ns": 2_000_000_000},
+    )
+    document = original.to_dict(include_hash=False)
+    document["estimated_planning_state"] = estimated.to_dict()
+    propagated = TabletopTaskRequest.from_dict(document)
+
+    assert propagated.observation == original.observation
+    assert propagated.planning_snapshot == estimated.snapshot
+    assert propagated.planning_camera_T_object[0][3] == pytest.approx(-0.012)
+    assert TabletopTaskRequest.from_dict(propagated.to_dict()) == propagated
+
+    bad = original.to_dict(include_hash=False)
+    bad["estimated_planning_state"] = {
+        **estimated.to_dict(),
+        "anchor_observation_sha256": "0" * 64,
+    }
+    with pytest.raises(ValueError, match="different visual anchor"):
+        TabletopTaskRequest.from_dict(bad)
 
 
 def test_charuco_escape_request_round_trip_and_frozen_board(tmp_path: Path) -> None:
@@ -260,9 +295,84 @@ def test_complete_execution_binds_escape_task_and_exact_return() -> None:
     assert tuple((item.from_pose_id, item.to_pose_id) for item in plan.recovery_trajectories) == (
         ("grasp_approach", "grasp_retreat"),
         ("retention_test_lift", "payload_replace"),
+        ("move_to_pregrasp", "return_to_clearance"),
     )
     assert plan.recovery_trajectories[0].command_q_rad == plan.trajectories[7].command_q_rad
     assert plan.recovery_trajectories[1].command_q_rad == plan.trajectories[6].command_q_rad
+    assert plan.recovery_trajectories[2].command_q_rad == tuple(
+        reversed(plan.trajectories[1].command_q_rad)
+    )
+
+    estimated_state = EstimatedCameraPlanningState(
+        snapshot=RobotSnapshot((0.0,) * 22 + (0.20,) * 7, (0.0,) * 7, (0.0,) * 7),
+        object_T_camera=identity(),
+        anchor_observation_sha256=clearance_request.observation.content_sha256,
+        anchor_timestamp_ns=1,
+        timestamp_ns=2,
+        anchor_input_timing={"timestamp_ns": 1},
+        current_input_timing={"timestamp_ns": 2},
+    )
+    estimated_document = clearance_request.to_dict(include_hash=False)
+    estimated_document["estimated_planning_state"] = estimated_state.to_dict()
+    estimated_request = TabletopTaskRequest.from_dict(estimated_document)
+    new_endpoints = (0.25, 0.26, 0.27, 0.28, 0.27, 0.26, 0.25, 0.20)
+    new_motions = []
+    source = "clearance"
+    start = 0.20
+    for phase, end in zip(phases, new_endpoints, strict=True):
+        new_motions.append(trajectory(source, phase, start, end))
+        source = phase
+        start = end
+    new_task = TabletopTaskPlan(
+        estimated_request.content_sha256,
+        "right",
+        "cube_1",
+        identity(),
+        open_q,
+        close_q,
+        (0.1,) * 7,
+        tuple(new_motions),
+        phases,
+        {},
+    )
+    pregrasp = TabletopPregraspPlan(
+        request_sha256=clearance_request.content_sha256,
+        arm="right",
+        selected_candidate_id="cube_1",
+        object_T_grasp=identity(),
+        open_active_dex3_q_rad=open_q,
+        outbound=plan.task.trajectories[0],
+        inbound=PlannedTrajectory(
+            "move_to_pregrasp",
+            "return_to_clearance",
+            (0.0, 1.0),
+            ((0.20,) * 7, (0.10,) * 7),
+            ((0.20,) * 7, (0.10,) * 7),
+            0.0,
+        ),
+        planner_provenance={},
+    )
+    assert TabletopPregraspPlan.from_dict(pregrasp.to_dict()) == pregrasp
+    remaining = build_pregrasp_remaining_plan(
+        prior_pregrasp_plan=pregrasp,
+        estimated_request=estimated_request,
+        task=new_task,
+    )
+    assert PregraspRemainingPlan.from_dict(remaining.to_dict()) == remaining
+    assert remaining.trajectories[0].from_pose_id == "move_to_pregrasp"
+    assert remaining.trajectories[-1].to_pose_id == "return_to_clearance"
+    assert remaining.trajectories[-1].command_q_rad == tuple(
+        reversed(pregrasp.outbound.command_q_rad)
+    )
+    assert tuple(
+        (item.from_pose_id, item.to_pose_id) for item in remaining.recovery_trajectories[-2:]
+    ) == (
+        ("estimated_pregrasp", "move_to_pregrasp"),
+        ("move_to_pregrasp", "return_to_clearance"),
+    )
+    assert remaining.recovery_trajectories[-2].command_q_rad == tuple(
+        reversed(remaining.trajectories[0].command_q_rad)
+    )
 
 
 def test_retention_route_contract_binds_measured_fingers_to_task(tmp_path: Path) -> None:

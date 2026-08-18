@@ -4,11 +4,17 @@
 
 This stack answers one narrow question before changing robot control: given a
 visually anchored camera pose, how much subsequent head-camera motion can the
-recorded G1 proprioceptive sensors explain?
+G1 proprioceptive sensors explain?
 
-It is offline and read-only. It opens an existing MCAP, never creates a Unitree
-publisher, and writes its report under the ignored `work/` directory. The first
-benchmark is the fixed-board rigid-chair run:
+The selected numerical observer is now a standalone pure-Python component. It
+has no ROS, CuRobo, MPC, or robot-command dependency. It accepts exactly one
+full 6D visual anchor, the three measured waist joints, pelvis orientation, and
+torso orientation. The hardware timing adapter and every control consumer are
+deliberately still absent.
+
+The validation tools remain offline and read-only. They open an existing MCAP,
+never create a Unitree publisher, and write reports under the ignored `work/`
+directory. The first benchmark is the fixed-board rigid-chair run:
 
 ```bash
 ./tools/g1_state_estimation_research.sh \
@@ -20,6 +26,23 @@ The report hash-binds the board observations, URDF, and removable calibration
 bundle. It uses MCAP record time as the common clock and fits a separate affine
 mapping from each RealSense producer header clock to that clock. Raw camera
 header seconds are not compared directly with Unitree receipt times.
+
+### Implemented estimator boundary
+
+`AnchoredCameraStateEstimator` retains only the empirically best
+`hybrid_pelvis_position_torso_orientation` hypothesis. A visual measurement
+resets all six pose dimensions. Between anchors, pelvis orientation plus the
+three waist joints propagate camera position and the torso IMU propagates
+camera orientation. The estimate reports anchor age and the explicit
+fixed-pelvis-IMU-origin assumption.
+
+Arm, hand, leg, command, RGB, raw D435i IMU, and depth inputs are not part of
+this estimator. The pelvis-to-camera URDF chain contains only the three waist
+joints. Depth remains a separately validated table-plane measurement because
+the retained recordings have not yet demonstrated that fusing it improves the
+hybrid estimate. Likewise, no numerical covariance is published: the retained
+replays measured errors, but no covariance model has yet been calibrated and
+validated. A future consumer must not invent either.
 
 ## What the rigid-chair recording proves
 
@@ -201,9 +224,10 @@ camera calibration. The layers are:
    zero velocity as low-variance hypotheses only while the contact state is
    known. Feet, chair, and table-hand contacts should have independent mode
    flags and covariances; none should be hard-coded as permanently fixed.
-4. **Depth-plane update.** Fit the table plane in native depth. Its normal
-   constrains tilt and its distance constrains translation along the normal.
-   It cannot determine in-plane X/Y or yaw on an untextured plane.
+4. **Optional depth-plane update.** Fit the table plane in native depth only if
+   a later replay demonstrates incremental value over the hybrid observer. Its
+   normal constrains tilt and its distance constrains translation along the
+   normal. It cannot determine in-plane X/Y or yaw on an untextured plane.
 5. **External 6D update.** During research, the fixed ChArUco board provides
    direct ground truth and an update. For a general workspace, use visual
    landmarks or tested VIO/SLAM. For a task with a visible object, a fresh
@@ -221,24 +245,62 @@ For the tabletop cube task, this becomes a concrete contract:
 2. Propagate camera pose at state rate with the hybrid pelvis-IMU-origin,
    measured-waist-FK, and torso-orientation model. Grow covariance with time
    and contact uncertainty; do not silently claim fixed-base kinematics.
-3. Use the depth table plane to update camera tilt and table-normal distance
-   whenever enough clean table pixels remain. It cannot correct X/Y or yaw.
-4. Accept a fresh 6D visual update whenever the cube or fixed landmark is
+3. Accept a fresh 6D visual update whenever the cube or fixed landmark is
    visible. The current evidence supports an initial target of one update every
    1--2 seconds on rigid support. If it is occluded, propagate and increase
    uncertainty rather than inventing an in-plane correction.
-5. First consume the updated pose only at stationary task boundaries and replan
+4. First consume the updated pose only at stationary task boundaries and replan
    the remaining CuRobo stages. Continuous trajectory deformation remains a
    later control experiment.
 
-The first production integration now implements the supported-lift boundary:
+Native depth remains available as an independent table-normal check. It should
+be added to this contract only after a fused replay shows lower held-out error,
+not merely because the sensor is recorded.
+
+The first production integration implements two deliberately discrete
+boundaries. At the supported-lift boundary,
 the fixed AprilCube is observed after loaded ownership and again at clearance.
 Only the reversible escape exists before that motion. The second observation
 replaces the camera/object and measured locked-body state, while the selected
 arm coordinate is pinned to the exact escape command endpoint. CuRobo then
-plans the executable grasp lifecycle. This corrects the measured loaded-to-lift
+selects a grasp by validating its pregrasp route and unexecuted linear grasp
+approach, but serializes only the reversible route to pregrasp. The payload
+lifecycle is deliberately deferred. This corrects the measured loaded-to-lift
 camera/body change without claiming continuous state estimation or permitting
 the cube itself to move.
+
+For the default trajectory controller, the clearance observation also becomes
+the full visual anchor for `AnchoredCameraStateEstimator`. The live adapter
+receipt-pairs and interpolates only the three waist joints, pelvis orientation,
+and torso orientation at one monotonic timestamp. After the originally planned
+clearance-to-pregrasp motion settles, the observer propagates
+`object_T_camera` to that stationary boundary. The planner request retains the
+original visual observation unchanged and adds a separate hash-bound estimated
+planning-state record, including both synchronized-input timing records and the
+exact current robot snapshot.
+
+The persistent CuRobo worker must preserve the previously selected grasp. Its
+fixed-shape open-hand optimizer and CUDA graphs survive the boundary; only
+topology-compatible kinematic values and the world are updated. It may choose
+another IK branch for that same physical grasp, and plans the
+corrected-pregrasp, approach, retention-test, payload, replacement, and retreat
+motions exactly once. The selected arm starts at the exact active command
+rather than the tracking measurement. After replacement, the new plan returns
+to that exact old pregrasp state and reverses the original
+clearance-to-pregrasp samples to clearance. The original supported-escape
+reverse then remains the final return. Thus a state-estimation or planning
+rejection has a complete pre-existing return route and cannot silently switch
+to a different grasp.
+
+Planning may take long enough for the body state to change again. Immediately
+before installing the result, the code obtains another synchronized estimate
+and compares it with the estimate that was planned. It reuses the task's
+existing 5 mm / 2 degree perception-spread limits rather than adding another
+uncommissioned threshold. The executor then independently checks complete
+joint-state stability and exact command continuity during atomic replacement.
+Continuous mid-trajectory correction is intentionally absent. The optional
+MPC path still uses its frozen lifecycle and reports that it does not yet
+consume the stationary-boundary estimate.
 
 ## Candidate upstream implementations
 

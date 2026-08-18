@@ -38,8 +38,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _base_scene,
     _contact_links,
     _cuboid_cover_spheres,
-    _fixture_clearance_from_spheres,
-    _fixture_collision_mesh,
+    _fixture_collision_checker,
     _local_plane_clearance_from_spheres,
     _selected_open_transit_world_robot,
     _table_from_resting_object,
@@ -405,7 +404,7 @@ class TabletopPhaseMPC:
         )
         strict_robot, _reference = build_tabletop_robot_config(
             arm=self.arm,
-            snapshot=clearance_request.observation.snapshot,
+            snapshot=clearance_request.planning_snapshot,
             joint_position_offsets_rad=clearance_request.joint_position_offsets_rad,
             active_finger_q_rad=tuple(float(value) for value in initial_fingers),
         )
@@ -466,10 +465,11 @@ class TabletopPhaseMPC:
             clearance_request,
             base_T_torso,
         )
-        self._fixture_mesh = _fixture_collision_mesh(
+        self._fixture_checker = _fixture_collision_checker(
             clearance_request,
             base_T_object,
             self._down,
+            device_cfg=self.device_cfg,
         )
         self._cube_scene = _base_scene(
             clearance_request,
@@ -480,7 +480,7 @@ class TabletopPhaseMPC:
         self._base_T_torso0 = _rigid_transform(base_T_torso)
         self._reference_T_torso0 = _rigid_transform(
             invert_transform(
-                np.asarray(clearance_request.observation.camera_T_object, dtype=np.float64)
+                np.asarray(clearance_request.planning_camera_T_object, dtype=np.float64)
             )
             @ invert_transform(np.asarray(clearance_request.torso_T_camera, dtype=np.float64))
         )
@@ -652,7 +652,7 @@ class TabletopPhaseMPC:
         )
         robot, _reference = build_tabletop_robot_config(
             arm=self.arm,
-            snapshot=self.clearance_request.observation.snapshot,
+            snapshot=self.clearance_request.planning_snapshot,
             joint_position_offsets_rad=self.clearance_request.joint_position_offsets_rad,
             active_finger_q_rad=tuple(float(value) for value in finger),
         )
@@ -690,7 +690,7 @@ class TabletopPhaseMPC:
                 label="open active Dex3 posture",
             )
         if measured_active_dex3_q_rad is None:
-            raise ValueError(f"MPC phase {spec.phase} requires measured contact fingers")
+            raise ValueError(f"MPC phase {spec.phase} requires measured close fingers")
         return _validated_finger_q(
             measured_active_dex3_q_rad,
             label="measured MPC contact fingers",
@@ -1037,40 +1037,28 @@ class TabletopPhaseMPC:
                 )
                 return diagnostics
 
-        if self._fixture_mesh is not None:
-            fixture_spheres = spheres
+        if self._fixture_checker is not None:
+            fixture_spheres = sphere_tensor
             if self.spec.allow_fingertip_cube_contact:
                 # The frozen linear-contact planner applies the same exception
                 # to these three links while the fingers enter the grasp.
-                fixture_spheres = spheres.copy()
+                fixture_spheres = sphere_tensor.clone()
                 for link_name in _contact_links(self.arm):
-                    indices = (
-                        config.get_sphere_index_from_link_name(link_name)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                        .reshape(-1)
-                    )
-                    fixture_spheres[:, indices, 3] = -100.0
-            fixture_clearance, fixture_link, fixture_sample = _fixture_clearance_from_spheres(
+                    indices = config.get_sphere_index_from_link_name(link_name).reshape(-1)
+                    fixture_spheres[..., indices, 3] = -100.0
+            fixture_hit = self._fixture_checker.first_collision(
                 fixture_spheres,
-                config=config,
-                fixture_mesh=self._fixture_mesh,
+                kinematics_config=config,
             )
-            diagnostics.update(
-                {
-                    "minimum_fixture_clearance_m": float(fixture_clearance),
-                    "minimum_fixture_clearance_link": fixture_link,
-                    "minimum_fixture_clearance_sample": fixture_sample,
-                }
-            )
-            if fixture_clearance < 0.0:
+            if fixture_hit is not None:
+                penetration, fixture_link, fixture_sample = fixture_hit
                 diagnostics.update(
                     {
                         "strict_valid": False,
                         "strict_failure": "fixture_collision",
                         "strict_failure_sample": fixture_sample,
                         "strict_failure_links": [fixture_link, self.request.fixture.fixture_id],
+                        "strict_failure_penetration_m": penetration,
                     }
                 )
         return diagnostics

@@ -24,12 +24,15 @@ from g1_aprilcube_calibration.transports.unitree_dex3 import (
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
 from g1_dex3_tabletop.planning.curobo_backend import (
     COLLISION_ACTIVATION_DISTANCE_M,
+    FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD,
     IK_SEEDS,
     TRAJECTORY_INTERPOLATION_DT_S,
     CuroboKinematicCollisionChecker,
+    CuroboWorldCollisionChecker,
     _joint_state_dt,
     _reverse_trajectory,
     _self_collision_pair_penetrations,
+    sample_linear_joint_sweep,
 )
 from g1_dex3_tabletop.planning.dex3_handedness import (
     dex3_execution_profile,
@@ -48,19 +51,24 @@ from g1_dex3_tabletop.tabletop_contracts import (
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
+    TabletopPregraspPlan,
     TabletopTaskPlan,
     TabletopTaskRequest,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
 WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M = 1.0e-6
+IK_BRANCH_DUPLICATE_TOLERANCE_RAD = 1.0e-5
+PREGRASP_IK_POSITION_TOLERANCE_M = 0.005
+PREGRASP_IK_ORIENTATION_TOLERANCE_RAD = 0.05
+FIXED_CLOSE_COLLISION_BATCH_SAMPLES = 4096
 
 
 @dataclass(frozen=True, slots=True)
 class _PregraspBranch:
     """One collision-valid CuRobo IK solution for one pregrasp goal."""
 
-    goalset_local_index: int
+    candidate_local_index: int
     solver_seed_index: int
     model_q_rad: np.ndarray
     position_error_m: float
@@ -74,6 +82,26 @@ class _OpenBranchPlan:
     minimum_plane_clearance_m: float
     minimum_plane_link: str
     minimum_plane_sample: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ApproachBranchPlan:
+    approach: PlannedTrajectory
+    minimum_plane_clearance_m: float
+    minimum_plane_link: str
+    minimum_plane_sample: int
+    fixed_close_sweep: _FixedCloseSweepResult
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedCloseSweepResult:
+    sample_count: int
+    minimum_plane_clearance_m: float
+    minimum_plane_link: str
+    minimum_plane_sample: int
+    minimum_fixture_clearance_m: float | None
+    minimum_fixture_link: str | None
+    minimum_fixture_sample: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +165,17 @@ def _local_table_plane_links(arm: str) -> tuple[str, ...]:
     return (
         f"{arm}_wrist_pitch_link",
         f"{arm}_wrist_yaw_link",
+        f"{arm}_hand_palm_link",
+        *(f"{arm}_hand_{suffix}_link" for suffix in DEX3_MOTOR_JOINT_SUFFIXES[arm]),
+    )
+
+
+def _local_wrist_plane_links(arm: str) -> tuple[str, ...]:
+    return (f"{arm}_wrist_pitch_link", f"{arm}_wrist_yaw_link")
+
+
+def _fixed_hand_links(arm: str) -> tuple[str, ...]:
+    return (
         f"{arm}_hand_palm_link",
         *(f"{arm}_hand_{suffix}_link" for suffix in DEX3_MOTOR_JOINT_SUFFIXES[arm]),
     )
@@ -455,12 +494,35 @@ def _load_shortlist(request: TabletopTaskRequest) -> tuple[dict[str, Any], list[
     if not candidates or len(candidates) != int(document.get("candidate_count", -1)):
         raise ValueError("qualified cube shortlist candidate count is invalid")
     approach_distance_m = float(document["execution_contract"]["approach_distance_m"])
+    if request.fixture is None:
+        contract = document["execution_contract"]
+        if (
+            document.get("format_version") != 2
+            or contract.get("fixed_cube_during_qualification") is not True
+            or contract.get("fixed_descriptor_close_target") is not True
+            or contract.get("exact_fixed_close_sweep_table_clear") is not True
+            or int(contract.get("fixed_close_sweep_samples", 0)) != 51
+        ):
+            raise ValueError(
+                "direct-table shortlist lacks stationary-cube fixed-close qualification"
+            )
     for candidate in candidates:
-        if candidate.get("execution_evidence", {}).get("intrinsic_retention_passed") is not True:
+        evidence = candidate.get("execution_evidence", {})
+        if evidence.get("intrinsic_retention_passed") is not True:
             raise ValueError(
                 "qualified cube candidate lacks intrinsic retention evidence: "
                 f"{candidate.get('candidate_id', '<missing ID>')}"
             )
+        if request.fixture is None:
+            exact_clearance = float(evidence.get("fixed_close_sweep_table_clearance_m", -1.0))
+            if (
+                evidence.get("qualification_model") != "stationary_cube_fixed_descriptor_close"
+                or exact_clearance < request.minimum_hand_plane_clearance_m
+            ):
+                raise ValueError(
+                    "direct-table candidate lacks the required exact fixed-close clearance: "
+                    f"{candidate.get('candidate_id', '<missing ID>')}"
+                )
         if request.fixture is not None and approach_distance_m not in candidate.get(
             "valid_approach_distances_m", ()
         ):
@@ -522,7 +584,7 @@ def _table_from_resting_object(
     """
 
     base_T_camera = base_T_torso @ np.asarray(request.torso_T_camera)
-    detected_object = base_T_camera @ np.asarray(request.observation.camera_T_object)
+    detected_object = base_T_camera @ np.asarray(request.planning_camera_T_object)
     base_T_object = _canonical_resting_cube_pose(detected_object)
     object_up = base_T_object[:3, 2]
     down = -object_up
@@ -617,61 +679,53 @@ def _base_scene(
     return scene
 
 
-def _fixture_collision_mesh(
+def _attached_lift_scene(
+    request: TabletopTaskRequest,
+    base_T_torso: np.ndarray,
+) -> dict[str, Any]:
+    """Scene for lifting an object away from its supporting fixture.
+
+    The attached cube begins in deliberate contact with its presenter. CuRobo's
+    world checker cannot disable only that object/fixture pair, so the support
+    is omitted from this optimizer scene. The generated route is independently
+    rechecked against the exact fixture using the robot spheres without the
+    attached cube, preserving every hand/fixture collision rule.
+    """
+
+    scene = _base_scene(request, base_T_torso, include_cube=False)
+    if request.fixture is not None:
+        meshes = scene.get("mesh", {})
+        meshes.pop(request.fixture.fixture_id, None)
+        if not meshes:
+            scene.pop("mesh", None)
+    return scene
+
+
+def _fixture_collision_checker(
     request: TabletopTaskRequest,
     base_T_object: np.ndarray,
     down: np.ndarray,
+    *,
+    device_cfg,
 ):
-    """Load the hash-checked fixture once in base coordinates for CPU rechecks."""
+    """Load the hash-checked fixture once into CuRobo's CUDA collision world."""
 
     path = _fixture_mesh_path(request)
     fixture_pose = _base_T_fixture(request, base_T_object, down)
     if path is None or fixture_pose is None:
         return None
     assert request.fixture is not None
-    import trimesh
-
-    mesh = trimesh.load(path, force="mesh", process=True)
-    if not isinstance(mesh, trimesh.Trimesh) or not mesh.is_watertight:
-        raise ValueError("fixture collision mesh must be one watertight solid")
-    mesh.apply_scale(np.asarray(request.fixture.mesh_scale, dtype=np.float64))
-    mesh.apply_transform(fixture_pose)
-    return mesh
-
-
-def _fixture_clearance_from_spheres(
-    sphere_array: np.ndarray,
-    *,
-    config,
-    fixture_mesh,
-) -> tuple[float, str, int]:
-    """Return minimum exact-mesh clearance for already-computed robot spheres."""
-
-    import trimesh
-
-    values = np.asarray(sphere_array, dtype=np.float64)
-    if values.ndim != 3 or values.shape[2] != 4:
-        raise ValueError("fixture sphere array must have shape N x S x 4")
-    valid_samples, valid_spheres = np.nonzero(values[..., 3] > 0.0)
-    if len(valid_samples) == 0:
-        raise RuntimeError("fixture collision recheck found no enabled robot spheres")
-    selected = values[valid_samples, valid_spheres]
-    # trimesh uses positive signed distance inside a watertight mesh and
-    # negative distance outside. Sphere clearance is therefore -distance-r.
-    signed = trimesh.proximity.signed_distance(fixture_mesh, selected[:, :3])
-    clearances = -np.asarray(signed, dtype=np.float64) - selected[:, 3]
-    if not np.all(np.isfinite(clearances)):
-        raise RuntimeError("fixture collision recheck produced a non-finite distance")
-    minimum_index = int(np.argmin(clearances))
-    sphere_index = int(valid_spheres[minimum_index])
-    link_index = int(config.link_sphere_idx_map.reshape(-1)[sphere_index].item())
-    index_to_name = {value: name for name, value in config.link_name_to_idx_map.items()}
-    if link_index not in index_to_name:
-        raise RuntimeError("fixture collision recheck could not resolve a sphere link")
-    return (
-        float(clearances[minimum_index]),
-        index_to_name[link_index],
-        int(valid_samples[minimum_index]),
+    return CuroboWorldCollisionChecker(
+        scene={
+            "mesh": {
+                request.fixture.fixture_id: {
+                    "file_path": str(path),
+                    "pose": _pose_list(fixture_pose),
+                    "scale": list(request.fixture.mesh_scale),
+                }
+            }
+        },
+        device_cfg=device_cfg,
     )
 
 
@@ -683,6 +737,7 @@ def _local_plane_clearance(
     plane_point: np.ndarray,
     down: np.ndarray,
     include_payload: bool,
+    link_names: tuple[str, ...] | None = None,
 ) -> tuple[float, str, int]:
     """Return minimum signed clearance for local manipulation geometry.
 
@@ -714,6 +769,7 @@ def _local_plane_clearance(
         plane_point=plane_point,
         down=down,
         include_payload=include_payload,
+        link_names=link_names,
     )
 
 
@@ -725,6 +781,7 @@ def _local_plane_clearance_from_spheres(
     plane_point: np.ndarray,
     down: np.ndarray,
     include_payload: bool,
+    link_names: tuple[str, ...] | None = None,
 ) -> tuple[float, str, int]:
     """Evaluate the table guard from already-computed CuRobo spheres."""
 
@@ -733,15 +790,15 @@ def _local_plane_clearance_from_spheres(
     values = np.asarray(sphere_array, dtype=np.float64)
     if values.ndim != 3 or values.shape[2] != 4:
         raise ValueError("table-plane sphere array must have shape N x S x 4")
-    link_names = list(_local_table_plane_links(arm))
+    selected_links = list(_local_table_plane_links(arm) if link_names is None else link_names)
     if include_payload:
-        link_names.append(attachment_link(arm))
+        selected_links.append(attachment_link(arm))
     minimum = float("inf")
     minimum_link = ""
     minimum_sample = -1
     up = -np.asarray(down, dtype=np.float64)
     point = np.asarray(plane_point, dtype=np.float64)
-    for link_name in link_names:
+    for link_name in selected_links:
         try:
             indices = config.get_sphere_index_from_link_name(link_name)
         except BaseException as error:  # CuRobo raises for unknown names.
@@ -763,6 +820,315 @@ def _local_plane_clearance_from_spheres(
     if not np.isfinite(minimum):
         raise RuntimeError("table-plane guard found no enabled local collision spheres")
     return minimum, minimum_link, minimum_sample
+
+
+class _FixedCloseSweepValidator:
+    """Check the commanded finger sweep at a candidate's fixed arm contact pose.
+
+    Hardware sends the one descriptor close target, so candidate selection
+    proves the complete fixed-cube sweep before moving to pregrasp. Physical
+    contact may stop the fingers earlier; that measured posture still undergoes
+    the independent frozen-route check before any lift.
+    """
+
+    def __init__(
+        self,
+        *,
+        request: TabletopTaskRequest,
+        base_T_object: np.ndarray,
+        plane_point: np.ndarray,
+        down: np.ndarray,
+        open_q: np.ndarray,
+        close_target_q: np.ndarray,
+    ) -> None:
+        import torch
+        from curobo.types import DeviceCfg
+
+        started = time.monotonic()
+        self.request = request
+        self.arm = request.arm
+        self.plane_point = np.asarray(plane_point, dtype=np.float64)
+        self.down = np.asarray(down, dtype=np.float64)
+        self.finger_sweep = sample_linear_joint_sweep(open_q, close_target_q)
+        robot, self.active_joint_names, reference = build_tabletop_route_validation_robot_config(
+            arm=self.arm,
+            snapshot=request.planning_snapshot,
+            joint_position_offsets_rad=request.joint_position_offsets_rad,
+        )
+        self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+        self.checker = CuroboKinematicCollisionChecker(
+            robot=robot,
+            device_cfg=self.device_cfg,
+        )
+        self.fixture_checker = _fixture_collision_checker(
+            request,
+            base_T_object,
+            self.down,
+            device_cfg=self.device_cfg,
+        )
+        self.relative_hand_sweep_spheres, self.hand_sphere_link_names = (
+            self._build_relative_hand_sweep(reference)
+        )
+        self.cache_build_s = time.monotonic() - started
+
+    def _build_relative_hand_sweep(
+        self,
+        reference: tuple[float, ...],
+    ):
+        """Express the commanded hand sweep once in the grasp frame."""
+
+        import torch
+        from curobo.types import JointState
+
+        arm_q = np.asarray(reference[:7], dtype=np.float64)
+        sweep_q = np.concatenate(
+            (
+                np.repeat(arm_q[None], len(self.finger_sweep), axis=0),
+                self.finger_sweep,
+            ),
+            axis=1,
+        )
+        spheres = self.checker.robot_spheres(
+            sweep_q,
+            joint_names=self.active_joint_names,
+        ).reshape(len(sweep_q), -1, 4)
+        state = JointState.from_position(
+            self.device_cfg.to_device(sweep_q[:1]),
+            joint_names=list(self.active_joint_names),
+        )
+        grasp_pose = (
+            self.checker.kinematics.compute_kinematics(state)
+            .tool_poses[grasp_frame(self.arm)]
+            .get_matrix()[0]
+        )
+        config = self.checker.config.kinematics_config
+        indices: list[int] = []
+        sphere_links: list[str] = []
+        for link_name in _fixed_hand_links(self.arm):
+            current = (
+                torch.as_tensor(config.get_sphere_index_from_link_name(link_name))
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            indices.extend(int(value) for value in current)
+            sphere_links.extend([link_name] * len(current))
+        selected = spheres[:, indices]
+        enabled = selected[0, :, 3] > 0.0
+        selected = selected[:, enabled]
+        sphere_links = [
+            name
+            for name, keep in zip(sphere_links, enabled.detach().cpu().tolist(), strict=True)
+            if keep
+        ]
+        rotation = grasp_pose[:3, :3]
+        translation = grasp_pose[:3, 3]
+        local_centers = torch.matmul(
+            selected[..., :3] - translation,
+            rotation,
+        )
+        return (
+            torch.cat((local_centers, selected[..., 3:4]), dim=-1),
+            tuple(sphere_links),
+        )
+
+    def batch_candidate_rejections(
+        self,
+        grasp_matrices: list[np.ndarray],
+    ) -> dict[int, tuple[str, str]]:
+        """Prune target-fixed hand/fixture and hand/table failures on CUDA."""
+
+        import torch
+
+        if self.fixture_checker is None:
+            return {}
+        matrices = np.asarray(grasp_matrices, dtype=np.float64)
+        if matrices.ndim != 3 or matrices.shape[1:] != (4, 4):
+            raise ValueError("fixed-close candidate poses must have shape N x 4 x 4")
+        sample_count = len(self.finger_sweep)
+        candidates_per_batch = max(
+            FIXED_CLOSE_COLLISION_BATCH_SAMPLES // sample_count,
+            1,
+        )
+        relative = self.relative_hand_sweep_spheres
+        rejections: dict[int, tuple[str, str]] = {}
+        up = self.device_cfg.to_device(-self.down)
+        plane_point = self.device_cfg.to_device(self.plane_point)
+        for start in range(0, len(matrices), candidates_per_batch):
+            stop = min(start + candidates_per_batch, len(matrices))
+            transforms = self.device_cfg.to_device(matrices[start:stop])
+            rotation = transforms[:, :3, :3]
+            translation = transforms[:, :3, 3]
+            centers = (
+                torch.matmul(
+                    relative[None, ..., :3],
+                    rotation[:, None, :, :].transpose(-1, -2),
+                )
+                + translation[:, None, None, :]
+            )
+            radii = relative[None, ..., 3:4].expand(len(transforms), -1, -1, -1)
+            world = torch.cat((centers, radii), dim=-1)
+            flat = world.reshape(-1, world.shape[-2], 4)
+            fixture_hits = self.fixture_checker.deepest_collisions(
+                flat,
+                sphere_link_names=self.hand_sphere_link_names,
+            )
+            clearance = torch.sum((centers - plane_point) * up, dim=-1) - radii[..., 0]
+            minimum_clearance, minimum_flat = clearance.reshape(len(transforms), -1).min(dim=1)
+            for local_index in range(len(transforms)):
+                candidate_index = start + local_index
+                sample_hits = fixture_hits[
+                    local_index * sample_count : (local_index + 1) * sample_count
+                ]
+                hits = [value for value in sample_hits if value is not None]
+                if hits:
+                    penetration, link_name, flat_sample = max(
+                        hits,
+                        key=lambda value: value[0],
+                    )
+                    sample = flat_sample - local_index * sample_count
+                    rejections[candidate_index] = (
+                        "batched_fixed_close_fixture",
+                        (
+                            f"{link_name}={penetration * 1000.0:.3f}mm penetration at "
+                            f"sample {sample}/{sample_count - 1}"
+                        ),
+                    )
+                    continue
+                minimum = float(minimum_clearance[local_index].item())
+                if minimum < self.request.minimum_hand_plane_clearance_m:
+                    flattened = int(minimum_flat[local_index].item())
+                    sample = flattened // int(world.shape[-2])
+                    sphere = flattened % int(world.shape[-2])
+                    rejections[candidate_index] = (
+                        "batched_fixed_close_table_plane",
+                        (
+                            f"clearance={minimum:.4f}m at "
+                            f"{self.hand_sphere_link_names[sphere]} sample "
+                            f"{sample}/{sample_count - 1}; required="
+                            f"{self.request.minimum_hand_plane_clearance_m:.4f}m"
+                        ),
+                    )
+        return rejections
+
+    def validate(
+        self,
+        contact_model_q: np.ndarray,
+        candidate: dict[str, Any],
+    ) -> _FixedCloseSweepResult:
+        arm_q = np.asarray(contact_model_q, dtype=np.float64).reshape(-1)
+        if arm_q.shape != (7,) or not np.all(np.isfinite(arm_q)):
+            raise ValueError("fixed-close sweep requires seven finite contact arm joints")
+        sweep_q = np.concatenate(
+            (
+                np.repeat(arm_q[None], len(self.finger_sweep), axis=0),
+                self.finger_sweep,
+            ),
+            axis=1,
+        )
+        spheres_tensor = self.checker.robot_spheres(
+            sweep_q,
+            joint_names=self.active_joint_names,
+        )
+        collision_samples = self.checker.self_collision_pair_penetrations_from_spheres(
+            spheres_tensor
+        )
+        for sample_index, pairs in enumerate(collision_samples):
+            if not pairs:
+                continue
+            pair, penetration = max(pairs.items(), key=lambda item: item[1])
+            raise _BranchRejected(
+                "fixed_close_sweep_strict_self_collision",
+                f"{pair[0]}/{pair[1]}={penetration * 1000.0:.3f}mm at "
+                f"sample {sample_index}/{len(sweep_q) - 1}",
+            )
+
+        sphere_array = spheres_tensor.detach().cpu().numpy().reshape(len(sweep_q), -1, 4)
+        if self.request.fixture is None:
+            evidence = candidate["execution_evidence"]
+            exact_link = str(evidence["fixed_close_sweep_minimum_link"])
+            if self.arm == "left":
+                exact_link = exact_link.replace("right_", "left_", 1)
+            exact = (
+                float(evidence["fixed_close_sweep_table_clearance_m"]),
+                exact_link,
+                int(evidence["fixed_close_sweep_minimum_sample"]),
+            )
+            wrist = _local_plane_clearance_from_spheres(
+                sphere_array,
+                config=self.checker.config.kinematics_config,
+                arm=self.arm,
+                plane_point=self.plane_point,
+                down=self.down,
+                include_payload=False,
+                link_names=_local_wrist_plane_links(self.arm),
+            )
+            hand_clearance, hand_link, hand_sample = min(exact, wrist, key=lambda item: item[0])
+        else:
+            hand_clearance, hand_link, hand_sample = _local_plane_clearance_from_spheres(
+                sphere_array,
+                config=self.checker.config.kinematics_config,
+                arm=self.arm,
+                plane_point=self.plane_point,
+                down=self.down,
+                include_payload=False,
+            )
+        if hand_clearance < self.request.minimum_hand_plane_clearance_m:
+            raise _BranchRejected(
+                "fixed_close_sweep_table_plane",
+                f"clearance={hand_clearance:.4f}m at {hand_link} sample "
+                f"{hand_sample}/{len(sweep_q) - 1}; required="
+                f"{self.request.minimum_hand_plane_clearance_m:.4f}m",
+            )
+
+        if self.fixture_checker is not None:
+            fixture_hit = self.fixture_checker.first_collision(
+                spheres_tensor,
+                kinematics_config=self.checker.config.kinematics_config,
+            )
+            if fixture_hit is not None:
+                penetration, fixture_link, fixture_sample = fixture_hit
+                raise _BranchRejected(
+                    "fixed_close_sweep_fixture",
+                    f"{fixture_link}={penetration * 1000.0:.3f}mm penetration at "
+                    f"sample {fixture_sample}/{len(sweep_q) - 1}",
+                )
+        return _FixedCloseSweepResult(
+            sample_count=len(sweep_q),
+            minimum_plane_clearance_m=hand_clearance,
+            minimum_plane_link=hand_link,
+            minimum_plane_sample=hand_sample,
+            minimum_fixture_clearance_m=None,
+            minimum_fixture_link=None,
+            minimum_fixture_sample=None,
+        )
+
+    def validate_closed_lift_fixture(self, arm_q: np.ndarray) -> None:
+        """Recheck hand/fixture separation while the cube lifts off its support."""
+
+        if self.fixture_checker is None:
+            return
+        values = np.asarray(arm_q, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] != 7:
+            raise ValueError("closed-lift fixture validation requires N x 7 arm joints")
+        closed = np.repeat(self.finger_sweep[-1:, :], len(values), axis=0)
+        route_q = np.concatenate((values, closed), axis=1)
+        sphere_tensor = self.checker.robot_spheres(
+            route_q,
+            joint_names=self.active_joint_names,
+        )
+        fixture_hit = self.fixture_checker.first_collision(
+            sphere_tensor,
+            kinematics_config=self.checker.config.kinematics_config,
+        )
+        if fixture_hit is None:
+            return
+        penetration, fixture_link, fixture_sample = fixture_hit
+        raise _BranchRejected(
+            "closed_lift_fixture",
+            f"{fixture_link}={penetration * 1000.0:.3f}mm penetration at "
+            f"sample {fixture_sample}/{len(values) - 1}",
+        )
 
 
 def _world_cuboid_clearances(
@@ -844,6 +1210,8 @@ def _planner(robot, scene: dict[str, Any], *, max_goalset: int, seed: int):
         device_cfg=device_cfg,
         num_ik_seeds=IK_SEEDS,
         num_trajopt_seeds=4,
+        position_tolerance=PREGRASP_IK_POSITION_TOLERANCE_M,
+        orientation_tolerance=PREGRASP_IK_ORIENTATION_TOLERANCE_RAD,
         self_collision_check=True,
         use_cuda_graph=True,
         random_seed=seed,
@@ -852,6 +1220,198 @@ def _planner(robot, scene: dict[str, Any], *, max_goalset: int, seed: int):
         interpolation_buffer_size=1000,
     )
     return MotionPlanner(config), device_cfg
+
+
+def _batched_pregrasp_ik_solver(
+    robot,
+    scene: dict[str, Any],
+    *,
+    candidate_count: int,
+    seed: int,
+    device_cfg,
+):
+    """Build an IK-only GPU batch with one independent row per candidate."""
+
+    from curobo.inverse_kinematics import InverseKinematics, InverseKinematicsCfg
+
+    if candidate_count <= 0:
+        raise ValueError("batched pregrasp IK requires at least one candidate")
+    config = InverseKinematicsCfg.create(
+        robot=robot,
+        optimizer_configs=["ik/lbfgs_ik.yml"],
+        scene_model=scene,
+        collision_cache={"cuboid": 4, "mesh": 1},
+        device_cfg=device_cfg,
+        num_seeds=IK_SEEDS,
+        position_tolerance=PREGRASP_IK_POSITION_TOLERANCE_M,
+        orientation_tolerance=PREGRASP_IK_ORIENTATION_TOLERANCE_RAD,
+        self_collision_check=True,
+        max_batch_size=candidate_count,
+        max_goalset=1,
+        use_cuda_graph=True,
+        random_seed=seed,
+        optimizer_collision_activation_distance=COLLISION_ACTIVATION_DISTANCE_M,
+    )
+    return InverseKinematics(config)
+
+
+class ReusableOpenPlanner:
+    """Retain one fixed-shape open-hand MotionPlanner across task boundaries."""
+
+    def __init__(self) -> None:
+        self._planner = None
+        self._device_cfg = None
+        self._configuration_key: str | None = None
+        self._seed: int | None = None
+
+    @staticmethod
+    def _robot_configs(planner) -> tuple[Any, ...]:
+        configs: list[Any] = []
+        seen: set[int] = set()
+        rollouts = [
+            *planner.ik_solver.core.get_all_rollout_instances(),
+            *planner.trajopt_solver.core.get_all_rollout_instances(),
+        ]
+        if planner.graph_planner is not None:
+            rollouts.extend(planner.graph_planner.get_all_rollout_instances())
+        for rollout in rollouts:
+            config = rollout.transition_model.robot_model.config
+            if id(config) in seen:
+                continue
+            seen.add(id(config))
+            configs.append(config)
+        if not configs:
+            raise RuntimeError("CuRobo MotionPlanner exposes no robot configuration buffers")
+        return tuple(configs)
+
+    @staticmethod
+    def _assert_compatible(target, source) -> None:
+        import torch
+
+        left = target.kinematics_config
+        right = source.kinematics_config
+        if left.joint_names != right.joint_names:
+            raise RuntimeError("reusable planner active joints changed")
+        if left.tool_frames != right.tool_frames:
+            raise RuntimeError("reusable planner tool frames changed")
+        if left.lock_jointstate.joint_names != right.lock_jointstate.joint_names:
+            raise RuntimeError("reusable planner locked joints changed")
+        for name in (
+            "fixed_transforms",
+            "link_map",
+            "joint_map",
+            "joint_map_type",
+            "tool_frame_map",
+            "joint_offset_map",
+            "link_spheres",
+            "link_sphere_idx_map",
+        ):
+            if getattr(left, name).shape != getattr(right, name).shape:
+                raise RuntimeError(f"reusable planner changed CuRobo {name} shape")
+        if target.self_collision_config.sphere_padding.shape != (
+            source.self_collision_config.sphere_padding.shape
+        ):
+            raise RuntimeError("reusable planner changed self-collision padding shape")
+        if not torch.equal(
+            target.self_collision_config.collision_pairs,
+            source.self_collision_config.collision_pairs,
+        ):
+            raise RuntimeError("reusable planner changed self-collision pair topology")
+
+    def acquire(
+        self,
+        robot,
+        scene: dict[str, Any],
+        *,
+        seed: int,
+        configuration_key: str,
+    ) -> tuple[Any, Any, dict[str, Any]]:
+        """Create or value-update one planner while preserving CUDA graph allocations."""
+
+        started = time.monotonic()
+        if self._planner is None or self._seed != seed:
+            self.close()
+            planner, device_cfg = _planner(
+                robot,
+                scene,
+                max_goalset=1,
+                seed=seed,
+            )
+            self._planner = planner
+            self._device_cfg = device_cfg
+            self._configuration_key = configuration_key
+            self._seed = seed
+            return (
+                planner,
+                device_cfg,
+                {
+                    "reused": False,
+                    "configuration_changed": True,
+                    "topology_rebuilt": False,
+                    "elapsed_s": time.monotonic() - started,
+                },
+            )
+        if self._configuration_key != configuration_key:
+            from curobo._src.geom.types import SceneCfg
+
+            source = robot.kinematics
+            targets = self._robot_configs(self._planner)
+            try:
+                for target in targets:
+                    self._assert_compatible(target, source)
+            except RuntimeError:
+                self.close()
+                planner, device_cfg = _planner(
+                    robot,
+                    scene,
+                    max_goalset=1,
+                    seed=seed,
+                )
+                self._planner = planner
+                self._device_cfg = device_cfg
+                self._configuration_key = configuration_key
+                self._seed = seed
+                return (
+                    planner,
+                    device_cfg,
+                    {
+                        "reused": False,
+                        "configuration_changed": True,
+                        "topology_rebuilt": True,
+                        "elapsed_s": time.monotonic() - started,
+                    },
+                )
+            for target in targets:
+                target.kinematics_config.copy_(source.kinematics_config)
+                target.self_collision_config.sphere_padding.copy_(
+                    source.self_collision_config.sphere_padding
+                )
+            self._planner.update_world(SceneCfg.create(scene))
+            self._planner.reset_seed()
+            self._configuration_key = configuration_key
+            changed = True
+        else:
+            self._planner.reset_seed()
+            changed = False
+        return (
+            self._planner,
+            self._device_cfg,
+            {
+                "reused": True,
+                "configuration_changed": changed,
+                "topology_rebuilt": False,
+                "elapsed_s": time.monotonic() - started,
+            },
+        )
+
+    def close(self) -> None:
+        planner = self._planner
+        self._planner = None
+        self._device_cfg = None
+        self._configuration_key = None
+        self._seed = None
+        if planner is not None:
+            _cleanup(planner)
 
 
 def _joint_state(device_cfg, values: np.ndarray, names: tuple[str, ...]):
@@ -917,6 +1477,21 @@ def _goalset(matrices: list[np.ndarray], device_cfg, *, arm: str):
     return GoalToolPose([grasp_frame(arm)], positions, quaternions)
 
 
+def _batched_pose_goals(matrices: list[np.ndarray], device_cfg, *, arm: str):
+    """Return one independent single-pose IK problem per candidate."""
+
+    from curobo.types import GoalToolPose, Pose
+
+    values = np.asarray(matrices, dtype=np.float64)
+    if values.ndim != 3 or values.shape[1:] != (4, 4) or len(values) == 0:
+        raise ValueError("batched pregrasp goals require a non-empty N x 4 x 4 array")
+    pose = Pose.from_matrix(device_cfg.to_device(values))
+    return GoalToolPose.from_poses(
+        {grasp_frame(arm): pose},
+        ordered_tool_frames=[grasp_frame(arm)],
+    )
+
+
 def _as_numpy(value) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
@@ -929,64 +1504,108 @@ def _pregrasp_matrix(grasp_matrix: np.ndarray, approach_distance_m: float) -> np
     return np.asarray(grasp_matrix, dtype=np.float64) @ offset
 
 
-def _enumerate_pregrasp_branches(planner, goals, state) -> list[_PregraspBranch]:
-    """Return every collision-valid pregrasp branch produced by CuRobo's IK seeds.
+def _repeat_joint_state(state, count: int):
+    from curobo.types import JointState
 
-    A goal set is still used so CuRobo can prioritize all retained GraspGenX
-    candidates together.  Unlike ``MotionPlanner.plan_grasp``, no branch is
-    collapsed to one final arm configuration here.
-    """
+    return JointState.from_position(
+        state.position.repeat(count, 1),
+        joint_names=state.joint_names,
+    )
 
-    result = planner.ik_solver.solve_pose(
+
+def _enumerate_pregrasp_branches(
+    solver,
+    goals,
+    state,
+    *,
+    candidate_count: int,
+) -> tuple[list[_PregraspBranch], Any]:
+    """Return up to 16 dedicated collision-valid IK branches per candidate."""
+
+    if candidate_count <= 0:
+        raise ValueError("pregrasp IK candidate count must be positive")
+    batch_state = _repeat_joint_state(state, candidate_count)
+    result = solver.solve_pose(
         goals,
         return_seeds=IK_SEEDS,
-        current_state=state,
+        current_state=batch_state,
     )
-    success = _as_numpy(result.success).astype(bool).reshape(-1)
-    solutions = _as_numpy(result.solution).reshape(len(success), -1)
-    if solutions.shape[1] != 7:
-        raise RuntimeError(f"CuRobo pregrasp IK returned invalid shape {solutions.shape}")
-    position_error = _as_numpy(result.position_error).reshape(len(success), -1).max(axis=1)
-    rotation_error = _as_numpy(result.rotation_error).reshape(len(success), -1).max(axis=1)
-    if result.goalset_index is None:
-        goalset_index = np.zeros(len(success), dtype=np.int64)
-    else:
-        goalset_index = _as_numpy(result.goalset_index).reshape(len(success), -1)[:, 0]
+    success = _as_numpy(result.success).astype(bool)
+    solutions = _as_numpy(result.solution)
+    if success.ndim != 2 or success.shape[0] != candidate_count:
+        raise RuntimeError(f"CuRobo pregrasp IK returned invalid success shape {success.shape}")
+    if solutions.shape != (*success.shape, 7):
+        raise RuntimeError(f"CuRobo pregrasp IK returned invalid solution shape {solutions.shape}")
+    position_error = _as_numpy(result.position_error).reshape(*success.shape, -1).max(axis=2)
+    rotation_error = _as_numpy(result.rotation_error).reshape(*success.shape, -1).max(axis=2)
+    reference = _as_numpy(state.position).reshape(-1)
 
     branches: list[_PregraspBranch] = []
-    for solver_seed_index in np.flatnonzero(success):
-        branches.append(
-            _PregraspBranch(
-                goalset_local_index=int(goalset_index[solver_seed_index]),
-                solver_seed_index=int(solver_seed_index),
-                model_q_rad=np.asarray(solutions[solver_seed_index], dtype=np.float64),
-                position_error_m=float(position_error[solver_seed_index]),
-                rotation_error_rad=float(rotation_error[solver_seed_index]),
-            )
+    for candidate_local_index in range(candidate_count):
+        valid = np.flatnonzero(success[candidate_local_index])
+        ordered = sorted(
+            (int(index) for index in valid),
+            key=lambda index: float(
+                np.linalg.norm(solutions[candidate_local_index, index] - reference)
+            ),
         )
-    return branches
+        unique: list[np.ndarray] = []
+        for solver_seed_index in ordered:
+            solution = np.asarray(
+                solutions[candidate_local_index, solver_seed_index],
+                dtype=np.float64,
+            )
+            if any(
+                float(np.max(np.abs(solution - previous))) <= IK_BRANCH_DUPLICATE_TOLERANCE_RAD
+                for previous in unique
+            ):
+                continue
+            unique.append(solution)
+            branches.append(
+                _PregraspBranch(
+                    candidate_local_index=candidate_local_index,
+                    solver_seed_index=solver_seed_index,
+                    model_q_rad=solution,
+                    position_error_m=float(
+                        position_error[candidate_local_index, solver_seed_index]
+                    ),
+                    rotation_error_rad=float(
+                        rotation_error[candidate_local_index, solver_seed_index]
+                    ),
+                )
+            )
+    branches.sort(key=lambda branch: float(np.linalg.norm(branch.model_q_rad - reference)))
+    return branches, result
 
 
 def _try_branch_pool(
     branches: list[_PregraspBranch],
     *,
     candidate_ids: list[str],
-    attempt: Callable[[_PregraspBranch], tuple[_OpenBranchPlan, _LiftBranchPlan]],
+    attempt: Callable[[_PregraspBranch], Any],
     report: Callable[[str], None],
 ) -> tuple[
     _PregraspBranch | None,
-    tuple[_OpenBranchPlan, _LiftBranchPlan] | None,
+    Any | None,
     list[dict[str, Any]],
 ]:
     """Try the finite IK branch pool without discarding a candidate early."""
 
+    from collections import Counter
+
     failures: list[dict[str, Any]] = []
+    totals = Counter(branch.candidate_local_index for branch in branches)
+    attempted: Counter[int] = Counter()
     for pool_index, branch in enumerate(branches, start=1):
-        if not 0 <= branch.goalset_local_index < len(candidate_ids):
-            raise RuntimeError("CuRobo returned an invalid pregrasp goal-set index")
-        candidate_id = candidate_ids[branch.goalset_local_index]
+        if not 0 <= branch.candidate_local_index < len(candidate_ids):
+            raise RuntimeError("CuRobo returned an invalid pregrasp candidate index")
+        candidate_id = candidate_ids[branch.candidate_local_index]
+        attempted[branch.candidate_local_index] += 1
+        candidate_branch_index = attempted[branch.candidate_local_index]
+        candidate_branch_count = totals[branch.candidate_local_index]
         report(
-            f"trying {candidate_id} IK branch {pool_index}/{len(branches)} "
+            f"trying {candidate_id} IK branch "
+            f"{candidate_branch_index}/{candidate_branch_count} "
             f"(solver seed {branch.solver_seed_index})"
         )
         try:
@@ -995,13 +1614,16 @@ def _try_branch_pool(
             failure = {
                 "candidate_id": candidate_id,
                 "pool_branch_index": pool_index,
+                "candidate_branch_index": candidate_branch_index,
+                "candidate_branch_count": candidate_branch_count,
                 "solver_seed_index": branch.solver_seed_index,
                 "stage": rejection.stage,
                 "reason": rejection.reason,
             }
             failures.append(failure)
             report(
-                f"rejected {candidate_id} IK branch {pool_index}/{len(branches)} "
+                f"rejected {candidate_id} IK branch "
+                f"{candidate_branch_index}/{candidate_branch_count} "
                 f"at {rejection.stage}: {rejection.reason}"
             )
             continue
@@ -1038,42 +1660,28 @@ def _pregrasp_endpoint_self_collision_reasons(
     return reasons
 
 
-def _goalset_ik_failure_diagnostic(
+def _batched_ik_failure_diagnostic(
     *,
-    planner,
+    result,
     robot: dict[str, Any],
     scene: dict[str, Any],
-    goals,
-    state,
     candidates: list[dict[str, Any]],
-    remaining: list[int],
     device_cfg,
-    arm: str,
     disabled_collision_links: set[str],
 ) -> str:
-    """Name physical constraints behind an otherwise opaque goal-set failure."""
+    """Name physical constraints behind an otherwise opaque batched-IK failure."""
 
-    def array(value) -> np.ndarray:
-        if hasattr(value, "detach"):
-            value = value.detach().cpu().numpy()
-        return np.asarray(value)
-
-    planner.disable_link_collision(list(disabled_collision_links))
-    try:
-        result = planner.ik_solver.solve_pose(
-            goals,
-            return_seeds=IK_SEEDS,
-            current_state=state,
-        )
-    finally:
-        planner.enable_link_collision(list(disabled_collision_links))
-
-    position_error = array(result.position_error).reshape(-1)
-    rotation_error = array(result.rotation_error).reshape(-1)
-    position_tolerance = float(planner.ik_solver.config.position_tolerance)
-    rotation_tolerance = float(planner.ik_solver.config.orientation_tolerance)
-    converged = np.flatnonzero(
-        (position_error < position_tolerance) & (rotation_error < rotation_tolerance)
+    success = _as_numpy(result.success).astype(bool)
+    if success.ndim != 2 or success.shape[0] != len(candidates):
+        return f"IK diagnostic returned invalid success shape {success.shape}"
+    solutions = _as_numpy(result.solution)
+    if solutions.shape != (*success.shape, 7):
+        return f"IK diagnostic returned invalid solution shape {solutions.shape}"
+    position_error = _as_numpy(result.position_error).reshape(*success.shape, -1).max(axis=2)
+    rotation_error = _as_numpy(result.rotation_error).reshape(*success.shape, -1).max(axis=2)
+    converged = np.argwhere(
+        (position_error < PREGRASP_IK_POSITION_TOLERANCE_M)
+        & (rotation_error < PREGRASP_IK_ORIENTATION_TOLERANCE_RAD)
     )
     best_position_mm = float(np.min(position_error) * 1000.0)
     best_rotation_deg = float(np.rad2deg(np.min(rotation_error)))
@@ -1084,29 +1692,28 @@ def _goalset_ik_failure_diagnostic(
             f"best rotation error={best_rotation_deg:.3f}deg"
         )
 
-    solutions = array(result.solution).reshape(-1, 7)
-    goalset_indices = array(result.goalset_index).reshape(-1)
+    converged_q = np.stack(
+        [solutions[candidate_index, seed_index] for candidate_index, seed_index in converged]
+    )
     pair_samples = _self_collision_pair_penetrations(
         robot=robot,
-        q_samples=solutions[converged],
+        q_samples=converged_q,
         device_cfg=device_cfg,
     )
     world_samples = _world_cuboid_clearances(
         robot=robot,
-        q_samples=solutions[converged],
+        q_samples=converged_q,
         scene=scene,
         device_cfg=device_cfg,
         disabled_links=disabled_collision_links,
     )
     branches: list[str] = []
     seen: set[tuple[str, tuple[tuple[str, str], ...], tuple[tuple[str, str], ...]]] = set()
-    for seed_index, pair_depths, world_clearances in zip(
+    for indices, pair_depths, world_clearances in zip(
         converged, pair_samples, world_samples, strict=True
     ):
-        local_goal_index = int(goalset_indices[seed_index])
-        candidate_id = "unknown candidate"
-        if 0 <= local_goal_index < len(remaining):
-            candidate_id = str(candidates[remaining[local_goal_index]]["candidate_id"])
+        candidate_index, _seed_index = (int(value) for value in indices)
+        candidate_id = str(candidates[candidate_index]["candidate_id"])
         filtered = {
             pair: depth
             for pair, depth in pair_depths.items()
@@ -1142,7 +1749,7 @@ def _goalset_ik_failure_diagnostic(
         if len(branches) == 3:
             break
     return (
-        f"IK diagnostic found {len(converged)}/{int(array(result.success).size)} "
+        f"IK diagnostic found {len(converged)}/{int(success.size)} "
         "Cartesian-converged but infeasible branches: " + "; ".join(branches)
     )
 
@@ -1254,6 +1861,27 @@ def _cleanup(planner) -> None:
         planner.destroy()
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def _validate_supported_escape_endpoint(
+    *,
+    start: np.ndarray,
+    target: np.ndarray,
+    endpoint: np.ndarray,
+    down: np.ndarray,
+    position_tolerance_m: float,
+) -> tuple[float, float]:
+    """Validate the FK endpoint against the Cartesian goal CuRobo accepted."""
+
+    target_error_m = float(np.linalg.norm(endpoint[:3, 3] - target[:3, 3]))
+    if target_error_m > position_tolerance_m:
+        raise RuntimeError(
+            "supported escape missed its requested Cartesian endpoint: "
+            f"position error={target_error_m:.4f}m; "
+            f"CuRobo tolerance={position_tolerance_m:.4f}m"
+        )
+    achieved_escape_m = -float(np.dot(down, endpoint[:3, 3] - start[:3, 3]))
+    return achieved_escape_m, target_error_m
 
 
 def plan_supported_escape(
@@ -1382,11 +2010,15 @@ def plan_supported_escape(
         endpoint_q = np.asarray(outbound.model_q_rad[-1])
         endpoint = _joint_state(device_cfg, endpoint_q, names)
         actual_target = _base_T_grasp(planner, endpoint, arm=arm)
+        position_tolerance_m = float(planner.trajopt_solver.config.position_tolerance)
+        achieved_escape_m, target_error_m = _validate_supported_escape_endpoint(
+            start=base_T_grasp,
+            target=target,
+            endpoint=actual_target,
+            down=down,
+            position_tolerance_m=position_tolerance_m,
+        )
         terminal_clearance = -float(np.dot(down, actual_target[:3, 3] - plane_point))
-        if terminal_clearance < 0.05:
-            raise RuntimeError(
-                f"supported escape finishes only {terminal_clearance:.4f}m above the table plane"
-            )
         route_clearance, route_link, route_sample = _local_plane_clearance(
             planner,
             route_q,
@@ -1411,7 +2043,10 @@ def plan_supported_escape(
             )
         inbound = _reverse_trajectory(outbound)
         report(
-            f"CuRobo supported escape passed; G-frame plane clearance={terminal_clearance:.4f}m"
+            f"CuRobo supported escape passed; requested lift={request.supported_escape_m:.4f}m, "
+            f"achieved lift={achieved_escape_m:.4f}m, endpoint error={target_error_m:.4f}m "
+            f"(CuRobo tolerance={position_tolerance_m:.4f}m), "
+            f"G-frame plane clearance={terminal_clearance:.4f}m"
         )
         return SupportedEscapePlan(
             request_sha256=request.content_sha256,
@@ -1429,6 +2064,10 @@ def plan_supported_escape(
                     "pose_planning": pose_planning_s,
                 },
                 "execution_maximum_arm_velocity_rad_s": (request.maximum_arm_velocity_rad_s),
+                "supported_escape_requested_m": request.supported_escape_m,
+                "supported_escape_achieved_m": achieved_escape_m,
+                "supported_escape_endpoint_error_m": target_error_m,
+                "curobo_position_tolerance_m": position_tolerance_m,
                 "policy": (
                     f"straight table-normal escape from {plane_source}; "
                     "no fabricated table box; "
@@ -1455,12 +2094,13 @@ def plan_supported_escape(
 def _snapshot_at_arm_q(
     request: TabletopTaskRequest, command_q: tuple[float, ...]
 ) -> RobotSnapshot:
-    q29 = np.asarray(request.observation.snapshot.measured_q29_rad).copy()
+    snapshot = request.planning_snapshot
+    q29 = np.asarray(snapshot.measured_q29_rad).copy()
     q29[np.asarray(arm_indices(request.arm))] = np.asarray(command_q)
     return RobotSnapshot(
         measured_q29_rad=tuple(q29),
-        left_dex3_q_rad=request.observation.snapshot.left_dex3_q_rad,
-        right_dex3_q_rad=request.observation.snapshot.right_dex3_q_rad,
+        left_dex3_q_rad=snapshot.left_dex3_q_rad,
+        right_dex3_q_rad=snapshot.right_dex3_q_rad,
     )
 
 
@@ -1523,7 +2163,7 @@ def _cspace_failure_reason(result) -> str:
     )
 
 
-def _plan_open_branch(
+def _plan_approach_trajectory(
     *,
     planner,
     device_cfg,
@@ -1531,16 +2171,10 @@ def _plan_open_branch(
     reference_command_q: np.ndarray,
     reference_model_q: np.ndarray,
     pregrasp_model_q: np.ndarray,
-    grasp_matrix: np.ndarray,
-    open_robot: dict[str, Any],
-    strict_checker: CuroboKinematicCollisionChecker,
     request: TabletopTaskRequest,
-    base_T_torso: np.ndarray,
-    plane_point: np.ndarray,
-    down: np.ndarray,
     arm: str,
-) -> _OpenBranchPlan:
-    """Plan and independently validate one exact open-hand IK branch."""
+) -> PlannedTrajectory:
+    """Plan one clearance-to-pregrasp IK branch without weakening validation."""
 
     pregrasp_state = _joint_state(device_cfg, pregrasp_model_q, arm_joint_names(arm))
     approach_result = planner.plan_cspace(
@@ -1569,8 +2203,147 @@ def _plan_open_branch(
         model_q_rad=reference_model_q,
     )
 
-    # Start the Cartesian segment at the trajectory's actual terminal state,
-    # rather than assuming the joint-space optimizer ended at bit-identical IK.
+    return approach
+
+
+def _validate_open_route(
+    *,
+    planner,
+    device_cfg,
+    route_q: np.ndarray,
+    open_robot: dict[str, Any],
+    strict_checker: CuroboKinematicCollisionChecker,
+    request: TabletopTaskRequest,
+    base_T_torso: np.ndarray,
+    plane_point: np.ndarray,
+    down: np.ndarray,
+    arm: str,
+    disabled_cube_links: set[str],
+) -> tuple[float, str, int]:
+    """Apply strict self, object, fixture, and table checks to an open-hand route."""
+
+    open_route_q = np.asarray(route_q, dtype=np.float64)
+    route_self_collisions = _self_collision_pair_penetrations(
+        robot=open_robot,
+        q_samples=open_route_q,
+        device_cfg=device_cfg,
+        checker=strict_checker,
+    )
+    for sample_index, pairs in enumerate(route_self_collisions):
+        if not pairs:
+            continue
+        pair, penetration = max(pairs.items(), key=lambda item: item[1])
+        raise _BranchRejected(
+            "open_route_strict_self_collision",
+            f"{pair[0]}/{pair[1]}={penetration * 1000.0:.3f}mm at sample {sample_index}",
+        )
+
+    cube_scene = _base_scene(request, base_T_torso, include_cube=True)
+    route_cube_clearances = _world_cuboid_clearances(
+        robot=open_robot,
+        q_samples=open_route_q,
+        scene=cube_scene,
+        device_cfg=device_cfg,
+        disabled_links=disabled_cube_links,
+        checker=strict_checker,
+    )
+    for sample_index, clearances in enumerate(route_cube_clearances):
+        if not clearances:
+            continue
+        (link_name, object_name), clearance = min(clearances.items(), key=lambda item: item[1])
+        raise _BranchRejected(
+            "open_route_strict_cube_collision",
+            f"{link_name}/{object_name}={clearance * 1000.0:+.3f}mm "
+            f"clearance at sample {sample_index}",
+        )
+
+    open_clearance, open_link, open_sample = _local_plane_clearance(
+        planner,
+        open_route_q,
+        arm=arm,
+        plane_point=plane_point,
+        down=down,
+        include_payload=False,
+    )
+    if open_clearance < request.minimum_hand_plane_clearance_m:
+        raise _BranchRejected(
+            "open_route_table_plane",
+            f"clearance={open_clearance:.4f}m at {open_link} sample {open_sample}; "
+            f"required={request.minimum_hand_plane_clearance_m:.4f}m",
+        )
+    return open_clearance, open_link, open_sample
+
+
+def _validate_open_route_segments(
+    *,
+    planner,
+    device_cfg,
+    transit_q: np.ndarray,
+    grasp_q: np.ndarray,
+    open_robot: dict[str, Any],
+    strict_checker: CuroboKinematicCollisionChecker,
+    request: TabletopTaskRequest,
+    base_T_torso: np.ndarray,
+    plane_point: np.ndarray,
+    down: np.ndarray,
+    arm: str,
+) -> tuple[float, str, int]:
+    """Keep grasp-contact exceptions out of clearance-to-pregrasp transit."""
+
+    transit = np.asarray(transit_q, dtype=np.float64)
+    grasp = np.asarray(grasp_q, dtype=np.float64)
+    segments = (
+        (transit, set(), 0),
+        (grasp, set(_contact_links(arm)), len(transit) - 1),
+    )
+    clearances: list[tuple[float, str, int]] = []
+    for route, disabled_cube_links, sample_offset in segments:
+        clearance, link, sample = _validate_open_route(
+            planner=planner,
+            device_cfg=device_cfg,
+            route_q=route,
+            open_robot=open_robot,
+            strict_checker=strict_checker,
+            request=request,
+            base_T_torso=base_T_torso,
+            plane_point=plane_point,
+            down=down,
+            arm=arm,
+            disabled_cube_links=disabled_cube_links,
+        )
+        clearances.append((clearance, link, sample + sample_offset))
+    return min(clearances, key=lambda value: value[0])
+
+
+def _plan_open_branch(
+    *,
+    planner,
+    device_cfg,
+    state,
+    reference_command_q: np.ndarray,
+    reference_model_q: np.ndarray,
+    pregrasp_model_q: np.ndarray,
+    grasp_matrix: np.ndarray,
+    open_robot: dict[str, Any],
+    strict_checker: CuroboKinematicCollisionChecker,
+    request: TabletopTaskRequest,
+    base_T_torso: np.ndarray,
+    plane_point: np.ndarray,
+    down: np.ndarray,
+    arm: str,
+) -> _OpenBranchPlan:
+    """Plan and independently validate one exact open-hand IK branch."""
+
+    approach = _plan_approach_trajectory(
+        planner=planner,
+        device_cfg=device_cfg,
+        state=state,
+        reference_command_q=reference_command_q,
+        reference_model_q=reference_model_q,
+        pregrasp_model_q=pregrasp_model_q,
+        request=request,
+        arm=arm,
+    )
     actual_pregrasp_model_q = np.asarray(approach.model_q_rad[-1], dtype=np.float64)
     actual_pregrasp_state = _joint_state(device_cfg, actual_pregrasp_model_q, arm_joint_names(arm))
     grasp_goal = _goalset([grasp_matrix], device_cfg, arm=arm)
@@ -1609,58 +2382,21 @@ def _plan_open_branch(
         model_q_rad=actual_pregrasp_model_q,
     )
 
-    open_route_q = np.concatenate(
-        (np.asarray(approach.model_q_rad), np.asarray(grasp.model_q_rad)[1:]),
-        axis=0,
-    )
-    route_self_collisions = _self_collision_pair_penetrations(
-        robot=open_robot,
-        q_samples=open_route_q,
+    # Fingertip/cube contact is intentional only on the final straight grasp
+    # segment. The clearance-to-pregrasp transit must retain every cube link.
+    open_clearance, open_link, open_sample = _validate_open_route_segments(
+        planner=planner,
         device_cfg=device_cfg,
-        checker=strict_checker,
-    )
-    for sample_index, pairs in enumerate(route_self_collisions):
-        if not pairs:
-            continue
-        pair, penetration = max(pairs.items(), key=lambda item: item[1])
-        raise _BranchRejected(
-            "open_route_strict_self_collision",
-            f"{pair[0]}/{pair[1]}={penetration * 1000.0:.3f}mm at sample {sample_index}",
-        )
-
-    cube_scene = _base_scene(request, base_T_torso, include_cube=True)
-    route_cube_clearances = _world_cuboid_clearances(
-        robot=open_robot,
-        q_samples=open_route_q,
-        scene=cube_scene,
-        device_cfg=device_cfg,
-        disabled_links=set(_contact_links(arm)),
-        checker=strict_checker,
-    )
-    for sample_index, clearances in enumerate(route_cube_clearances):
-        if not clearances:
-            continue
-        (link_name, object_name), clearance = min(clearances.items(), key=lambda item: item[1])
-        raise _BranchRejected(
-            "open_route_strict_cube_collision",
-            f"{link_name}/{object_name}={clearance * 1000.0:+.3f}mm "
-            f"clearance at sample {sample_index}",
-        )
-
-    open_clearance, open_link, open_sample = _local_plane_clearance(
-        planner,
-        open_route_q,
-        arm=arm,
+        transit_q=np.asarray(approach.model_q_rad),
+        grasp_q=np.asarray(grasp.model_q_rad),
+        open_robot=open_robot,
+        strict_checker=strict_checker,
+        request=request,
+        base_T_torso=base_T_torso,
         plane_point=plane_point,
         down=down,
-        include_payload=False,
+        arm=arm,
     )
-    if open_clearance < request.minimum_hand_plane_clearance_m:
-        raise _BranchRejected(
-            "open_route_table_plane",
-            f"clearance={open_clearance:.4f}m at {open_link} sample {open_sample}; "
-            f"required={request.minimum_hand_plane_clearance_m:.4f}m",
-        )
     return _OpenBranchPlan(
         approach=approach,
         grasp=grasp,
@@ -1681,6 +2417,7 @@ def _plan_attached_lift(
     plane_point: np.ndarray,
     down: np.ndarray,
     arm: str,
+    fixed_close_validator: _FixedCloseSweepValidator,
 ) -> _LiftBranchPlan:
     """Plan with the descriptor close target; live measured fingers are rechecked later."""
 
@@ -1694,7 +2431,7 @@ def _plan_attached_lift(
             active_finger_q_rad=tuple(close_target_q),
         )
         _use_moving_grasp_frame_only(close_target_robot, arm=arm)
-        attached_scene = _base_scene(request, base_T_torso, include_cube=False)
+        attached_scene = _attached_lift_scene(request, base_T_torso)
         planner, device_cfg = _planner(
             close_target_robot,
             attached_scene,
@@ -1749,6 +2486,7 @@ def _plan_attached_lift(
             model_q_rad=contact_model_q,
         )
         lift_q = np.asarray(lift.model_q_rad)
+        fixed_close_validator.validate_closed_lift_fixture(lift_q)
         from curobo.types import JointState
 
         lift_state = JointState.from_position(
@@ -1768,26 +2506,48 @@ def _plan_attached_lift(
         if len(split_candidates) == 0:
             raise _BranchRejected(
                 "retention_test_lift",
-                "planned payload route never reaches the configured retention-test height",
+                "planned payload route never reaches the configured retention-checkpoint height",
             )
         split_index = int(split_candidates[0])
         if split_index <= 0 or split_index >= len(lift_q) - 1:
             raise _BranchRejected(
                 "retention_test_lift",
-                f"retention-test boundary falls at unusable sample {split_index}/{len(lift_q) - 1}",
+                "retention-checkpoint boundary falls at unusable sample "
+                f"{split_index}/{len(lift_q) - 1}",
             )
         retention_test_lift, remaining_lift = _split_lift_trajectory(
             lift,
             split_index=split_index,
         )
-        hand_clearance, hand_link, hand_sample = _local_plane_clearance(
-            planner,
-            lift_q,
-            arm=arm,
-            plane_point=plane_point,
-            down=down,
-            include_payload=False,
-        )
+        if request.fixture is None:
+            evidence = selected["execution_evidence"]
+            exact_link = str(evidence["fixed_close_sweep_minimum_link"])
+            if arm == "left":
+                exact_link = exact_link.replace("right_", "left_", 1)
+            exact = (
+                float(evidence["fixed_close_sweep_table_clearance_m"]),
+                exact_link,
+                int(evidence["fixed_close_sweep_minimum_sample"]),
+            )
+            wrist = _local_plane_clearance(
+                planner,
+                lift_q,
+                arm=arm,
+                plane_point=plane_point,
+                down=down,
+                include_payload=False,
+                link_names=_local_wrist_plane_links(arm),
+            )
+            hand_clearance, hand_link, hand_sample = min(exact, wrist, key=lambda item: item[0])
+        else:
+            hand_clearance, hand_link, hand_sample = _local_plane_clearance(
+                planner,
+                lift_q,
+                arm=arm,
+                plane_point=plane_point,
+                down=down,
+                include_payload=False,
+            )
         if hand_clearance < request.minimum_hand_plane_clearance_m:
             raise _BranchRejected(
                 "closed_lift_table_plane",
@@ -1856,7 +2616,7 @@ def _payload_route(task: TabletopTaskPlan) -> np.ndarray:
 
 
 class RetentionRouteValidator:
-    """Cached FK/collision checker for one frozen task's measured contact pose."""
+    """Cached FK/collision checker for one frozen task's measured close pose."""
 
     def __init__(self, tabletop: TabletopTaskRequest, task: TabletopTaskPlan) -> None:
         import torch
@@ -1873,7 +2633,7 @@ class RetentionRouteValidator:
         started = time.monotonic()
         robot, self.active_joint_names, reference = build_tabletop_route_validation_robot_config(
             arm=self.arm,
-            snapshot=tabletop.observation.snapshot,
+            snapshot=tabletop.planning_snapshot,
             joint_position_offsets_rad=tabletop.joint_position_offsets_rad,
         )
         self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
@@ -1891,10 +2651,11 @@ class RetentionRouteValidator:
             tabletop,
             base_T_torso,
         )
-        self.fixture_mesh = _fixture_collision_mesh(
+        self.fixture_checker = _fixture_collision_checker(
             tabletop,
             base_T_object,
             self.down,
+            device_cfg=self.device_cfg,
         )
         self.cache_build_s = time.monotonic() - started
 
@@ -1924,17 +2685,15 @@ class RetentionRouteValidator:
                 continue
             pair, penetration = max(pairs.items(), key=lambda item: item[1])
             raise RuntimeError(
-                "measured stalled Dex3 posture invalidates the frozen payload route: "
+                "measured close Dex3 posture invalidates the frozen payload route: "
                 f"{pair[0]}/{pair[1]}={penetration * 1000.0:.3f}mm penetration "
                 f"at sample {sample_index}/{len(route_q) - 1}"
             )
-        spheres = (
-            self.checker.robot_spheres(route_q, joint_names=self.active_joint_names)
-            .detach()
-            .cpu()
-            .numpy()
-            .reshape(len(route_q), -1, 4)
+        sphere_tensor = self.checker.robot_spheres(
+            route_q,
+            joint_names=self.active_joint_names,
         )
+        spheres = sphere_tensor.detach().cpu().numpy().reshape(len(route_q), -1, 4)
         hand_clearance, hand_link, hand_sample = _local_plane_clearance_from_spheres(
             spheres,
             config=self.checker.config.kinematics_config,
@@ -1945,34 +2704,32 @@ class RetentionRouteValidator:
         )
         if hand_clearance < self.tabletop.minimum_hand_plane_clearance_m:
             raise RuntimeError(
-                "measured stalled Dex3 posture leaves insufficient hand/table execution "
+                "measured close Dex3 posture leaves insufficient hand/table execution "
                 f"margin: clearance={hand_clearance:.4f}m at {hand_link} sample "
                 f"{hand_sample}/{len(route_q) - 1}; required="
                 f"{self.tabletop.minimum_hand_plane_clearance_m:.4f}m"
             )
-        fixture_clearance = fixture_link = fixture_sample = None
-        if self.fixture_mesh is not None:
-            fixture_clearance, fixture_link, fixture_sample = _fixture_clearance_from_spheres(
-                spheres,
-                config=self.checker.config.kinematics_config,
-                fixture_mesh=self.fixture_mesh,
+        if self.fixture_checker is not None:
+            fixture_hit = self.fixture_checker.first_collision(
+                sphere_tensor,
+                kinematics_config=self.checker.config.kinematics_config,
             )
-            if fixture_clearance < 0.0:
+            if fixture_hit is not None:
+                penetration, fixture_link, fixture_sample = fixture_hit
                 raise RuntimeError(
-                    "measured stalled Dex3 posture invalidates the frozen payload route "
+                    "measured close Dex3 posture invalidates the frozen payload route "
                     f"against the presentation fixture: {fixture_link} has "
-                    f"{fixture_clearance * 1000.0:.3f}mm clearance at sample "
+                    f"{penetration * 1000.0:.3f}mm penetration at sample "
                     f"{fixture_sample}/{len(route_q) - 1}"
                 )
-        fixture_report = (
-            ""
-            if fixture_clearance is None
-            else f" and fixture clearance={fixture_clearance:.4f}m at {fixture_link}"
-        )
         report(
-            "measured stalled-hand retention route passed strict self-collision and "
+            "measured close-hand retention route passed strict self-collision and "
             f"table-plane checks; minimum hand clearance={hand_clearance:.4f}m"
-            f"{fixture_report}"
+            + (
+                " and CUDA fixture collision check passed"
+                if self.fixture_checker is not None
+                else ""
+            )
         )
         return RetentionRouteValidationResult(
             request_sha256=request.content_sha256,
@@ -1982,9 +2739,9 @@ class RetentionRouteValidator:
             minimum_hand_plane_clearance_m=hand_clearance,
             minimum_hand_plane_link=hand_link,
             minimum_hand_plane_sample=hand_sample,
-            minimum_fixture_clearance_m=fixture_clearance,
-            minimum_fixture_clearance_link=fixture_link,
-            minimum_fixture_clearance_sample=fixture_sample,
+            minimum_fixture_clearance_m=None,
+            minimum_fixture_clearance_link=None,
+            minimum_fixture_clearance_sample=None,
             planner_provenance={
                 **model_source_hashes(),
                 "curobo_commit": CUROBO_COMMIT,
@@ -1993,13 +2750,16 @@ class RetentionRouteValidator:
                 "cache_build_s": self.cache_build_s,
                 "required_hand_plane_clearance_m": (self.tabletop.minimum_hand_plane_clearance_m),
                 "policy": (
-                    "frozen split payload arm route; measured contact-stalled active Dex3; "
+                    "frozen split payload arm route; measured stable-close active Dex3; "
                     "strict full-robot self-collision, selected wrist/hand table plane, "
                     "and optional exact presenter mesh"
                 ),
                 "presentation_id": self.tabletop.presentation_id,
-                "fixture_mesh_rechecked": self.fixture_mesh is not None,
+                "fixture_mesh_rechecked_on_cuda": self.fixture_checker is not None,
                 "blocked_motor_ids": list(request.blocked_motor_ids),
+                "retention_evidence_policy": (
+                    "commissioned_empty_close_opposed_joint_obstruction"
+                ),
                 "pressure_used_for_live_decision": False,
             },
         )
@@ -2016,20 +2776,34 @@ def validate_retention_route(
     return validator.validate(request, progress=progress)
 
 
-def plan_tabletop_task(
+def _plan_tabletop(
     request: TabletopTaskRequest,
     *,
+    required_candidate_id: str | None = None,
+    pregrasp_only: bool,
+    open_planner_cache: ReusableOpenPlanner | None = None,
     progress: Callable[[str], None] | None = None,
-) -> TabletopTaskPlan:
-    """Plan a complete task while preserving alternate arm IK branches."""
+) -> TabletopTaskPlan | TabletopPregraspPlan:
+    """Plan either the first boundary route or one complete task."""
 
     report = progress or (lambda _message: None)
     arm = request.arm
     shortlist, candidates = _load_shortlist(request)
+    if required_candidate_id is not None:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("candidate_id")) == required_candidate_id
+        ]
+        if len(candidates) != 1:
+            raise ValueError(
+                f"required grasp candidate {required_candidate_id!r} is not uniquely present"
+            )
+        report(f"preserving previously selected grasp {required_candidate_id}")
     open_profile, close_target_profile = dex3_execution_profile(arm)
     open_q = np.asarray(open_profile, dtype=np.float64)
     close_target_q = np.asarray(close_target_profile, dtype=np.float64)
-    reference = np.asarray(request.observation.snapshot.measured_q29_rad)[
+    reference = np.asarray(request.planning_snapshot.measured_q29_rad)[
         np.asarray(arm_indices(arm))
     ]
     # Model-space reference includes removable calibration joint offsets.
@@ -2044,8 +2818,14 @@ def plan_tabletop_task(
     strict_model_resolution_s = 0.0
     optimizer_model_clone_s = 0.0
     open_optimizer_setup_s = 0.0
-    goalset_ik_s = 0.0
+    open_optimizer_reconfiguration_s = 0.0
+    open_optimizer_reused = False
+    open_optimizer_topology_rebuilt = False
+    batched_ik_setup_s = 0.0
+    batched_ik_s = 0.0
+    batched_fixed_close_s = 0.0
     endpoint_precheck_s = 0.0
+    fixed_close_sweep_validation_s = 0.0
     open_branch_planning_s = 0.0
     attached_lift_planning_s = 0.0
     try:
@@ -2054,7 +2834,7 @@ def plan_tabletop_task(
 
         query_robot, _ = build_tabletop_robot_config(
             arm=arm,
-            snapshot=request.observation.snapshot,
+            snapshot=request.planning_snapshot,
             joint_position_offsets_rad=request.joint_position_offsets_rad,
             active_finger_q_rad=tuple(open_q),
         )
@@ -2074,15 +2854,49 @@ def plan_tabletop_task(
         base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
 
         plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
+        fixed_close_validator = _FixedCloseSweepValidator(
+            request=request,
+            base_T_object=base_T_object,
+            plane_point=plane_point,
+            down=down,
+            open_q=open_q,
+            close_target_q=close_target_q,
+        )
         grasp_matrices = [base_T_object @ _candidate_transform(item) for item in candidates]
         approach_distance_m = float(shortlist["execution_contract"]["approach_distance_m"])
-        remaining_indices = list(range(len(candidates)))
         branch_rejections: list[dict[str, Any]] = []
+        stage_started = time.monotonic()
+        candidate_rejections = fixed_close_validator.batch_candidate_rejections(grasp_matrices)
+        batched_fixed_close_s = time.monotonic() - stage_started
+        remaining_indices = [
+            index for index in range(len(candidates)) if index not in candidate_rejections
+        ]
+        for index, (stage, reason) in candidate_rejections.items():
+            branch_rejections.append(
+                {
+                    "candidate_id": str(candidates[index]["candidate_id"]),
+                    "stage": stage,
+                    "reason": reason,
+                }
+            )
+        if candidate_rejections:
+            report(
+                "batched fixed-close GPU pruning removed "
+                f"{len(candidate_rejections)}/{len(candidates)} candidates; "
+                f"{len(remaining_indices)} remain for arm IK"
+            )
+        if not remaining_indices:
+            raise RuntimeError(
+                "every qualified grasp collides with the presentation fixture or table "
+                f"during the fixed descriptor close sweep: {branch_rejections}"
+            )
         selected: dict[str, Any] | None = None
         selected_branch: _PregraspBranch | None = None
         selected_round = 0
+        approach_plan: _ApproachBranchPlan | None = None
         open_plan: _OpenBranchPlan | None = None
         lift_plan: _LiftBranchPlan | None = None
+        fixed_close_sweep_plan: _FixedCloseSweepResult | None = None
         branch_attempt_count = 0
         search_round = 0
         open_robot = query_robot
@@ -2112,21 +2926,36 @@ def plan_tabletop_task(
             pregrasp_matrices = [
                 _pregrasp_matrix(matrix, approach_distance_m) for matrix in subset_matrices
             ]
-            current_candidate_count = len(subset_candidates)
 
             def create_open_planner(
                 current_transit_robot=resolved_transit_robot,
                 current_scene=scene,
-                candidate_count=current_candidate_count,
             ):
-                nonlocal open_optimizer_setup_s
+                nonlocal open_optimizer_reconfiguration_s
+                nonlocal open_optimizer_reused, open_optimizer_setup_s
+                nonlocal open_optimizer_topology_rebuilt
                 setup_started = time.monotonic()
-                current_planner, current_device = _planner(
-                    current_transit_robot,
-                    current_scene,
-                    max_goalset=candidate_count,
-                    seed=request.random_seed,
-                )
+                if open_planner_cache is None:
+                    current_planner, current_device = _planner(
+                        current_transit_robot,
+                        current_scene,
+                        max_goalset=1,
+                        seed=request.random_seed,
+                    )
+                    cache_event = None
+                else:
+                    current_planner, current_device, cache_event = open_planner_cache.acquire(
+                        current_transit_robot,
+                        current_scene,
+                        seed=request.random_seed,
+                        configuration_key=request.content_sha256,
+                    )
+                    open_optimizer_reused = open_optimizer_reused or bool(cache_event["reused"])
+                    open_optimizer_topology_rebuilt = open_optimizer_topology_rebuilt or bool(
+                        cache_event["topology_rebuilt"]
+                    )
+                    if cache_event["reused"]:
+                        open_optimizer_reconfiguration_s += float(cache_event["elapsed_s"])
                 open_optimizer_setup_s += time.monotonic() - setup_started
                 current_state = _joint_state(
                     current_device,
@@ -2135,43 +2964,88 @@ def plan_tabletop_task(
                 )
                 return current_planner, current_device, current_state
 
-            planner, device_cfg, state = create_open_planner()
-            pregrasp_goals = _goalset(pregrasp_matrices, device_cfg, arm=arm)
             stage_started = time.monotonic()
-            branches = _enumerate_pregrasp_branches(planner, pregrasp_goals, state)
-            goalset_ik_s += time.monotonic() - stage_started
-            if not branches:
-                diagnostic = _goalset_ik_failure_diagnostic(
-                    planner=planner,
-                    robot=transit_robot,
-                    scene=scene,
-                    goals=pregrasp_goals,
-                    state=state,
-                    candidates=subset_candidates,
-                    remaining=list(range(len(subset_candidates))),
-                    device_cfg=device_cfg,
-                    arm=arm,
-                    disabled_collision_links=set(),
+            ik_solver = _batched_pregrasp_ik_solver(
+                resolved_transit_robot,
+                scene,
+                candidate_count=len(subset_candidates),
+                seed=request.random_seed,
+                device_cfg=device_cfg,
+            )
+            batched_ik_setup_s += time.monotonic() - stage_started
+            pregrasp_goals = _batched_pose_goals(pregrasp_matrices, device_cfg, arm=arm)
+            stage_started = time.monotonic()
+            try:
+                branches, ik_result = _enumerate_pregrasp_branches(
+                    ik_solver,
+                    pregrasp_goals,
+                    state,
+                    candidate_count=len(subset_candidates),
                 )
+                batched_ik_s += time.monotonic() - stage_started
+                diagnostic = (
+                    None
+                    if branches
+                    else _batched_ik_failure_diagnostic(
+                        result=ik_result,
+                        robot=transit_robot,
+                        scene=scene,
+                        candidates=subset_candidates,
+                        device_cfg=device_cfg,
+                        disabled_collision_links=set(),
+                    )
+                )
+            finally:
+                _cleanup(ik_solver)
+            if not branches:
                 raise RuntimeError(
                     "no collision-valid pregrasp IK branch remains for the qualified "
                     f"candidates; prior branch rejections={branch_rejections}; {diagnostic}"
                 )
-            represented_local_indices = sorted({branch.goalset_local_index for branch in branches})
+            ik_branch_counts = {
+                local_index: sum(
+                    branch.candidate_local_index == local_index for branch in branches
+                )
+                for local_index in range(len(subset_candidates))
+            }
             stage_started = time.monotonic()
             endpoint_collision_reasons = _pregrasp_endpoint_self_collision_reasons(
                 branches,
                 checker=strict_open_checker,
             )
             endpoint_precheck_s += time.monotonic() - stage_started
-            endpoint_collision_by_seed = {
-                branch.solver_seed_index: reason
-                for branch, reason in zip(branches, endpoint_collision_reasons, strict=True)
+            surviving_branches: list[_PregraspBranch] = []
+            endpoint_pruned = 0
+            for branch, reason in zip(branches, endpoint_collision_reasons, strict=True):
+                if reason is None:
+                    surviving_branches.append(branch)
+                    continue
+                endpoint_pruned += 1
+                branch_rejections.append(
+                    {
+                        "candidate_id": candidate_ids[branch.candidate_local_index],
+                        "solver_seed_index": branch.solver_seed_index,
+                        "stage": "pregrasp_endpoint_strict_self_collision",
+                        "reason": reason,
+                    }
+                )
+            branches = surviving_branches
+            branch_counts = {
+                local_index: sum(
+                    branch.candidate_local_index == local_index for branch in branches
+                )
+                for local_index in range(len(subset_candidates))
             }
+            counts_text = ", ".join(
+                f"{candidate_ids[index]}={ik_branch_counts[index]}"
+                for index in range(len(candidate_ids))
+            )
             report(
-                f"CuRobo pregrasp IK round {search_round}: {len(branches)}/{IK_SEEDS} "
-                f"collision-valid branches across {len(represented_local_indices)} "
-                f"of {len(subset_candidates)} remaining candidates"
+                f"CuRobo independent batched pregrasp IK: {len(branches)} unique "
+                "strict-endpoint-valid branches after pruning "
+                f"{endpoint_pruned} branches in one GPU pass; "
+                f"{len(subset_candidates)} candidates with {IK_SEEDS} dedicated seeds "
+                f"each produced: {counts_text}"
             )
 
             def attempt_branch(
@@ -2180,17 +3054,18 @@ def plan_tabletop_task(
                 current_matrices=subset_matrices,
                 current_open_robot=open_robot,
                 current_strict_checker=strict_open_checker,
-                current_endpoint_collisions=endpoint_collision_by_seed,
-            ) -> tuple[_OpenBranchPlan, _LiftBranchPlan]:
+            ) -> (
+                _ApproachBranchPlan
+                | tuple[
+                    _OpenBranchPlan,
+                    _LiftBranchPlan,
+                    _FixedCloseSweepResult,
+                ]
+            ):
                 nonlocal planner, device_cfg, state, branch_attempt_count
+                nonlocal fixed_close_sweep_validation_s
                 nonlocal open_branch_planning_s, attached_lift_planning_s
                 branch_attempt_count += 1
-                endpoint_collision = current_endpoint_collisions[branch.solver_seed_index]
-                if endpoint_collision is not None:
-                    raise _BranchRejected(
-                        "pregrasp_endpoint_strict_self_collision",
-                        endpoint_collision,
-                    )
                 if planner is None:
                     planner, device_cfg, state = create_open_planner()
                 branch_start_state = _fresh_branch_start_state(
@@ -2198,9 +3073,44 @@ def plan_tabletop_task(
                     reference_model,
                     arm=arm,
                 )
-                selected_local = branch.goalset_local_index
+                selected_local = branch.candidate_local_index
                 candidate = current_candidates[selected_local]
                 branch_started = time.monotonic()
+                if pregrasp_only:
+                    try:
+                        open_validation = _plan_open_branch(
+                            planner=planner,
+                            device_cfg=device_cfg,
+                            state=branch_start_state,
+                            reference_command_q=reference,
+                            reference_model_q=reference_model,
+                            pregrasp_model_q=branch.model_q_rad,
+                            grasp_matrix=current_matrices[selected_local],
+                            open_robot=current_open_robot,
+                            strict_checker=current_strict_checker,
+                            request=request,
+                            base_T_torso=base_T_torso,
+                            plane_point=plane_point,
+                            down=down,
+                            arm=arm,
+                        )
+                    finally:
+                        open_branch_planning_s += time.monotonic() - branch_started
+                    sweep_started = time.monotonic()
+                    try:
+                        fixed_close_sweep = fixed_close_validator.validate(
+                            np.asarray(open_validation.grasp.model_q_rad[-1]),
+                            candidate,
+                        )
+                    finally:
+                        fixed_close_sweep_validation_s += time.monotonic() - sweep_started
+                    return _ApproachBranchPlan(
+                        approach=open_validation.approach,
+                        minimum_plane_clearance_m=(open_validation.minimum_plane_clearance_m),
+                        minimum_plane_link=open_validation.minimum_plane_link,
+                        minimum_plane_sample=open_validation.minimum_plane_sample,
+                        fixed_close_sweep=fixed_close_sweep,
+                    )
                 try:
                     branch_open = _plan_open_branch(
                         planner=planner,
@@ -2220,7 +3130,16 @@ def plan_tabletop_task(
                     )
                 finally:
                     open_branch_planning_s += time.monotonic() - branch_started
-                _cleanup(planner)
+                sweep_started = time.monotonic()
+                try:
+                    branch_fixed_close_sweep = fixed_close_validator.validate(
+                        np.asarray(branch_open.grasp.model_q_rad[-1]),
+                        candidate,
+                    )
+                finally:
+                    fixed_close_sweep_validation_s += time.monotonic() - sweep_started
+                if open_planner_cache is None:
+                    _cleanup(planner)
                 planner = None
                 lift_started = time.monotonic()
                 try:
@@ -2234,10 +3153,11 @@ def plan_tabletop_task(
                         plane_point=plane_point,
                         down=down,
                         arm=arm,
+                        fixed_close_validator=fixed_close_validator,
                     )
                 finally:
                     attached_lift_planning_s += time.monotonic() - lift_started
-                return branch_open, branch_lift
+                return branch_open, branch_lift, branch_fixed_close_sweep
 
             branch, complete, failures = _try_branch_pool(
                 branches,
@@ -2247,29 +3167,164 @@ def plan_tabletop_task(
             )
             branch_rejections.extend(failures)
             if branch is not None and complete is not None:
-                selected = subset_candidates[branch.goalset_local_index]
+                selected = subset_candidates[branch.candidate_local_index]
                 selected_branch = branch
                 selected_round = search_round
-                open_plan, lift_plan = complete
+                if pregrasp_only:
+                    if not isinstance(complete, _ApproachBranchPlan):
+                        raise RuntimeError("pregrasp search returned an invalid branch result")
+                    approach_plan = complete
+                else:
+                    if not isinstance(complete, tuple):
+                        raise RuntimeError("task search returned an invalid branch result")
+                    open_plan, lift_plan, fixed_close_sweep_plan = complete
                 break
 
-            _cleanup(planner)
+            if open_planner_cache is None:
+                _cleanup(planner)
             planner = None
-            for local_index in represented_local_indices:
+            for local_index in range(len(subset_candidates)):
                 global_index = subset_indices[local_index]
                 candidate_id = str(candidates[global_index]["candidate_id"])
-                count = sum(branch.goalset_local_index == local_index for branch in branches)
+                count = ik_branch_counts[local_index]
+                if count == 0:
+                    branch_rejections.append(
+                        {
+                            "candidate_id": candidate_id,
+                            "stage": "batched_pregrasp_ik",
+                            "reason": (
+                                f"0 unique collision-valid solutions from {IK_SEEDS} "
+                                "dedicated seeds"
+                            ),
+                        }
+                    )
                 remaining_indices.remove(global_index)
                 report(
-                    f"exhausted all {count} returned IK branches for {candidate_id}; "
-                    "only now removing that grasp candidate"
+                    f"exhausted all {count} unique branches from {IK_SEEDS} dedicated "
+                    f"IK seeds for {candidate_id}"
                 )
 
-        if selected is None or selected_branch is None or open_plan is None or lift_plan is None:
+        if selected is None or selected_branch is None:
             raise RuntimeError(
-                "all qualified cube grasp IK branches failed complete-path validation: "
+                "all qualified cube grasp IK branches failed route validation: "
                 f"{branch_rejections}"
             )
+
+        if pregrasp_only:
+            if approach_plan is None:
+                raise RuntimeError("pregrasp search ended without a selected route")
+            object_T_grasp = _candidate_transform(selected)
+            inbound = _reverse_trajectory(approach_plan.approach)
+            inbound = PlannedTrajectory(
+                from_pose_id="move_to_pregrasp",
+                to_pose_id="return_to_clearance",
+                sample_time_s=inbound.sample_time_s,
+                command_q_rad=inbound.command_q_rad,
+                model_q_rad=inbound.model_q_rad,
+                planning_time_s=0.0,
+            )
+            report(
+                f"selected {selected['candidate_id']}; planned only the reversible "
+                "clearance-to-pregrasp boundary route"
+            )
+            return TabletopPregraspPlan(
+                request_sha256=request.content_sha256,
+                arm=arm,
+                selected_candidate_id=str(selected["candidate_id"]),
+                object_T_grasp=tuple(
+                    tuple(float(value) for value in row) for row in object_T_grasp
+                ),
+                open_active_dex3_q_rad=tuple(open_q),
+                outbound=approach_plan.approach,
+                inbound=inbound,
+                planner_provenance={
+                    **model_source_hashes(),
+                    "curobo_commit": CUROBO_COMMIT,
+                    "arm": arm,
+                    "presentation_id": request.presentation_id,
+                    "fixture": None if request.fixture is None else request.fixture.to_dict(),
+                    "elapsed_s": time.monotonic() - started,
+                    "stage_timings_s": {
+                        "strict_model_resolution": strict_model_resolution_s,
+                        "optimizer_model_clone": optimizer_model_clone_s,
+                        "open_optimizer_setup": open_optimizer_setup_s,
+                        "open_optimizer_reconfiguration": (open_optimizer_reconfiguration_s),
+                        "independent_batched_ik_setup": batched_ik_setup_s,
+                        "independent_batched_ik": batched_ik_s,
+                        "batched_fixed_close_candidate_pruning": (batched_fixed_close_s),
+                        "strict_pregrasp_endpoint_check": endpoint_precheck_s,
+                        "fixed_close_sweep_model_resolution": (
+                            fixed_close_validator.cache_build_s
+                        ),
+                        "fixed_close_sweep_validation": (fixed_close_sweep_validation_s),
+                        "pregrasp_route_planning_and_validation": open_branch_planning_s,
+                    },
+                    "grasp_shortlist_sha256": request.grasp_shortlist_sha256,
+                    "candidate_count": len(candidates),
+                    "candidate_count_after_fixed_close_pruning": len(remaining_indices),
+                    "execution_maximum_arm_velocity_rad_s": (request.maximum_arm_velocity_rad_s),
+                    "selection_policy": (
+                        "independent_batched_curobo_pregrasp_ik_with_strict_"
+                        "clearance_to_pregrasp_grasp_approach_and_fixed_close_"
+                        "sweep_validation"
+                    ),
+                    "pregrasp_ik_batches": selected_round,
+                    "pregrasp_ik_seeds_per_candidate": IK_SEEDS,
+                    "pregrasp_ik_duplicate_tolerance_rad": (IK_BRANCH_DUPLICATE_TOLERANCE_RAD),
+                    "pregrasp_ik_unique_branches_by_candidate": {
+                        candidate_ids[index]: branch_counts[index]
+                        for index in range(len(candidate_ids))
+                    },
+                    "pregrasp_ik_branches_tested": branch_attempt_count,
+                    "selected_pregrasp_solver_seed_index": selected_branch.solver_seed_index,
+                    "selected_pregrasp_position_error_m": selected_branch.position_error_m,
+                    "selected_pregrasp_rotation_error_rad": selected_branch.rotation_error_rad,
+                    "rejected_grasp_branches": branch_rejections,
+                    "open_hand_minimum_plane_clearance_m": (
+                        approach_plan.minimum_plane_clearance_m
+                    ),
+                    "open_hand_minimum_plane_clearance_link": (approach_plan.minimum_plane_link),
+                    "open_hand_minimum_plane_clearance_sample": (
+                        approach_plan.minimum_plane_sample
+                    ),
+                    "fixed_close_sweep_sample_count": (
+                        approach_plan.fixed_close_sweep.sample_count
+                    ),
+                    "fixed_close_sweep_maximum_joint_step_rad": (
+                        FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD
+                    ),
+                    "fixed_close_sweep_minimum_plane_clearance_m": (
+                        approach_plan.fixed_close_sweep.minimum_plane_clearance_m
+                    ),
+                    "fixed_close_sweep_minimum_plane_link": (
+                        approach_plan.fixed_close_sweep.minimum_plane_link
+                    ),
+                    "fixed_close_sweep_minimum_plane_sample": (
+                        approach_plan.fixed_close_sweep.minimum_plane_sample
+                    ),
+                    "fixed_close_sweep_minimum_fixture_clearance_m": (
+                        approach_plan.fixed_close_sweep.minimum_fixture_clearance_m
+                    ),
+                    "fixed_close_sweep_minimum_fixture_link": (
+                        approach_plan.fixed_close_sweep.minimum_fixture_link
+                    ),
+                    "fixed_close_sweep_minimum_fixture_sample": (
+                        approach_plan.fixed_close_sweep.minimum_fixture_sample
+                    ),
+                    "planning_scope": "clearance_to_pregrasp_only",
+                    "candidate_validation_scope": (
+                        "clearance_to_pregrasp checks every hand link against the cube; "
+                        "contact-tip exceptions apply only to the unexecuted linear grasp "
+                        "approach; the complete fixed descriptor close sweep is checked "
+                        "at contact; only the reversible pregrasp route is serialized"
+                    ),
+                    "open_optimizer_reused": open_optimizer_reused,
+                    "open_optimizer_topology_rebuilt": open_optimizer_topology_rebuilt,
+                },
+            )
+
+        if open_plan is None or lift_plan is None or fixed_close_sweep_plan is None:
+            raise RuntimeError("complete task search ended without a complete branch")
 
         approach = open_plan.approach
         grasp = open_plan.grasp
@@ -2321,9 +3376,9 @@ def plan_tabletop_task(
             open_active_dex3_q_rad=tuple(open_q),
             close_target_active_dex3_q_rad=tuple(close_target_q),
             initial_active_dex3_q_rad=(
-                request.observation.snapshot.left_dex3_q_rad
+                request.planning_snapshot.left_dex3_q_rad
                 if arm == "left"
-                else request.observation.snapshot.right_dex3_q_rad
+                else request.planning_snapshot.right_dex3_q_rad
             ),
             trajectories=(
                 approach,
@@ -2356,31 +3411,72 @@ def plan_tabletop_task(
                     "strict_model_resolution": strict_model_resolution_s,
                     "optimizer_model_clone": optimizer_model_clone_s,
                     "open_optimizer_setup": open_optimizer_setup_s,
-                    "goalset_ik": goalset_ik_s,
+                    "open_optimizer_reconfiguration": open_optimizer_reconfiguration_s,
+                    "independent_batched_ik_setup": batched_ik_setup_s,
+                    "independent_batched_ik": batched_ik_s,
+                    "batched_fixed_close_candidate_pruning": batched_fixed_close_s,
                     "strict_pregrasp_endpoint_check": endpoint_precheck_s,
+                    "fixed_close_sweep_model_resolution": (fixed_close_validator.cache_build_s),
+                    "fixed_close_sweep_validation": fixed_close_sweep_validation_s,
                     "open_branch_planning_and_validation": open_branch_planning_s,
                     "attached_lift_planning_and_validation": attached_lift_planning_s,
                 },
                 "grasp_shortlist_sha256": request.grasp_shortlist_sha256,
                 "candidate_count": len(candidates),
+                "candidate_count_after_fixed_close_pruning": len(remaining_indices),
+                "required_candidate_id": required_candidate_id,
                 "execution_maximum_arm_velocity_rad_s": (request.maximum_arm_velocity_rad_s),
                 "selection_policy": (
-                    "bounded_curobo_pregrasp_ik_branch_search_with_strict_endpoint_and_"
+                    "independent_batched_curobo_pregrasp_ik_with_strict_endpoint_and_"
                     "complete_lifecycle_validation"
                 ),
-                "pregrasp_ik_search_rounds": selected_round,
+                "pregrasp_ik_batches": selected_round,
+                "pregrasp_ik_seeds_per_candidate": IK_SEEDS,
+                "pregrasp_ik_duplicate_tolerance_rad": IK_BRANCH_DUPLICATE_TOLERANCE_RAD,
+                "pregrasp_ik_unique_branches_by_candidate": {
+                    candidate_ids[index]: branch_counts[index]
+                    for index in range(len(candidate_ids))
+                },
                 "pregrasp_ik_branches_tested": branch_attempt_count,
                 "selected_pregrasp_solver_seed_index": (selected_branch.solver_seed_index),
                 "selected_pregrasp_position_error_m": (selected_branch.position_error_m),
                 "selected_pregrasp_rotation_error_rad": (selected_branch.rotation_error_rad),
                 "rejected_grasp_branches": branch_rejections,
-                "qualification": "GraspGenX + Isaac/PhysX retained shortlist",
+                "qualification": (
+                    "GraspGenX pose + intrinsic retention + stationary-cube fixed-close "
+                    "exact-mesh table qualification"
+                ),
                 "finger_close_command_policy": (
                     "one descriptor-defined target for every grasp; physical contact limits "
                     "measured travel; candidate PhysX endpoints are qualification evidence only"
                 ),
+                "fixed_close_sweep_sample_count": fixed_close_sweep_plan.sample_count,
+                "fixed_close_sweep_maximum_joint_step_rad": (FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD),
+                "fixed_close_sweep_minimum_plane_clearance_m": (
+                    fixed_close_sweep_plan.minimum_plane_clearance_m
+                ),
+                "fixed_close_sweep_minimum_plane_link": (
+                    fixed_close_sweep_plan.minimum_plane_link
+                ),
+                "fixed_close_sweep_minimum_plane_sample": (
+                    fixed_close_sweep_plan.minimum_plane_sample
+                ),
+                "fixed_close_sweep_minimum_fixture_clearance_m": (
+                    fixed_close_sweep_plan.minimum_fixture_clearance_m
+                ),
+                "fixed_close_sweep_minimum_fixture_link": (
+                    fixed_close_sweep_plan.minimum_fixture_link
+                ),
+                "fixed_close_sweep_minimum_fixture_sample": (
+                    fixed_close_sweep_plan.minimum_fixture_sample
+                ),
                 "attachment_policy": (
                     "CuRobo AttachmentManager deterministic conservative 3x3x3 cuboid cover"
+                ),
+                "attached_payload_support_policy": (
+                    "cube/presentation-fixture contact is exempt only during the direct "
+                    "separation lift; the exact generated route is independently checked "
+                    "for every robot/fixture collision without the attached cube"
                 ),
                 "attachment_sphere_count": lift_plan.attachment_sphere_count,
                 "visual_policy": (
@@ -2413,7 +3509,50 @@ def plan_tabletop_task(
                 "retention_test_lift_requested_m": request.retention_test_lift_m,
                 "retention_test_lift_actual_m": (lift_plan.retention_test_lift_actual_m),
                 "return_policy": "exact reverse lift, grasp, and approach trajectories",
+                "open_optimizer_reused": open_optimizer_reused,
+                "open_optimizer_topology_rebuilt": open_optimizer_topology_rebuilt,
             },
         )
     finally:
-        _cleanup(planner)
+        if open_planner_cache is None:
+            _cleanup(planner)
+
+
+def plan_tabletop_pregrasp(
+    request: TabletopTaskRequest,
+    *,
+    open_planner_cache: ReusableOpenPlanner | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> TabletopPregraspPlan:
+    """Plan only the reversible clearance-to-pregrasp boundary route."""
+
+    result = _plan_tabletop(
+        request,
+        pregrasp_only=True,
+        open_planner_cache=open_planner_cache,
+        progress=progress,
+    )
+    if not isinstance(result, TabletopPregraspPlan):
+        raise TypeError("pregrasp planner returned a complete task")
+    return result
+
+
+def plan_tabletop_task(
+    request: TabletopTaskRequest,
+    *,
+    required_candidate_id: str | None = None,
+    open_planner_cache: ReusableOpenPlanner | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> TabletopTaskPlan:
+    """Plan a complete task while preserving alternate arm IK branches."""
+
+    result = _plan_tabletop(
+        request,
+        required_candidate_id=required_candidate_id,
+        pregrasp_only=False,
+        open_planner_cache=open_planner_cache,
+        progress=progress,
+    )
+    if not isinstance(result, TabletopTaskPlan):
+        raise TypeError("complete task planner returned only a pregrasp route")
+    return result

@@ -20,6 +20,8 @@ def pose_set_from_trajectories(
     robot_model: str,
     urdf_sha256: str,
     source: str,
+    initial_pose_id: str | None = None,
+    initial_command_q_rad: Sequence[float] | None = None,
 ) -> PoseSet:
     """Create endpoint metadata without changing any planned command."""
 
@@ -30,6 +32,38 @@ def pose_set_from_trajectories(
     timestamp = utc_now_iso()
     records: list[PoseRecord] = []
     seen: set[str] = set()
+    if (initial_pose_id is None) != (initial_command_q_rad is None):
+        raise ValueError("initial pose ID and command must be provided together")
+    if trajectories and trajectories[0].from_pose_id != "__handoff__":
+        if initial_pose_id is None:
+            raise ValueError(
+                "a plan starting away from handoff must include its current boundary"
+            )
+        if initial_pose_id != trajectories[0].from_pose_id:
+            raise ValueError(
+                "initial trajectory boundary must match the first trajectory source"
+            )
+    if initial_pose_id is not None:
+        initial = np.asarray(initial_command_q_rad, dtype=np.float64).reshape(-1)
+        if initial.shape != (7,) or not np.all(np.isfinite(initial)):
+            raise ValueError("initial trajectory command must contain seven finite joints")
+        if initial_pose_id == "__handoff__":
+            raise ValueError("initial trajectory boundary cannot be handoff")
+        full_q = full_reference.copy()
+        full_q[indices] = initial
+        records.append(
+            PoseRecord(
+                id=initial_pose_id,
+                group="tabletop_execution",
+                measured_calibration_q=tuple(initial),
+                measured_full_q=tuple(full_q),
+                calibration_q_spread=(0.0,) * 7,
+                recorded_at_utc=timestamp,
+                recorded_monotonic_s=0.0,
+                source=source,
+            )
+        )
+        seen.add(initial_pose_id)
     for index, trajectory in enumerate(trajectories):
         if trajectory.to_pose_id == "__handoff__" or trajectory.to_pose_id in seen:
             continue

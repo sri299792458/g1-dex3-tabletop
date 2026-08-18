@@ -354,7 +354,10 @@ class PoseExecutor:
         if not operator_confirmed:
             raise ValueError("operator confirmation is required for every trajectory")
         if self.current_pose_id != from_pose_id:
-            raise ValueError("trajectory source does not match the current pose")
+            raise ValueError(
+                f"trajectory source {from_pose_id!r} does not match the current pose "
+                f"{self.current_pose_id!r}"
+            )
         if plan_sha256 != self.approved_validation_report_sha256:
             raise ValueError("trajectory belongs to a different approved plan")
         if to_pose_id != HANDOFF_POSE_ID and not any(
@@ -433,7 +436,10 @@ class PoseExecutor:
         if not operator_confirmed:
             raise ValueError("operator confirmation is required for every trajectory")
         if self.current_pose_id != from_pose_id:
-            raise ValueError("streaming trajectory source does not match the current pose")
+            raise ValueError(
+                f"streaming trajectory source {from_pose_id!r} does not match the "
+                f"current pose {self.current_pose_id!r}"
+            )
         if plan_sha256 != self.approved_validation_report_sha256:
             raise ValueError("streaming trajectory belongs to a different approved plan")
         if to_pose_id != HANDOFF_POSE_ID and not any(

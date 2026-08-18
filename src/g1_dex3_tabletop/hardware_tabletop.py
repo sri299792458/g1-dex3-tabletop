@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
+import numpy as np
 from aprilcube import CorrespondenceDetector
 
 from g1_aprilcube_calibration.activation_handoff import build_activation_handoff
@@ -30,12 +31,16 @@ from g1_aprilcube_calibration.executor_driver import (
     SynchronizedPoseExecutor,
 )
 from g1_aprilcube_calibration.executor_state_machine import ExecutorState, PoseExecutor
-from g1_aprilcube_calibration.joint_map import validate_arm_side
+from g1_aprilcube_calibration.joint_map import arm_indices, validate_arm_side
 from g1_aprilcube_calibration.pose_schema import PoseSet
 from g1_aprilcube_calibration.process_lock import CommandOwnerLock
 from g1_aprilcube_calibration.readiness import StateSampleBuffer
 from g1_aprilcube_calibration.ros.camera_adapter import ROSCameraSubscriber, ROSImageFrame
-from g1_aprilcube_calibration.transports.unitree_arm_sdk import UnitreeLowStateObserver
+from g1_aprilcube_calibration.transforms import invert_transform
+from g1_aprilcube_calibration.transports.unitree_arm_sdk import (
+    UnitreeLowStateObserver,
+    UnitreeTorsoIMUObserver,
+)
 from g1_aprilcube_calibration.transports.unitree_debug_lowcmd import (
     UnitreeDebugLowCmdTransport,
 )
@@ -47,6 +52,7 @@ from g1_aprilcube_calibration.transports.unitree_dex3 import (
 )
 from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.calibration_candidates import camera_info_from_hardware
+from g1_dex3_tabletop.camera_state_sync import CameraStateInputBuffer
 from g1_dex3_tabletop.execution_plan import pose_set_from_trajectories
 from g1_dex3_tabletop.hardware_config import (
     debug_lowcmd_config,
@@ -64,24 +70,44 @@ from g1_dex3_tabletop.persistent_planner import (
     PersistentTabletopPlanner,
     PlannerRequestRejected,
 )
-from g1_dex3_tabletop.planning.contracts import RobotSnapshot, atomic_write_json
+from g1_dex3_tabletop.planning.contracts import (
+    PlannedTrajectory,
+    RobotSnapshot,
+    atomic_write_json,
+)
+from g1_dex3_tabletop.planning.dex3_handedness import dex3_empty_close_reference
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
+from g1_dex3_tabletop.state_estimation import (
+    AnchoredCameraPoseEstimators,
+    AnchoredCameraStateEstimator,
+    CameraPoseAnchor,
+    pose_error,
+)
 from g1_dex3_tabletop.tabletop_contracts import (
+    PregraspRemainingPlan,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
     TabletopExecutionPlan,
+    TabletopPregraspPlan,
+    build_pregrasp_remaining_plan,
+    pregrasp_to_clearance_return,
 )
+from g1_dex3_tabletop.tabletop_object import load_tabletop_object_profile
 from g1_dex3_tabletop.tabletop_perception import (
     camera_motion_from_fixed_cube,
     observe_resting_cube,
 )
-from g1_dex3_tabletop.tabletop_presentation import load_tabletop_presentation
+from g1_dex3_tabletop.tabletop_presentation import (
+    DIRECT_PRESENTATION_ID,
+    load_tabletop_presentation,
+)
 from g1_dex3_tabletop.tabletop_workflow import (
     build_tabletop_request,
     load_task_config,
     request_at_clearance,
     request_at_clearance_observation,
+    request_at_estimated_pregrasp,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -126,6 +152,49 @@ def _wait_for_hands(observer, timeout_s: float = 5.0):
             last = str(error)
         time.sleep(0.02)
     raise RuntimeError("timed out waiting for Dex3 state: " + last)
+
+
+def _wait_for_torso_imu(observer, timeout_s: float = 5.0):
+    deadline = time.monotonic() + timeout_s
+    last = "no sample"
+    while time.monotonic() < deadline:
+        try:
+            return observer.observe()
+        except RuntimeError as error:
+            last = str(error)
+        time.sleep(0.02)
+    raise RuntimeError("timed out waiting for rt/secondary_imu: " + last)
+
+
+def _wait_for_camera_state_input(
+    buffer: CameraStateInputBuffer,
+    *,
+    target_monotonic_s: float | None,
+    maximum_age_s: float,
+    maximum_gap_s: float,
+    control_check=None,
+    timeout_s: float = 1.0,
+):
+    deadline = time.monotonic() + timeout_s
+    last = "camera-state inputs are incomplete"
+    while time.monotonic() < deadline:
+        if control_check is not None:
+            control_check()
+        try:
+            if target_monotonic_s is None:
+                return buffer.latest(
+                    now_monotonic_s=time.monotonic(),
+                    maximum_age_s=maximum_age_s,
+                    maximum_gap_s=maximum_gap_s,
+                )
+            return buffer.sample_at(
+                target_monotonic_s,
+                maximum_gap_s=maximum_gap_s,
+            )
+        except RuntimeError as error:
+            last = str(error)
+        time.sleep(0.005)
+    raise RuntimeError("timed out pairing camera-state inputs: " + last)
 
 
 def _wait_for_activation(observer, states, pose_set, recording, timeout_s: float = 5.0):
@@ -322,7 +391,7 @@ def _command_fingers(
     driver.safety_heartbeat = _finger_heartbeat(watchdog_value, controller)
 
 
-def _command_grasp_fingers(
+def _command_retention_test_close(
     controller,
     driver,
     watchdog_value,
@@ -330,6 +399,8 @@ def _command_grasp_fingers(
     active_side: str,
     left,
     right,
+    empty_close_reference_q_rad,
+    minimum_opposed_shortfall_rad: float,
     label: str,
 ):
     driver.safety_heartbeat = watchdog_value.pulse
@@ -339,10 +410,12 @@ def _command_grasp_fingers(
         watchdog_value.pulse()
 
     try:
-        return controller.command_grasp_until_stall(
+        return controller.command_close_for_retention_test(
             active_side=active_side,
             left_target_q_rad=left,
             right_target_q_rad=right,
+            empty_close_reference_q_rad=empty_close_reference_q_rad,
+            minimum_opposed_shortfall_rad=minimum_opposed_shortfall_rad,
             label=label,
             safety_heartbeat=check,
         )
@@ -359,6 +432,16 @@ def _trajectory_maps(execution: TabletopExecutionPlan):
     if len(normal) != len(execution.trajectories):
         raise ValueError("tabletop execution plan has duplicate phase names")
     return normal, recovery
+
+
+def _return_to_clearance_phases(normal_routes) -> tuple[str, ...]:
+    """Return the exact post-retreat phase sequence installed by the planner."""
+
+    if "return_to_clearance" not in normal_routes:
+        raise ValueError("tabletop execution plan has no return-to-clearance phase")
+    if "return_to_pregrasp" in normal_routes:
+        return "return_to_pregrasp", "return_to_clearance"
+    return ("return_to_clearance",)
 
 
 def _execute_trajectory(
@@ -384,6 +467,24 @@ def _execute_trajectory(
         label=trajectory.to_pose_id,
     )
     print(f"completed phase: {trajectory.to_pose_id}", flush=True)
+
+
+def _trajectory_with_endpoints(
+    trajectory: PlannedTrajectory,
+    *,
+    from_pose_id: str,
+    to_pose_id: str,
+) -> PlannedTrajectory:
+    """Rename a frozen route without changing any command or timing sample."""
+
+    return PlannedTrajectory(
+        from_pose_id=from_pose_id,
+        to_pose_id=to_pose_id,
+        sample_time_s=trajectory.sample_time_s,
+        command_q_rad=trajectory.command_q_rad,
+        model_q_rad=trajectory.model_q_rad,
+        planning_time_s=trajectory.planning_time_s,
+    )
 
 
 def _execute_mpc_phase(
@@ -581,11 +682,18 @@ def run_tabletop(args) -> int:
     if args.confirm != MOTION_ACK:
         raise ValueError(f"--confirm must equal exactly: {MOTION_ACK}")
     arm = validate_arm_side(args.arm)
+    empty_close_reference_q_rad, minimum_opposed_shortfall_rad = dex3_empty_close_reference(arm)
+    object_profile = load_tabletop_object_profile(args.object_profile)
     presentation = load_tabletop_presentation(
         args.presentation,
-        direct_shortlist_override=args.grasp_shortlist,
+        direct_shortlist_override=(
+            object_profile.direct_grasp_shortlist_path
+            if args.presentation == DIRECT_PRESENTATION_ID
+            else None
+        ),
     )
     presentation.require_arm(arm)
+    presentation.require_object_profile(object_profile.profile_id)
     hardware = load_hardware(args.hardware_config)
     configured_arms = {
         str(hardware["robot"]["calibration_arm"]),
@@ -609,11 +717,20 @@ def run_tabletop(args) -> int:
     bundle_bytes = args.calibration_bundle.read_bytes()
     quality_bytes = args.quality_config.read_bytes()
     task_config_bytes = args.task_config.read_bytes()
+    object_profile_bytes = object_profile.config_path.read_bytes()
+    detector_config_bytes = object_profile.detector_config_path.read_bytes()
+    grasp_shortlist_bytes = object_profile.direct_grasp_shortlist_path.read_bytes()
     presentation_config_bytes = (
         None if presentation.config_path is None else presentation.config_path.read_bytes()
     )
-    detector = CorrespondenceDetector(args.cube_config)
-    recording, _pairing = recording_configs(args.hardware_config)
+    # The D435i tabletop stream is already high-contrast.  CLAHE amplified
+    # foam/print texture and corrupted marker corners in retained hardware
+    # frames, while raw grayscale passed every archived tabletop burst.
+    detector = CorrespondenceDetector(
+        object_profile.detector_config_path,
+        preprocess=False,
+    )
+    recording, pairing = recording_configs(args.hardware_config)
     control_config, rate_hz = executor_config(args.hardware_config)
     control_config = replace(control_config, require_motion_endpoint_tolerance=False)
     task_velocity = float(task_config["motion"]["maximum_arm_velocity_rad_s"])
@@ -635,17 +752,24 @@ def run_tabletop(args) -> int:
         "status": "started",
         "commands_robot": False,
         "arm": arm,
+        "object_profile_id": object_profile.profile_id,
         "presentation_id": presentation.presentation_id,
         "motion_controller": args.motion_controller,
     }
     primary_error: BaseException | None = None
     rejection_return_completed = False
-    camera = observer = dex_observer = transport = dex_controller = None
+    camera = observer = torso_observer = dex_observer = transport = dex_controller = None
     node = rclpy_module = None
     raw_recorder = None
     guard = synchronized = driver = planner = None
     mpc_phases: dict[str, dict] = {}
     cube_anchor_motion = None
+    camera_state_inputs = CameraStateInputBuffer()
+    camera_estimator = AnchoredCameraStateEstimator(
+        AnchoredCameraPoseEstimators(model=model, calibration_bundle=bundle)
+    )
+    camera_state_anchor = None
+    camera_state_estimate = None
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
@@ -668,13 +792,24 @@ def run_tabletop(args) -> int:
                 maximum_frames=30,
             )
             states = StateSampleBuffer()
+
+            def receive_lowstate(sample) -> None:
+                states.add(sample)
+                camera_state_inputs.add_lowstate(sample)
+
             transport_cfg = transport_config(
                 args.hardware_config,
                 interface=args.network_interface,
                 domain_id=args.domain_id,
             )
-            observer = UnitreeLowStateObserver(transport_cfg, on_sample=states.add)
+            observer = UnitreeLowStateObserver(transport_cfg, on_sample=receive_lowstate)
             _wait_for_state(observer)
+            torso_observer = UnitreeTorsoIMUObserver(
+                transport_cfg,
+                lowstate_observer=observer,
+                on_sample=camera_state_inputs.add_torso_imu,
+            )
+            _wait_for_torso_imu(torso_observer)
             hand_cfg = dex3_config(
                 args.hardware_config,
                 interface=args.network_interface,
@@ -699,6 +834,7 @@ def run_tabletop(args) -> int:
             print(
                 "READ-ONLY PREFLIGHT PASSED — seated stationary state, both Dex3 "
                 "states, rectified camera profile, and resting AprilCube are valid; "
+                f"object={object_profile.profile_id}; "
                 f"presentation={presentation.presentation_id}; no command publisher exists",
                 flush=True,
             )
@@ -735,6 +871,12 @@ def run_tabletop(args) -> int:
                 raise RuntimeError("capture quality configuration changed after preflight")
             if args.task_config.read_bytes() != task_config_bytes:
                 raise RuntimeError("tabletop task configuration changed after preflight")
+            if object_profile.config_path.read_bytes() != object_profile_bytes:
+                raise RuntimeError("tabletop object profile changed after preflight")
+            if object_profile.detector_config_path.read_bytes() != detector_config_bytes:
+                raise RuntimeError("object detector config changed after preflight")
+            if object_profile.direct_grasp_shortlist_path.read_bytes() != grasp_shortlist_bytes:
+                raise RuntimeError("object grasp shortlist changed after preflight")
             if (
                 presentation.config_path is not None
                 and presentation.config_path.read_bytes() != presentation_config_bytes
@@ -833,6 +975,7 @@ def run_tabletop(args) -> int:
                 calibration_bundle_path=args.calibration_bundle,
                 grasp_shortlist_path=presentation.grasp_shortlist_path,
                 task_config_path=args.task_config,
+                object_dimensions_m=object_profile.dimensions_m,
                 presentation_id=presentation.presentation_id,
                 fixture=presentation.fixture,
             )
@@ -873,7 +1016,7 @@ def run_tabletop(args) -> int:
             )
             initial_left = held_hands.left.position
             initial_right = held_hands.right.position
-            grasp_stall = None
+            grasp_close = None
             retention_evidence = None
             retention_route = None
             _execute_trajectory(
@@ -913,58 +1056,154 @@ def run_tabletop(args) -> int:
                 )
                 clearance_request_path = task_run / "clearance_request.json"
                 clearance_request.write_json(clearance_request_path)
-                replanned_execution_path = task_run / "execution_plan.json"
-                planner.request(
-                    "replan-tabletop-at-clearance",
-                    request_path=clearance_request_path,
-                    output_path=replanned_execution_path,
+                # Preserve the state synchronized to the visual anchor before
+                # planning. At the measured ~1 kHz input rate, the bounded
+                # buffer can otherwise evict this sample during a GPU solve.
+                anchor_time_s = float(
+                    np.median([frame.timing.receipt_monotonic_s for frame in clearance_frames])
+                )
+                camera_state_anchor = _wait_for_camera_state_input(
+                    camera_state_inputs,
+                    target_monotonic_s=anchor_time_s,
+                    maximum_age_s=control_config.state_freshness_timeout_s,
+                    maximum_gap_s=pairing.maximum_bracket_span_s,
                     control_check=driver.check,
                 )
-                replanned_execution = TabletopExecutionPlan.from_json(replanned_execution_path)
-                replanned_task = replanned_execution.task
-                replanned_pose_set = pose_set_from_trajectories(
-                    arm=arm,
-                    trajectories=replanned_execution.trajectories,
-                    reference_full_q=boundary_state.position,
-                    robot_model=model.name,
-                    urdf_sha256=model.sha256,
-                    source="NVlabs/curobo_fixed_cube_clearance_replan",
+                anchor_estimate = camera_estimator.reset(
+                    CameraPoseAnchor(
+                        reference_T_camera=invert_transform(
+                            np.asarray(boundary_observation.camera_T_object)
+                        ),
+                        sample=camera_state_anchor.sample,
+                    )
                 )
+                atomic_write_json(
+                    task_run / "camera_state_anchor.json",
+                    {
+                        "estimate": anchor_estimate.to_dict(),
+                        "input": camera_state_anchor.to_dict(),
+                        "visual_observation_sha256": (
+                            clearance_request.observation.content_sha256
+                        ),
+                    },
+                )
+                escape_return = _trajectory_with_endpoints(
+                    escape.inbound,
+                    from_pose_id="return_to_clearance",
+                    to_pose_id="__handoff__",
+                )
+                if args.motion_controller == "trajectory":
+                    pregrasp_path = task_run / "pregrasp_plan.json"
+                    planner.request(
+                        "plan-tabletop-pregrasp-at-clearance",
+                        request_path=clearance_request_path,
+                        output_path=pregrasp_path,
+                        control_check=driver.check,
+                    )
+                    pregrasp_plan = TabletopPregraspPlan.from_json(pregrasp_path)
+                    stage_trajectories = (
+                        pregrasp_plan.outbound,
+                        pregrasp_plan.inbound,
+                        escape_return,
+                    )
+                    replanned_pose_set = pose_set_from_trajectories(
+                        arm=arm,
+                        trajectories=stage_trajectories,
+                        reference_full_q=boundary_state.position,
+                        robot_model=model.name,
+                        urdf_sha256=model.sha256,
+                        source="NVlabs/curobo_reversible_pregrasp_boundary",
+                        initial_pose_id="clearance",
+                        initial_command_q_rad=escape.outbound.command_q_rad[-1],
+                    )
+                    stage_plan_sha256 = pregrasp_plan.content_sha256
+                else:
+                    replanned_execution_path = task_run / "execution_plan.json"
+                    planner.request(
+                        "replan-tabletop-at-clearance",
+                        request_path=clearance_request_path,
+                        output_path=replanned_execution_path,
+                        control_check=driver.check,
+                    )
+                    replanned_execution = TabletopExecutionPlan.from_json(replanned_execution_path)
+                    replanned_pose_set = pose_set_from_trajectories(
+                        arm=arm,
+                        trajectories=replanned_execution.trajectories,
+                        reference_full_q=boundary_state.position,
+                        robot_model=model.name,
+                        urdf_sha256=model.sha256,
+                        source="NVlabs/curobo_fixed_cube_clearance_replan",
+                        initial_pose_id="clearance",
+                        initial_command_q_rad=escape.outbound.command_q_rad[-1],
+                    )
+                    stage_plan_sha256 = replanned_execution.content_sha256
                 synchronized.replace_validated_remaining_plan(
                     pose_set=replanned_pose_set,
-                    approved_validation_report_sha256=(replanned_execution.content_sha256),
+                    approved_validation_report_sha256=stage_plan_sha256,
                     validated_reference_state=boundary_state,
                 )
             except (PlannerRequestRejected, RuntimeError, ValueError) as error:
                 driver.check()
-                _execute_trajectory(
-                    synchronized,
-                    driver,
-                    escape.inbound,
-                    plan_sha256=escape.content_sha256,
-                    control_config=control_config,
-                )
+                try:
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        escape.inbound,
+                        plan_sha256=escape.content_sha256,
+                        control_config=control_config,
+                    )
+                except (RuntimeError, ValueError) as recovery_error:
+                    raise RuntimeError(
+                        f"clearance-boundary preparation failed: {error}; "
+                        f"frozen reverse also failed: {recovery_error}"
+                    ) from recovery_error
                 rejection_return_completed = True
                 raise TabletopTaskRejected(
                     f"fixed-cube clearance-boundary replan failed: {error}"
                 ) from error
 
-            execution = replanned_execution
-            task = replanned_task
-            normal_routes, recovery_routes = _trajectory_maps(execution)
-            task.write_json(task_run / "task_plan.json")
-            retention_test_lift_mm = 1000.0 * float(
-                task.planner_provenance["retention_test_lift_actual_m"]
-            )
-            payload_lift_mm = 1000.0 * float(clearance_request.lift_m)
-            print(
-                "CLEARANCE-BOUNDARY REPLAN INSTALLED — fixed-cube anchor measured "
-                f"{cube_anchor_motion['translation_norm_mm']:.2f} mm / "
-                f"{cube_anchor_motion['rotation_deg']:.2f} deg camera motion; selected "
-                f"grasp {task.selected_candidate_id}; required hand/table execution "
-                f"margin={clearance_request.minimum_hand_plane_clearance_m * 1000.0:.1f} mm",
-                flush=True,
-            )
+            if args.motion_controller == "trajectory":
+                execution = pregrasp_plan
+                task = None
+                normal_routes = {
+                    pregrasp_plan.outbound.to_pose_id: pregrasp_plan.outbound,
+                    escape_return.to_pose_id: escape_return,
+                }
+                recovery_routes = {
+                    (
+                        pregrasp_plan.inbound.from_pose_id,
+                        pregrasp_plan.inbound.to_pose_id,
+                    ): pregrasp_plan.inbound
+                }
+                active_plan_sha256 = pregrasp_plan.content_sha256
+                selected_candidate_id = pregrasp_plan.selected_candidate_id
+                active_open = pregrasp_plan.open_active_dex3_q_rad
+                print(
+                    "CLEARANCE-TO-PREGRASP PLAN INSTALLED — fixed-cube anchor measured "
+                    f"{cube_anchor_motion['translation_norm_mm']:.2f} mm / "
+                    f"{cube_anchor_motion['rotation_deg']:.2f} deg camera motion; selected "
+                    f"grasp {selected_candidate_id}; its unexecuted linear approach passed "
+                    "strict validation, but only the reversible pregrasp route was installed; "
+                    "the payload lifecycle will be planned once after the pregrasp state "
+                    f"correction; planning={pregrasp_plan.planner_provenance['elapsed_s']:.2f}s",
+                    flush=True,
+                )
+            else:
+                execution = replanned_execution
+                task = replanned_execution.task
+                normal_routes, recovery_routes = _trajectory_maps(execution)
+                active_plan_sha256 = execution.content_sha256
+                task.write_json(task_run / "task_plan.json")
+                selected_candidate_id = task.selected_candidate_id
+                active_open = task.open_active_dex3_q_rad
+                print(
+                    "CLEARANCE-BOUNDARY REPLAN INSTALLED — fixed-cube anchor measured "
+                    f"{cube_anchor_motion['translation_norm_mm']:.2f} mm / "
+                    f"{cube_anchor_motion['rotation_deg']:.2f} deg camera motion; selected "
+                    f"grasp {selected_candidate_id}; required hand/table execution "
+                    f"margin={clearance_request.minimum_hand_plane_clearance_m * 1000.0:.1f} mm",
+                    flush=True,
+                )
 
             def execute_phase(
                 name: str,
@@ -985,7 +1224,7 @@ def run_tabletop(args) -> int:
                         planner,
                         arm=arm,
                         trajectory=normal_routes[name],
-                        plan_sha256=execution.content_sha256,
+                        plan_sha256=active_plan_sha256,
                         control_config=control_config,
                         measured_active_dex3_q_rad=measured_active_dex3_q_rad,
                         phase_record=phase_record,
@@ -997,7 +1236,7 @@ def run_tabletop(args) -> int:
                     synchronized,
                     driver,
                     normal_routes[name],
-                    plan_sha256=execution.content_sha256,
+                    plan_sha256=active_plan_sha256,
                     control_config=control_config,
                 )
 
@@ -1006,11 +1245,13 @@ def run_tabletop(args) -> int:
                     synchronized,
                     driver,
                     recovery_routes[(source, target)],
-                    plan_sha256=execution.content_sha256,
+                    plan_sha256=active_plan_sha256,
                     control_config=control_config,
                 )
 
-            active_open = task.open_active_dex3_q_rad
+            def execute_return_to_clearance(*, use_mpc: bool) -> None:
+                for phase in _return_to_clearance_phases(normal_routes):
+                    execute_phase(phase, use_mpc=use_mpc)
 
             def open_active_hand(label: str) -> None:
                 _command_fingers(
@@ -1031,7 +1272,7 @@ def run_tabletop(args) -> int:
                 else:
                     open_active_hand("open after rejected grasp attempt")
                     execute_recovery("grasp_approach", "grasp_retreat")
-                execute_phase("return_to_clearance", use_mpc=False)
+                execute_return_to_clearance(use_mpc=False)
                 _command_fingers(
                     dex_controller,
                     driver,
@@ -1045,30 +1286,225 @@ def run_tabletop(args) -> int:
 
             open_active_hand(f"{arm}-hand pregrasp open")
             execute_phase("move_to_pregrasp")
+            if args.motion_controller == "trajectory":
+                original_pregrasp_plan = pregrasp_plan
+                original_clearance_request = clearance_request
+                boundary_return = pregrasp_to_clearance_return(original_pregrasp_plan)
+                try:
+                    pregrasp_state = synchronized.observe_state()
+                    pregrasp_hands = dex_controller.observer.observe()
+                    camera_state_current = _wait_for_camera_state_input(
+                        camera_state_inputs,
+                        target_monotonic_s=None,
+                        maximum_age_s=control_config.state_freshness_timeout_s,
+                        maximum_gap_s=pairing.maximum_bracket_span_s,
+                        control_check=driver.check,
+                    )
+                    camera_state_estimate = camera_estimator.estimate(camera_state_current.sample)
+                    q29 = np.asarray(pregrasp_state.position, dtype=np.float64).copy()
+                    q29[np.asarray(arm_indices(arm))] = np.asarray(
+                        original_pregrasp_plan.outbound.command_q_rad[-1]
+                    )
+                    estimated_request = request_at_estimated_pregrasp(
+                        original_clearance_request,
+                        snapshot=RobotSnapshot(
+                            measured_q29_rad=tuple(q29),
+                            left_dex3_q_rad=tuple(pregrasp_hands.left.position),
+                            right_dex3_q_rad=tuple(pregrasp_hands.right.position),
+                        ),
+                        estimate=camera_state_estimate,
+                        anchor_input=camera_state_anchor,
+                        current_input=camera_state_current,
+                    )
+                    estimated_request_path = task_run / "pregrasp_estimated_request.json"
+                    remaining_path = task_run / "pregrasp_remaining_plan.json"
+                    estimated_request.write_json(estimated_request_path)
+                    planner.request(
+                        "replan-tabletop-at-pregrasp",
+                        request_path=estimated_request_path,
+                        output_path=remaining_path,
+                        control_check=driver.check,
+                    )
+                    remaining = PregraspRemainingPlan.from_json(remaining_path)
+                    if (
+                        remaining.prior_pregrasp_plan_sha256
+                        != original_pregrasp_plan.content_sha256
+                    ):
+                        raise RuntimeError(
+                            "pregrasp correction belongs to a different prior pregrasp plan"
+                        )
+                    if remaining.selected_candidate_id != selected_candidate_id:
+                        raise RuntimeError("pregrasp correction changed the selected grasp")
+                    expected_remaining = build_pregrasp_remaining_plan(
+                        prior_pregrasp_plan=original_pregrasp_plan,
+                        estimated_request=estimated_request,
+                        task=remaining.task,
+                    )
+                    if remaining.content_sha256 != expected_remaining.content_sha256:
+                        raise RuntimeError(
+                            "pregrasp correction differs from the deterministic remapping "
+                            "of its hash-bound task and prior execution"
+                        )
+                    installation_input = _wait_for_camera_state_input(
+                        camera_state_inputs,
+                        target_monotonic_s=None,
+                        maximum_age_s=control_config.state_freshness_timeout_s,
+                        maximum_gap_s=pairing.maximum_bracket_span_s,
+                        control_check=driver.check,
+                    )
+                    installation_estimate = camera_estimator.estimate(installation_input.sample)
+                    installation_motion = pose_error(
+                        camera_state_estimate.reference_T_camera,
+                        installation_estimate.reference_T_camera,
+                    )
+                    if installation_motion["translation_norm_mm"] > float(
+                        task_config["perception"]["maximum_translation_spread_mm"]
+                    ) or installation_motion["rotation_deg"] > float(
+                        task_config["perception"]["maximum_rotation_spread_deg"]
+                    ):
+                        raise RuntimeError(
+                            "camera state changed while CuRobo replanned: "
+                            f"{installation_motion['translation_norm_mm']:.3f}mm / "
+                            f"{installation_motion['rotation_deg']:.3f}deg"
+                        )
+                    atomic_write_json(
+                        task_run / "pregrasp_estimator_installation_check.json",
+                        {
+                            "planned_estimate": camera_state_estimate.to_dict(),
+                            "installation_estimate": installation_estimate.to_dict(),
+                            "installation_input": installation_input.to_dict(),
+                            "change": installation_motion,
+                            "limits": {
+                                "translation_mm": task_config["perception"][
+                                    "maximum_translation_spread_mm"
+                                ],
+                                "rotation_deg": task_config["perception"][
+                                    "maximum_rotation_spread_deg"
+                                ],
+                            },
+                        },
+                    )
+                    corrected_pose_set = pose_set_from_trajectories(
+                        arm=arm,
+                        trajectories=remaining.trajectories,
+                        reference_full_q=pregrasp_state.position,
+                        robot_model=model.name,
+                        urdf_sha256=model.sha256,
+                        source="NVlabs/curobo_proprioceptive_pregrasp_replan",
+                        initial_pose_id="move_to_pregrasp",
+                        initial_command_q_rad=(original_pregrasp_plan.outbound.command_q_rad[-1]),
+                    )
+                    synchronized.replace_validated_remaining_plan(
+                        pose_set=corrected_pose_set,
+                        approved_validation_report_sha256=remaining.content_sha256,
+                        validated_reference_state=pregrasp_state,
+                    )
+                except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+                    driver.check()
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        boundary_return,
+                        plan_sha256=original_pregrasp_plan.content_sha256,
+                        control_config=control_config,
+                    )
+                    _command_fingers(
+                        dex_controller,
+                        driver,
+                        guard,
+                        left=initial_left,
+                        right=initial_right,
+                        label="initial finger posture restoration after pregrasp replan rejection",
+                    )
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        escape_return,
+                        plan_sha256=original_pregrasp_plan.content_sha256,
+                        control_config=control_config,
+                    )
+                    rejection_return_completed = True
+                    raise TabletopTaskRejected(
+                        f"pregrasp camera-state correction failed: {error}"
+                    ) from error
+
+                clearance_request = estimated_request
+                task = remaining.task
+                execution = remaining
+                active_plan_sha256 = remaining.content_sha256
+                normal_routes = {
+                    trajectory.to_pose_id: trajectory
+                    for trajectory in (
+                        *remaining.trajectories,
+                        escape_return,
+                    )
+                }
+                recovery_routes = {
+                    (trajectory.from_pose_id, trajectory.to_pose_id): trajectory
+                    for trajectory in remaining.recovery_trajectories
+                }
+                task.write_json(task_run / "pregrasp_corrected_task_plan.json")
+                print(
+                    "PREGRASP STATE CORRECTION INSTALLED — waist/pelvis/torso state "
+                    f"propagated the fixed-cube camera anchor for "
+                    f"{camera_state_estimate.anchor_age_s:.3f}s; grasp "
+                    f"{task.selected_candidate_id} was preserved and every remaining "
+                    "motion was planned from the exact active command; "
+                    f"planning={task.planner_provenance['elapsed_s']:.2f}s, "
+                    "open_optimizer_reused="
+                    f"{task.planner_provenance['open_optimizer_reused']}",
+                    flush=True,
+                )
+                execute_phase("estimated_pregrasp", use_mpc=False)
+            else:
+                print(
+                    "PREGRASP STATE CORRECTION NOT APPLIED — the optional MPC execution "
+                    "path retains its own frozen lifecycle; use the default trajectory "
+                    "controller for the commissioned stationary-boundary correction",
+                    flush=True,
+                )
+            if task is None:
+                raise RuntimeError("tabletop remainder planning ended without a task plan")
+            retention_test_lift_mm = 1000.0 * float(
+                task.planner_provenance["retention_test_lift_actual_m"]
+            )
+            payload_lift_mm = 1000.0 * float(clearance_request.lift_m)
+            print(
+                "EMPTY-CLOSE REFERENCE READY — grasp evidence will require stable "
+                "thumb and opposing-finger shortfall of at least "
+                f"{minimum_opposed_shortfall_rad:.4f}rad on both sides; pressure and "
+                "tau_est remain recorded diagnostics; beginning grasp approach",
+                flush=True,
+            )
             execute_phase("grasp_approach")
             active_close_target = task.close_target_active_dex3_q_rad
             try:
-                grasp_stall = _command_grasp_fingers(
+                grasp_close = _command_retention_test_close(
                     dex_controller,
                     driver,
                     guard,
                     active_side=arm,
                     left=active_close_target if arm == "left" else initial_left,
                     right=active_close_target if arm == "right" else initial_right,
+                    empty_close_reference_q_rad=empty_close_reference_q_rad,
+                    minimum_opposed_shortfall_rad=minimum_opposed_shortfall_rad,
                     label=f"descriptor-defined {arm}-hand cube close",
                 )
             except Dex3GraspNotAcquiredError as error:
                 driver.check()
-                print(f"TASK REJECTED — no stable cube contact: {error}", flush=True)
+                print(f"TASK REJECTED — no stable grasp close: {error}", flush=True)
                 return_after_task_rejection(from_test_lift=False)
-                raise TabletopTaskRejected(f"no stable cube contact: {error}") from error
-            atomic_write_json(task_run / "grasp_stall.json", grasp_stall.to_dict())
+                raise TabletopTaskRejected(f"no stable grasp close: {error}") from error
+            atomic_write_json(
+                task_run / "grasp_close.json",
+                grasp_close.to_dict(),
+            )
             dex_controller.begin_retention_test()
             retention_request = RetentionRouteValidationRequest(
                 tabletop_request=clearance_request,
                 task_plan=task,
-                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
-                blocked_motor_ids=grasp_stall.blocked_motor_ids,
+                measured_active_dex3_q_rad=grasp_close.close_q_rad,
+                blocked_motor_ids=grasp_close.blocked_motor_ids,
             )
             retention_request_path = task_run / "retention_route_request.json"
             retention_route_path = task_run / "retention_route_validation.json"
@@ -1085,12 +1521,12 @@ def run_tabletop(args) -> int:
                 # path. Otherwise the frozen open-hand reverse route remains valid.
                 driver.check()
                 print(
-                    f"TASK REJECTED — measured contact route is unavailable: {error}",
+                    f"TASK REJECTED — measured close route is unavailable: {error}",
                     flush=True,
                 )
                 return_after_task_rejection(from_test_lift=False)
                 raise TabletopTaskRejected(
-                    f"measured contact route is unavailable: {error}"
+                    f"measured close route is unavailable: {error}"
                 ) from error
             retention_route = RetentionRouteValidationResult.from_json(retention_route_path)
             if retention_route.request_sha256 != retention_request.content_sha256:
@@ -1098,57 +1534,63 @@ def run_tabletop(args) -> int:
             try:
                 dex_controller.check_retention_test()
             except Dex3RetentionLostError as error:
-                print(f"TASK REJECTED — cube contact was lost before test lift: {error}")
+                print(f"TASK REJECTED — cube contact was lost before lift: {error}")
                 return_after_task_rejection(from_test_lift=False)
                 raise TabletopTaskRejected(
-                    f"cube contact was lost before test lift: {error}"
+                    f"cube contact was lost before lift: {error}"
                 ) from error
             print(
-                "GRASP STALL ACQUIRED — measured stalled fingers passed the frozen "
-                "payload-route collision recheck; beginning the "
-                f"{retention_test_lift_mm:.1f} mm test lift",
+                "GRASP CLOSE STABILIZED — thumb and opposing-finger obstruction relative "
+                "to commissioned empty close passed the frozen payload-route collision "
+                "recheck; pressure does not decide retention; beginning the "
+                f"{retention_test_lift_mm:.1f} mm retention checkpoint within the payload lift",
                 flush=True,
             )
             execute_phase(
                 "retention_test_lift",
-                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+                measured_active_dex3_q_rad=grasp_close.close_q_rad,
             )
             try:
-                retention_evidence = dex_controller.verify_grasp_stall_persistence(
+                retention_evidence = dex_controller.verify_retention_at_lifted_checkpoint(
                     safety_heartbeat=lambda: (driver.check(), guard.pulse()),
                 )
                 dex_controller.finish_retention_test()
             except Dex3RetentionLostError as error:
                 driver.check()
-                print(f"TASK REJECTED — cube contact did not survive test lift: {error}")
+                print(
+                    "TASK REJECTED — cube contact did not survive the lifted checkpoint; "
+                    "holding the close target during the exact low-lift reverse and opening "
+                    f"only after returning to support: {error}"
+                )
                 return_after_task_rejection(from_test_lift=True)
                 raise TabletopTaskRejected(
-                    f"cube contact did not survive test lift: {error}"
+                    f"cube contact did not survive lift checkpoint: {error}"
                 ) from error
             atomic_write_json(
                 task_run / "retention_evidence.json",
                 retention_evidence.to_dict(),
             )
             print(
-                "RETENTION TEST PASSED — a fresh stable finger stall remained after "
-                "the test lift; continuing the full payload lift",
+                "RETENTION TEST PASSED — stable thumb and opposing-finger obstruction "
+                "relative to commissioned empty close remained after separation from "
+                "the support; continuing the payload lift",
                 flush=True,
             )
             execute_phase(
                 "payload_lift",
-                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+                measured_active_dex3_q_rad=grasp_close.close_q_rad,
             )
             execute_phase(
                 "payload_lower",
-                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+                measured_active_dex3_q_rad=grasp_close.close_q_rad,
             )
             execute_phase(
                 "payload_replace",
-                measured_active_dex3_q_rad=grasp_stall.contact_q_rad,
+                measured_active_dex3_q_rad=grasp_close.close_q_rad,
             )
             open_active_hand("cube release after exact replacement")
             execute_phase("grasp_retreat")
-            execute_phase("return_to_clearance")
+            execute_return_to_clearance(use_mpc=True)
             _command_fingers(
                 dex_controller,
                 driver,
@@ -1158,7 +1600,7 @@ def run_tabletop(args) -> int:
                 label="initial finger posture restoration",
             )
             execute_phase("__handoff__")
-            if grasp_stall is None or retention_evidence is None or retention_route is None:
+            if grasp_close is None or retention_evidence is None or retention_route is None:
                 raise RuntimeError("tabletop lifecycle ended without retention evidence")
             _restore_seated_control(
                 driver=driver,
@@ -1173,14 +1615,23 @@ def run_tabletop(args) -> int:
                 "presentation_id": presentation.presentation_id,
                 "selected_candidate_id": task.selected_candidate_id,
                 "supported_escape_plan_sha256": escape.content_sha256,
-                "execution_plan_sha256": execution.content_sha256,
+                "active_plan_sha256": execution.content_sha256,
+                "active_plan_kind": execution.kind,
+                "pregrasp_plan_sha256": (
+                    pregrasp_plan.content_sha256
+                    if args.motion_controller == "trajectory"
+                    else None
+                ),
                 "cube_anchor_motion": cube_anchor_motion,
+                "pregrasp_camera_state_estimate": (
+                    None if camera_state_estimate is None else camera_state_estimate.to_dict()
+                ),
                 "motion_controller": args.motion_controller,
                 "mpc_phase_count": len(mpc_phases),
                 "mpc_window_count": sum(
                     len(document["windows"]) for document in mpc_phases.values()
                 ),
-                "grasp_stall": grasp_stall.to_dict(),
+                "grasp_close": grasp_close.to_dict(),
                 "retention_evidence": retention_evidence.to_dict(),
                 "retention_route_validation_sha256": retention_route.content_sha256,
                 "terminal_action": guard.terminal_action,
@@ -1192,8 +1643,8 @@ def run_tabletop(args) -> int:
                 "calibration_validation_claim": False,
             }
             print(
-                "TABLETOP TASK PASSED — grasp stall survived a "
-                f"{retention_test_lift_mm:.1f} mm test lift; cube then completed the "
+                "TABLETOP TASK PASSED — lifted opposed joint obstruction survived a "
+                f"{retention_test_lift_mm:.1f} mm retention checkpoint; cube then completed the "
                 f"{payload_lift_mm:.1f} mm lift, was replaced, and the arm "
                 "returned to its supported start, and seated FSM 3 restored",
                 flush=True,
@@ -1295,7 +1746,11 @@ def run_tabletop(args) -> int:
                     dex_controller.close()
             except BaseException as error:  # noqa: BLE001
                 cleanup_errors.append(f"Dex3 close: {error}")
-        for name, value in (("lowstate observer", observer), ("Dex3 observer", dex_observer)):
+        for name, value in (
+            ("torso IMU observer", torso_observer),
+            ("lowstate observer", observer),
+            ("Dex3 observer", dex_observer),
+        ):
             if value is not None:
                 try:
                     value.close()
@@ -1333,6 +1788,11 @@ def run_tabletop(args) -> int:
         )
         if cube_anchor_motion is not None:
             status.setdefault("cube_anchor_motion", cube_anchor_motion)
+        if camera_state_estimate is not None:
+            status.setdefault(
+                "pregrasp_camera_state_estimate",
+                camera_state_estimate.to_dict(),
+            )
         try:
             if preflight_frames:
                 _save_frames(task_run / "preflight", preflight_frames)

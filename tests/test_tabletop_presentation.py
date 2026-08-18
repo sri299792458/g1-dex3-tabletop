@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.planning.tabletop_planner import (
+    _attached_lift_scene,
     _base_scene,
-    _fixture_clearance_from_spheres,
     _load_shortlist,
     _table_from_resting_object,
 )
@@ -52,11 +52,14 @@ def test_direct_presentation_preserves_the_existing_scene_and_shortlist() -> Non
     assert presentation.fixture is None
     assert presentation.applicable_hand_sides == ("left", "right")
     assert presentation.grasp_shortlist_path.name == "shortlist.yaml"
+    presentation.require_object_profile("cube40-r3")
+    presentation.require_object_profile("cube60-r3")
 
     request = _request("direct")
     shortlist, candidates = _load_shortlist(request)
     assert shortlist["shortlist_id"] == "cube_dex3_executable_v1"
-    assert len(candidates) == 15
+    assert len(candidates) == 5
+    assert shortlist["execution_contract"]["fixed_cube_during_qualification"] is True
     assert _base_scene(request, np.eye(4), include_cube=False) == {"cuboid": {}}
 
 
@@ -64,6 +67,9 @@ def test_tripod_h50_is_an_opt_in_hash_bound_fixture_presentation() -> None:
     presentation = load_tabletop_presentation("tripod-h50")
     presentation.require_arm("left")
     presentation.require_arm("right")
+    presentation.require_object_profile("cube40-r3")
+    with pytest.raises(ValueError, match="not qualified for object profile"):
+        presentation.require_object_profile("cube60-r3")
     assert presentation.fixture is not None
     assert presentation.fixture.support_height_m == 0.050
     assert presentation.fixture.mesh_scale == (0.001, 0.001, 0.001)
@@ -103,28 +109,11 @@ def test_tripod_h50_moves_the_table_plane_below_the_presented_cube() -> None:
     )
 
 
-def test_exact_fixture_recheck_reports_the_colliding_link_and_sample(monkeypatch) -> None:
-    spheres = np.asarray(
-        (
-            ((0.20, 0.0, 0.0, 0.02),),
-            ((0.04, 0.0, 0.0, 0.01),),
-        ),
-        dtype=np.float64,
-    )
-    config = SimpleNamespace(
-        link_sphere_idx_map=np.asarray((3,)),
-        link_name_to_idx_map={"right_hand_index_1_link": 3},
-    )
-    monkeypatch.setattr(
-        "trimesh.proximity.signed_distance",
-        lambda _mesh, _points: np.asarray((-0.15, 0.01)),
-    )
-    clearance, link, sample = _fixture_clearance_from_spheres(
-        spheres,
-        config=config,
-        fixture_mesh=object(),
-    )
+def test_attached_lift_exempts_only_the_cube_support_fixture() -> None:
+    request = _request("tripod-h50")
 
-    assert clearance < 0.0
-    assert link == "right_hand_index_1_link"
-    assert sample == 1
+    scene = _attached_lift_scene(request, np.eye(4))
+
+    assert scene == {"cuboid": {}}
+    assert request.fixture is not None
+    assert request.fixture.fixture_id not in scene.get("mesh", {})

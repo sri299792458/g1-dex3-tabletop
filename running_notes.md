@@ -3468,3 +3468,476 @@ the full two-color plate and check the marker with the detector.
   Final verification is `334 passed, 6 skipped` in the control environment and
   `333 passed, 1 skipped` in the CUDA planner environment; Ruff and Git
   whitespace checks pass. No robot command was sent.
+
+## 2026-08-17 — Independent minimal camera-state observer
+
+- Promoted the retained-data winner into `AnchoredCameraStateEstimator`, a
+  pure numerical component with no ROS, CuRobo, MPC, or robot-command
+  dependency. It stores one synchronized full-pose visual anchor and exposes
+  the hybrid pelvis-position/torso-orientation prediction as a timestamped
+  `reference_T_camera` estimate.
+- Narrowed the estimator input from the complete 29-joint vector to exactly
+  `waist_yaw_joint`, `waist_roll_joint`, and `waist_pitch_joint`, plus the
+  pelvis and torso orientation matrices. The pelvis-to-camera URDF chain does
+  not contain an arm, hand, or leg joint. MCAP replay now extracts only those
+  three measured joints for estimation.
+- Removed the prior unused latest-sample pairing helper. It assigned the later
+  receipt timestamp to two unsynchronized messages; a future live adapter must
+  perform explicit interpolation or bounded pairing instead.
+- Did not add depth, raw D435i IMU, commands, arms, hands, or legs to the
+  estimator. Depth independently validates table-normal motion, but no retained
+  replay yet proves that adding it improves the hybrid estimate. It remains a
+  separate recorded research measurement.
+- Did not fabricate covariance. The estimate reports its visual-anchor age and
+  fixed-pelvis-IMU-origin assumption. Covariance and freshness policy belong to
+  a later, separately validated integration contract.
+- The strict continuous rigid-chair replay reproduced every prior numerical
+  camera error exactly: a single global anchor gives `4.661 mm` mean error;
+  realized `1.335 s` visual resets give `0.371 mm` mean / `0.873 mm` p95, and
+  realized `2.002 s` resets give `0.427 mm` mean / `0.993 mm` p95. No robot
+  command was sent.
+
+## 2026-08-17 — Stationary pregrasp state correction
+
+- Connected the independent hybrid observer to the default tabletop trajectory
+  workflow at exactly one stationary boundary. The clearance cube observation
+  is the visual anchor. At reached pregrasp, synchronized waist yaw/roll/pitch,
+  pelvis IMU, and torso IMU measurements propagate the fixed-object camera
+  pose; no depth, arm state, hand marker, or second pregrasp image was added to
+  the estimator.
+- The propagated pose is not written into `TabletopObservation`. A separate
+  hash-bound `EstimatedCameraPlanningState` records the original observation
+  hash, anchor/current timestamps and pairing diagnostics, exact robot snapshot,
+  estimator name, fixed-pelvis-IMU-origin assumption, and `object_T_camera`.
+- The persistent CuRobo worker preserves the already selected grasp candidate
+  and replans every remaining motion from the exact active pregrasp command.
+  It may search alternate IK branches only for that same grasp. The remapped
+  lifecycle returns through the corrected pregrasp, then exactly reverses the
+  original clearance-to-pregrasp path and the original supported escape.
+- Before atomic installation, a fresh propagated estimate must remain within
+  the already configured `5 mm / 2 deg` task perception limits of the pose used
+  for planning. Executor joint-state stability and exact command-continuity
+  checks remain independent. Any estimator, planning, or installation rejection
+  returns over the frozen old route and stops the task.
+- The optional MPC path remains unchanged and explicitly reports that it does
+  not consume this correction. No continuous trajectory deformation or new
+  controller was introduced.
+- Both complete test environments pass: `342 passed, 6 skipped` in `.venv` and
+  `341 passed, 1 skipped` in `.venv-planner`; Ruff and whitespace checks pass.
+  A command-free retained CUDA exercise preserved the selected grasp and built
+  all nine remapped remaining trajectories. That retained run used its historic
+  sub-5-mm margin and therefore is not evidence for the current 5 mm physical
+  policy. Re-running the same artifact under the current margin correctly
+  rejected it at `0.9 mm` thumb/table clearance. No robot command was sent.
+
+## 2026-08-17 — Removed duplicate trajectory lifecycle planning
+
+- The default trajectory workflow previously planned a complete
+  grasp/lift/replace/return lifecycle at clearance, executed only its first
+  `clearance -> pregrasp` edge, and then planned the same complete lifecycle
+  again after the stationary camera-state correction. That duplicate payload
+  planning was an architectural error, not an inherent CuRobo cost.
+- Clearance planning now returns a dedicated hash-bound `TabletopPregraspPlan`.
+  It serializes exactly one executable route to pregrasp and its exact reverse.
+  Candidate selection still plans and strictly validates the unexecuted linear
+  grasp approach, including full-robot self collision, cube/fixture geometry,
+  and the 5 mm table margin; an obviously invalid grasp is therefore not
+  selected merely to make the first stage faster.
+- Only after the arm reaches stationary pregrasp does CuRobo plan the corrected
+  grasp, retention lift, payload lift, replacement, retreat, return through the
+  old pregrasp, and exact pregrasp-to-clearance reverse. A failed estimator,
+  plan, or installation still has the pre-existing pregrasp reverse plus the
+  supported-escape reverse. The MPC path retains its existing full-lifecycle
+  transaction and was not silently changed.
+- The persistent worker now owns one `ReusableOpenPlanner`. The first boundary
+  allocates its fixed-shape MotionPlanner and CUDA graphs with the full grasp
+  goal-set capacity. At pregrasp, a freshly resolved strict robot remains the
+  source of truth; the worker requires identical active/locked joint names,
+  tool frames, tensor shapes, and self-collision pair topology before copying
+  new kinematic values into the retained optimizer and calling CuRobo's public
+  world-update API. A topology or seed/capacity change rebuilds instead.
+- A command-free CUDA test changed both the waist-pitch witness and object pose
+  between requests. Reusing the fixed-shape optimizer reduced open setup from
+  about `0.18 s` to `0.002 s`, goal-set IK from about `1.3 s` to `0.003 s`, and
+  the already-warmed open route stage from about `2.4 s` to `1.2 s` in the
+  corrected complete plan. With the retained run's historical 0.5 mm table
+  policy solely to permit like-for-like timing, the split stages took
+  `10.41 s` cold plus `6.72 s`; the first stage's `5.36 s` first-process model
+  cost is moved before SPACE by the existing worker warmup and is about `1.8 s`
+  there. The current 5 mm policy correctly rejects that historical scene and
+  was not relaxed in production.
+- No robot command was sent. These are retained-data CUDA planning tests only.
+- Final regression results are `343 passed, 6 skipped` in the control
+  environment and `342 passed, 1 skipped` in the CUDA planner environment;
+  changed Python files pass Ruff and `git diff --check` passes. The pre-existing
+  dirty `third_party/aprilcube` submodule was not modified.
+## 2026-08-17 — Supported escape validates the requested displacement
+
+- Removed the unrelated requirement that the terminal grasp frame be at least
+  `50 mm` above the observed table plane. The escape now checks its FK endpoint
+  against the actual requested Cartesian target using the same `5 mm` position
+  tolerance that CuRobo uses to declare the trajectory successful.
+- The plan provenance and terminal output record requested lift, achieved lift,
+  endpoint error, and CuRobo tolerance. The independent sampled wrist/hand
+  table-plane guard and strict self-collision validation are unchanged. No
+  robot command was sent for this change.
+
+## 2026-08-17 — Clearance plan replacement includes its reached start
+
+- Physical run `tabletop_20260817T210626Z` completed the exact 100 mm supported
+  escape and found a valid left-arm pregrasp, then rejected the replacement
+  before pregrasp motion because its pose set omitted the already-reached
+  `clearance` boundary. The frozen reverse completed and seated control was
+  restored.
+- Both trajectory and MPC clearance replacements now include the exact escape
+  endpoint as `clearance`. The later pregrasp correction already included its
+  reached `move_to_pregrasp` boundary. The common builder now rejects every
+  non-handoff plan that omits or misnames its current boundary, preventing the
+  same error at future replacement sites. No robot command was sent.
+
+## 2026-08-17 — Visual-anchor state is saved before planning
+
+- Run `tabletop_20260817T211231Z` completed the exact supported lift and found
+  a valid pregrasp. The clearance image's synchronized LowState/torso-IMU
+  sample was then unavailable because the approximately 4.8-second solve
+  produced 5,000 samples while the live buffer retained only 4,096.
+- The workflow now saves the synchronized camera-state anchor immediately
+  after the clearance image, before invoking CuRobo. All file writes and
+  planning finish before the controller switches to the new path, so a failure
+  still uses the already-approved escape reverse. If that reverse itself ever
+  fails, the status retains both the original and recovery errors instead of
+  hiding the first one. No robot command was sent for this fix.
+
+## 2026-08-17 — Fixed-close table sweep is checked before pregrasp
+
+- Physical run `tabletop_20260817T211927Z` reached the selected left-arm
+  pregrasp and then rejected the corrected remainder because every IK branch
+  put `left_hand_index_1_link` `3.6-3.8 mm` below the inferred table during
+  the provisional fixed-close lift, against the unchanged `5 mm` margin. The
+  frozen pregrasp and supported-escape reverses completed and seated control
+  was restored; no close or lift was attempted.
+- The simulated per-candidate `isaac_closed_q` remains qualification evidence
+  only. Prior physical data established that those angles came from simulations
+  where the cube moved substantially during closure and do not represent the
+  table-supported hardware contact posture. The one descriptor close target
+  and the measured-contact route validation are unchanged.
+- Candidate selection now evaluates the complete open-to-fixed-close finger
+  sweep at the exact planned grasp contact arm pose before it serializes or
+  executes a route to pregrasp. The existing 20 mrad maximum joint sampling
+  step is shared with Dex3 preparation. Every sample receives the strict
+  full-robot self-collision check, the selected wrist/hand `5 mm` table-plane
+  check, and the exact fixture-mesh check when a presenter is active.
+- Command-free CUDA replay of the retained request rejected the previously
+  selected grasp at `-3.8 mm` during this new early check. The other returned
+  IK branches retained their genuine wrist/elbow-to-torso collisions, so that
+  saved scene has no executable alternative; production will now stop at
+  clearance and reverse instead of first moving to a doomed pregrasp.
+- After real closure, the existing validator still inserts the measured
+  contact-stalled finger angles into every frozen payload-route sample before
+  even the `10 mm` retention lift. No table margin was relaxed and no robot
+  command was sent for this change.
+
+## 2026-08-17 — Requalified the existing 40 mm cube for the real close command
+
+- The prior 15-grasp direct-table shortlist used the cube pose and finger
+  endpoint after free-object Isaac closure. That evidence did not answer the
+  hardware question, where the tabletop cube is stationary and every grasp
+  receives the same fixed Dex3 descriptor close command.
+- Rechecked all 3,178 retained GraspGenX poses without changing any
+  `object_T_G`. Five pass the stationary-cube contract: open hand clear of the
+  cube, thumb and an opposing finger reach the fixed cube during the commanded
+  close, and the exact Dex3 collision meshes remain at least `5 mm` above the
+  table at open, pregrasp, and all 51 close-sweep samples. The tightest passing
+  clearance is `5.161 mm`; the first candidate has `6.053 mm`.
+- Direct-table planning uses that hash-bound exact-mesh hand/table evidence.
+  CuRobo remains responsible for IK, arm routes, strict self-collision, cube
+  collision, and wrist clearance. After physical closure, the pre-existing
+  measured-contact route check still runs before the `10 mm` retention lift.
+- A command-free replay of retained scene `tabletop_20260817T215708Z` selected
+  unchanged candidate `cube_head__seed_0000000079__sample_213` on its second IK
+  branch and planned the complete pick/lift/replace/return lifecycle in about
+  16 seconds. Open-route clearance was `9.313 mm`; exact fixed-close clearance
+  was `6.053 mm`; the configured requirement stayed `5 mm`. No robot command
+  was sent.
+
+## 2026-08-17 — Each retained grasp now receives an independent IK search
+
+- Replaced the shared five-pose CuRobo goal set with one IK-only GPU batch:
+  five independent rows, one goal per row, and 16 seeds per grasp. A shared
+  goal set had only 16 seeds total and could concentrate all returned solutions
+  on one candidate; it was not a complete five-candidate search.
+- The batch does not change trajectory planning. Its IK solver is destroyed
+  after copying out the finite joint-solution pool. The existing single-route
+  MotionPlanner then tests each solution with the existing strict endpoint,
+  route, fixed-close, payload, and return checks. This supersedes the earlier
+  note that the reusable MotionPlanner itself has full goal-set capacity; that
+  planner is deliberately single-goal again.
+- Command-free replay of retained physical scene
+  `tabletop_20260817T215708Z` produced 15 unique collision-valid IK solutions
+  for candidate `cube_head__seed_0000000079__sample_213` and zero for each of
+  the other four candidates. The strict full-robot endpoint check rejected the
+  first three solutions for named torso collisions. Solution 4 completed the
+  full pick/lift/replace/return lifecycle. Total planner time was `16.26 s`;
+  batched-IK construction was `0.062 s` and its solve was `1.384 s`.
+- The resulting route retained `9.313 mm` minimum open-route table clearance
+  and `6.053 mm` minimum exact fixed-close clearance against the unchanged
+  `5 mm` requirement. A second command-free test exercised the actual split
+  boundary workflow: pregrasp selection took `12.29 s`, the later task kept
+  candidate 213, reused the single-route planner, and produced all eight phases
+  in `8.89 s`. Final regression results are `350 passed, 6 skipped` in the
+  control environment and `349 passed, 1 skipped` in the CUDA planner
+  environment; Ruff passes. No robot command was sent.
+
+## 2026-08-17 — First complete physical lift exposed a missing return leg
+
+- Physical run `tabletop_20260817T230114Z` successfully acquired the left-hand
+  grasp, passed the measured stalled-finger route check with `6.525 mm` minimum
+  hand/table clearance, completed the retention test, lifted the 40 mm cube,
+  lowered it, and replaced it on the table.
+- The failure after replacement was a control-sequencing bug, not an IK,
+  collision, grasp, retention, or payload-planning failure. The pregrasp-
+  corrected plan contains `grasp_retreat -> return_to_pregrasp ->
+  return_to_clearance`. Hardware execution performed `grasp_retreat` and then
+  tried to start the second return edge directly. The executor correctly
+  rejected the source-pose mismatch, after which fail-closed cleanup produced
+  the observed zero-torque state.
+- Normal completion and both task-rejection returns now execute the optional
+  `return_to_pregrasp` edge before `return_to_clearance`. Unsplit plans retain
+  their original direct return. Source-pose errors now print both the required
+  and current logical pose IDs. No threshold, planned trajectory, collision
+  policy, or robot-control gain changed.
+
+## 2026-08-18 — Grasp evidence rebuilt around opposed Dex3 tactile contact
+
+- The stall-only contract was removed. Retained run analysis had already shown
+  that an empty Dex3 hand can stop with the same fixed-close joint residual as
+  the failed cube attempt, so joint residual alone cannot classify a grasp.
+  `tau_est` and raw `dq` remain recorded diagnostics; neither has a physically
+  commissioned object-contact model in this repository.
+- The implementation copies the validated signal contract from the local
+  `dex3_pressure_tools` study: the `30000 +/- 1000` invalid-slot rule, exactly
+  33 active taxels, per-run median unloaded baseline, p99 idle-noise audit, and
+  a fixed minimum contact rise of 50 raw counts. The baseline is collected for
+  `0.5 s` from at least 20 fresh active-hand samples while the hand is open at
+  pregrasp. A noisy or differently mapped hand is rejected; the runtime never
+  raises the contact threshold until noise appears valid.
+- Live closure now requires one stable `0.5 s` window containing all of:
+  commanded-direction finger motion, at least one `>0.08 rad` residual to the
+  fixed empty-close target, complete-hand spread `<=0.01 rad`, and simultaneous
+  above-baseline loading on a thumb group and a middle/index group. Thumb-only
+  or palm-only pressure, an isolated spike, pressure without closure residual,
+  and residual without opposed pressure all fail.
+- The fixed close command remains active during the existing planned retention
+  lift. At its lifted endpoint, a fresh `0.5 s` window must again contain both
+  opposed pressure and a close residual. Fingers and loaded taxels may migrate
+  as the cube settles; the post-lift blocked-motor set, taxels, pressure peaks,
+  and joint shift are recorded instead of being required to match first
+  contact exactly.
+- Official left/right Dex3 states now expose the complete `9 x 12` pressure
+  matrix and `tau_est` in diagnostic snapshots. The MCAP contract is unchanged
+  because it already records both official state topics. New artifacts are
+  `tactile_baseline.json`, `grasp_contact.json`, and the updated
+  `retention_evidence.json`; inactive pressure slots serialize as JSON `null`,
+  never non-standard NaN.
+- A baseline rejection occurs at pregrasp, not at grasp contact. Both complete
+  and pregrasp-corrected execution contracts therefore include hash-bound exact
+  reverse routes from their actual pregrasp states. This prevents the rejection
+  handler from executing a recovery whose source pose the robot never reached.
+- Command-free verification: `357 passed, 6 skipped` in the control environment;
+  the affected CUDA planner/contract set passes `56` tests; Ruff and Git diff
+  checks pass. No robot command was sent.
+
+## 2026-08-18 — Retention is a 30 mm checkpoint inside the normal lift
+
+- Opposed tactile contact at table height proves loading between the thumb and
+  an opposing finger, but not that the cube is supported independently of the
+  table. A lifted retention check therefore remains necessary.
+- There is no separate test-lift plan or extra planner call. CuRobo still
+  produces one 100 mm payload lift. The runtime now splits that unchanged
+  trajectory at its first sample at least `30 mm` above contact, pauses for the
+  fresh tactile/residual window, then either continues the suffix or exactly
+  reverses the prefix.
+- The prior 10 mm split was too close to the table relative to physical
+  tracking and table-pose uncertainty. The 30 mm boundary gives the 40 mm cube
+  materially clearer table separation while keeping a rejected-grasp drop
+  much lower than the full lift. Collision checks, speed, controller gains,
+  tactile thresholds, and the complete 100 mm payload target are unchanged.
+
+## 2026-08-18 — The 60 mm R3 cube is a hash-bound runtime object profile
+
+- A controlled size study in `sri299792458/g1-aprilcube-demo` retained the
+  released Dex3 descriptor, fixed close command, 3 mm edge radius, 5 mm table
+  requirement, and all GraspGenX/Isaac settings. The 40, 50, and 60 mm cubes
+  produced 5, 5, and 57 stationary-cube fixed-close-qualified grasps,
+  respectively. The 60 mm pool began with 3,279 intrinsic-retention passes;
+  none of the 57 admitted `object_T_G` poses was changed.
+- The audit was rerun with exact minimum-link and close-sweep-sample
+  provenance. Its 57 clearances span `5.008--15.988 mm`; runtime keeps the
+  complete shortlist and lets the existing independent batched IK plus strict
+  route validators choose against the live robot and cube pose.
+- `--object-profile cube60-r3` now selects one hash-bound bundle: exact 60 mm
+  R3 qualification mesh, 45 mm `DICT_4X4_100` detector with IDs 10--15, and
+  the 57-candidate direct-table shortlist. The existing `cube40-r3` profile
+  remains the default. Object selection changes no controller gain, speed,
+  safety rule, calibration transform, state estimator, or recording path.
+- The printable production mesh and the qualification mesh have identical
+  60 mm bounds and signed volume; their bidirectional vertex-to-surface
+  difference is below `4e-15 mm`. Their triangulation differs only because the
+  production target preserves the released cube's 75 percent marker-to-face
+  ratio. The runtime imports only the compact shortlist and exact qualified
+  mesh, not the roughly 183 MB experiment directory.
+- The 50 mm tripod presentation remains explicitly qualified only for
+  `cube40-r3`; selecting it with the 60 mm profile fails before robot ownership.
+  No robot command was sent while adding or validating the 60 mm profile.
+
+## 2026-08-18 — Tripod search is GPU-pruned before route optimization
+
+- Retained physical run `tabletop_20260818T125007Z` timed out after 180 seconds
+  despite producing 1,095 collision-valid pregrasp IK branches. The timeout did
+  not prove the scene was infeasible. An exact Trimesh signed-distance query,
+  originally written for one final measured-contact validation, had been moved
+  into the per-branch fixed-close loop. Some rejected branches consequently
+  spent about 20 seconds in CPU mesh queries after CuRobo had already loaded
+  the same exact tripod mesh on CUDA.
+- The CPU fixture query was removed from candidate search, selected-route
+  validation, measured-contact validation, and MPC checks. One reusable CuRobo
+  world checker now performs exact hash-bound mesh queries on CUDA. A deliberate
+  sphere/mesh penetration probe verified that the query detects contact; after
+  warmup, retained route queries take sub-millisecond time.
+- Before arm IK, the planner now expresses the complete 51-sample fixed Dex3
+  close sweep in the grasp frame, transforms it across every candidate, and
+  checks hand/table and hand/tripod geometry in bounded CUDA batches. It then
+  checks all arm IK endpoints for strict full-robot self collision in one GPU
+  call and ranks only the survivors by distance from the live arm state.
+  Trajectory optimization is never invoked for either rejected set.
+- The replay also exposed a separate physical modeling error. After attachment,
+  the cube begins in deliberate contact with the tripod that supports it, so
+  treating the attached cube/tripod pair as a collision makes every upward lift
+  start invalid. The attached-lift optimizer now excludes only that one support
+  pair. The resulting closed-hand route is independently checked against the
+  exact tripod mesh without payload spheres, preserving all robot/tripod
+  collision rules. Replacement is the exact reverse of the validated lift.
+- Command-free replay of the exact retained request pruned 220 of 372 grasp
+  candidates before arm IK and pruned 234 IK endpoints in one strict GPU pass.
+  Five trajectory branches were attempted. Candidate
+  `cube_head__seed_0000000079__sample_230` produced the complete
+  pick/lift/replace/return lifecycle in `18.88 s`; fixed-close candidate pruning
+  itself took `0.014 s`. The selected-candidate-only complete plan took
+  `16.53 s`. The former 180-second timeout is gone without changing the 5 mm
+  table margin, collision geometry, controller gains, or motion speed.
+- Final command-free verification is `359 passed, 6 skipped` in the control
+  environment and `61 passed` for the affected CUDA planner set. Ruff and Git
+  diff checks pass. No robot command was sent.
+
+## 2026-08-18 — Supported pressure is provisional; retention is decided after separation
+
+- Physical run `tabletop_20260818T145822Z` completed supported escape, grasp
+  selection, corrected pregrasp planning, approach, and the descriptor close.
+  The close held its final target for about `0.615 s`. Four fingers retained
+  `0.173--0.250 rad` residuals and the cube remained mechanically trapped.
+- During the stable close window, opposing-finger pressure was `184--208` raw
+  counts above baseline while the thumb peak remained `24--48`, just below the
+  unchanged `50`-count contact threshold. The old table-height gate therefore
+  rejected the close and immediately opened the hand. MCAP frames show the cube
+  still held before that command, beginning to tilt during opening, and falling
+  only after the fingers separated. The frozen reverse and seated restoration
+  otherwise completed without cleanup errors.
+- This run does not prove that the cube was supported against gravity; it may
+  have been wedged against the tripod. That is precisely the question answered
+  by the existing low `30 mm` separation checkpoint. Simultaneous opposed
+  pressure is therefore no longer a pre-lift requirement. A stable commanded
+  close with at least one `>0.08 rad` residual is recorded as
+  `grasp_close.json`, collision-checked at its measured finger angles, and
+  admitted to the unchanged low lift.
+- The fixed close target remains commanded throughout the low lift. The hard
+  decision remains at the lifted checkpoint, which still requires a fresh
+  stable residual and simultaneous thumb/opposing-finger pressure. Failure
+  follows the exact low-lift reverse while the hand remains closed and opens
+  only after returning to support. No tactile threshold, arm trajectory,
+  collision margin, control gain, or motion speed changed.
+- Command-free verification after this change: control environment `359 passed,
+  6 skipped`; planner/CUDA environment `358 passed, 1 skipped`; full Ruff lint,
+  touched-file format checks, repository diff checks, and the read-only local
+  hardware inspection all passed. No robot command was sent.
+
+## 2026-08-18 — Empty-close commissioning replaces pressure as grasp evidence
+
+- The preceding pressure-based policies are superseded. A standalone left-hand
+  empty-close commission measured the exact descriptor command at
+  `[-0.022203, 0.571732, 0.978123, -0.878780, -0.975255, -0.883415,
+  -0.972809] rad`; its worst descriptor-target tracking residual was only
+  `0.026668 rad`. The normal task does not repeat this open/close cycle.
+- A grasp now requires a stable shortfall of at least `0.05 rad` from that
+  commissioned empty close on both mechanical sides: at least one thumb
+  closing joint and at least one middle/index closing joint. Closing direction
+  is derived from the live open-to-descriptor command per motor; it is not
+  assumed to have one sign across the hand. The same two-sided test is repeated
+  after the existing 30 mm retention lift.
+- Retained physical evidence separates the cases cleanly. Successful lift run
+  `tabletop_20260817T230114Z` had maximum thumb/opposing shortfalls
+  `0.155609/0.394296 rad`; missed-cube run `tabletop_20260817T231230Z` had
+  `0.000925/0.196066 rad`; visually caged run
+  `tabletop_20260818T153501Z` had `0.155474/0.156364 rad`. The former and latter
+  pass; the missed cube fails because its thumb reached the empty posture.
+- Raw pressure, `tau_est`, and velocity continue to be captured in the official
+  Dex3 state topics in MCAP, but no live branch reads them. The pressure gate
+  was disproved by the latest caged grasp: no mapped taxel crossed the rule even
+  though the object moved with the hand. `grasp_close.json` and
+  `retention_evidence.json` now contain the exact commissioned reference,
+  closing directions, per-joint shortfalls, threshold, and selected motor IDs.
+- Only the left empty-close reference is commissioned. Selecting the right arm
+  fails during read-only setup and instructs the operator to run and record the
+  standalone right-hand measurement first; left data are never mirrored or
+  invented.
+- Command-free verification is `360 passed, 6 skipped` in the control
+  environment and `359 passed, 1 skipped` in the planner environment; full
+  Ruff lint, format, and repository diff checks pass. No robot command was
+  sent.
+
+## 2026-08-18 — Physical tripod runs exposed a transit-only thumb exception bug
+
+- Operator-observed run `tabletop_20260818T162801Z` lifted the cube and
+  completed every commanded reverse/release/return phase. The commissioned
+  empty-close test passed strongly at support and after the 30 mm checkpoint:
+  maximum thumb/opposing shortfalls were `0.23454/0.24631 rad`. The cube did
+  not balance exactly back on the three small tripod contacts. The current
+  `completed` result proves the commanded motion lifecycle and seated handback;
+  it does not contain a post-release visual placement claim.
+- Run `tabletop_20260818T163107Z` rejected before task planning and exactly
+  reversed the supported escape because the five-frame camera-to-cube pose
+  burst spanned `21.477 mm` against the unchanged `5 mm` stationary-boundary
+  limit. Offline replay isolated this as a CLAHE-induced visual outlier, not
+  object motion: one accepted frame misplaced a marker corner by about 13 px
+  and differed from the two good accepted frames by `30.649-33.817 mm`; two
+  other frames were rejected at `3.411/3.434 px` reprojection error. The torso
+  changed by at most about `0.011 deg` during the burst. Raw-grayscale replay
+  detected the larger face in all five frames with `0.145 mm / 0.221 deg`
+  spread.
+- During run `tabletop_20260818T163252Z`, the operator saw the left thumb strike
+  the cube on clearance-to-pregrasp. The subsequent close correctly failed the
+  new evidence test at `-0.0009/0.0113 rad` thumb/opposing shortfall and the
+  frozen reverse completed. Read-only replay found the exact nominal event:
+  `left_hand_thumb_2_link` was only `9.784 mm` from the cube at pregrasp-route
+  sample 14. Measured arm tracking reduced the modeled clearance to
+  `8.357 mm`; the worst joint error at that sample was `0.02070 rad`. The
+  anchored estimator measured another `0.910 mm / 0.281 deg` of body/camera
+  change over the complete clearance-to-pregrasp leg.
+- Root cause was not a missing cube obstacle. The strict post-planning checker
+  used the intentional thumb/middle/index contact-tip exemption over the whole
+  combined route. That exemption belongs only to the final straight grasp
+  approach. Clearance-to-pregrasp now checks every hand link against the cube;
+  the contact-tip exemption begins only after pregrasp.
+- Replaying the third request now rejects candidate 204 and ten other
+  thumb-skimming IK branches at the existing `<10 mm` activation band, then
+  selects candidate 157 with `25.958 mm` nominal minimum transit clearance.
+  Replaying the first request retains its physically successful candidate 213.
+  No collision threshold, sphere radius, grasp pose, controller gain, or robot
+  speed changed. Verification is `361 passed, 6 skipped` in the control
+  environment and `360 passed, 1 skipped` in the planner environment; Ruff and
+  diff checks pass. No robot command was sent during diagnosis or correction.
+- The tabletop D435i object detector now explicitly disables the AprilCube
+  library's general-purpose CLAHE default. Across all retained tabletop data,
+  raw grayscale produced `326/326` valid frame poses and passed all 65 complete
+  bursts; CLAHE produced `324/326` valid frame poses and the one false burst
+  rejection above. The AprilCube library default, pose gates, and thresholds
+  remain unchanged.

@@ -7,9 +7,18 @@
   "imported_artifacts": {
     "cube_dex3_executable_v1": {
       "repository": "sri299792458/g1-aprilcube-demo",
-      "commit": "724ee07079c25765b3e630f5508bca3b7731eef5",
-      "source": "artifacts/grasp_shortlists/cube_right_executable_v1/shortlist.yaml",
-      "runtime_policy": "shared object_T_G with exact left/right Dex3 side adapter"
+      "commit": "4325bc94988b44554f106b206fb1bcd650cfd619",
+      "source": "artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml",
+      "runtime_policy": "five unchanged object_T_G candidates qualified with the stationary 40 mm cube, the fixed descriptor close sweep, exact Dex3 collision meshes, a 5 mm table margin, and the exact left/right Dex3 side adapter"
+    },
+    "cube60_r3_dex3_executable_v1": {
+      "repository": "sri299792458/g1-aprilcube-demo",
+      "base_commit": "4325bc94988b44554f106b206fb1bcd650cfd619",
+      "source": "artifacts/grasp_atlas/cube60_r3_experiment_v1/right/arm_grasp_pool.yaml",
+      "source_sha256": "b7749554c66336a25b44afb525a3898dd8dbc0752ccd99e7faa685a689880a48",
+      "runtime_shortlist_sha256": "a9e81acce2cfe043343cd1ccf2419b0c85dce1aa75a51cf3f0e92dac3a4ca569",
+      "detector_config_sha256": "57bd5905460b06960ecca027087ca2358dc3c3ae1d616557052ffec97c61bebc",
+      "runtime_policy": "57 unchanged object_T_G candidates qualified with the stationary 60 mm R3 cube, the fixed descriptor close sweep, exact Dex3 collision meshes, a 5 mm table margin, and the exact left/right Dex3 side adapter"
     },
     "cube_tripod_h50": {
       "repository": "sri299792458/g1-aprilcube-demo",

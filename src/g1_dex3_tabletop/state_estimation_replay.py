@@ -19,6 +19,7 @@ from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.state_estimation import (
     ESTIMATOR_CONTRACTS,
     ESTIMATOR_NAMES,
+    WAIST_JOINT_INDICES,
     AnchoredCameraPoseEstimators,
     CameraPoseAnchor,
     ProprioceptiveSample,
@@ -254,7 +255,7 @@ def _read_mcap(
                         record_time_ns,
                         int(message.tick),
                         np.asarray(
-                            [state.q for state in message.motor_state[:29]],
+                            [message.motor_state[index].q for index in WAIST_JOINT_INDICES],
                             dtype=np.float64,
                         ),
                         np.asarray(message.imu_state.quaternion, dtype=np.float64),
@@ -458,7 +459,7 @@ def _aggregate_sample(event: BoardEvent, samples: _EventSamples) -> Propriocepti
             previous_tick = item[1]
     return ProprioceptiveSample(
         timestamp_ns=event.center_ns,
-        q29_rad=np.median(np.stack([item[2] for item in unique_lowstate]), axis=0),
+        waist_q_rad=np.median(np.stack([item[2] for item in unique_lowstate]), axis=0),
         navigation_R_pelvis_imu=_mean_rotation_from_wxyz([item[3] for item in unique_lowstate]),
         navigation_R_torso_imu=_mean_rotation_from_wxyz([item[1] for item in samples.torso_imu]),
     )

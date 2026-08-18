@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from itertools import pairwise
+from typing import Any
 
 import numpy as np
 
@@ -49,6 +50,31 @@ IK_ROTATION_TOLERANCE_RAD = 0.02
 TRAJECTORY_INTERPOLATION_DT_S = 0.025
 EXECUTION_MAXIMUM_VELOCITY_RAD_S = 0.2
 COLLISION_ACTIVATION_DISTANCE_M = 0.01
+FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD = 0.02
+
+
+def sample_linear_joint_sweep(
+    start: np.ndarray,
+    target: np.ndarray,
+    *,
+    maximum_joint_step_rad: float = FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD,
+) -> np.ndarray:
+    """Sample one direct joint-space sweep with a bounded per-sample step."""
+
+    initial = np.asarray(start, dtype=np.float64).reshape(-1)
+    final = np.asarray(target, dtype=np.float64).reshape(-1)
+    if initial.shape != final.shape or len(initial) == 0:
+        raise ValueError("joint sweep endpoints must have the same non-empty shape")
+    if not np.all(np.isfinite(initial)) or not np.all(np.isfinite(final)):
+        raise ValueError("joint sweep endpoints must be finite")
+    if not np.isfinite(maximum_joint_step_rad) or maximum_joint_step_rad <= 0.0:
+        raise ValueError("maximum joint sweep step must be positive and finite")
+    intervals = max(
+        int(np.ceil(np.max(np.abs(final - initial)) / maximum_joint_step_rad)),
+        1,
+    )
+    alpha = np.linspace(0.0, 1.0, intervals + 1, dtype=np.float64)[:, None]
+    return initial[None] + alpha * (final - initial)[None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,7 +160,7 @@ def plan_dex3_preparation(
                 "route_policy": "right_shoulder_then_left_shoulder_then_linear_finger_sweep",
                 "execution_maximum_velocity_rad_s": EXECUTION_MAXIMUM_VELOCITY_RAD_S,
                 "self_collision_activation_distance_m": (COLLISION_ACTIVATION_DISTANCE_M),
-                "finger_sweep_maximum_joint_step_rad": 0.02,
+                "finger_sweep_maximum_joint_step_rad": (FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD),
                 "rejected_candidates": rejected,
             },
         )
@@ -419,6 +445,106 @@ class CuroboKinematicCollisionChecker:
         return result
 
 
+class CuroboWorldCollisionChecker:
+    """Reusable CUDA sphere-to-world collision queries for one frozen scene."""
+
+    def __init__(self, *, scene: dict[str, Any], device_cfg) -> None:
+        from curobo._src.geom.collision.collision_scene import (
+            SceneCollision,
+            SceneCollisionCfg,
+        )
+        from curobo._src.geom.types import SceneCfg
+
+        cache = {
+            "cuboid": len(scene.get("cuboid", {})),
+            "mesh": len(scene.get("mesh", {})),
+        }
+        self.device_cfg = device_cfg
+        self.scene = SceneCollision.from_config(
+            SceneCollisionCfg(
+                device_cfg=device_cfg,
+                scene_model=SceneCfg.create(scene),
+                cache=cache,
+            )
+        )
+        self._buffers: dict[tuple[int, ...], Any] = {}
+
+    @staticmethod
+    def _query_shape(spheres):
+        if spheres.ndim == 3:
+            return spheres.unsqueeze(0)
+        if spheres.ndim != 4:
+            raise ValueError("world collision spheres must have three or four dimensions")
+        if spheres.shape[0] == 1:
+            return spheres
+        if spheres.shape[1] == 1:
+            return spheres.transpose(0, 1)
+        raise ValueError("world collision sphere tensor has an ambiguous batch shape")
+
+    def deepest_collisions(
+        self,
+        spheres,
+        *,
+        kinematics_config=None,
+        sphere_link_names: tuple[str, ...] | None = None,
+    ) -> list[tuple[float, str, int] | None]:
+        """Return the deepest collision for every trajectory sample on CUDA."""
+
+        from curobo._src.geom.collision.buffer_collision import CollisionBuffer
+
+        query = self._query_shape(spheres)
+        shape = tuple(int(value) for value in query.shape)
+        if shape not in self._buffers:
+            self._buffers[shape] = CollisionBuffer.from_shape(shape, self.device_cfg)
+        distance = self.scene.get_sphere_distance_raw(
+            query,
+            self._buffers[shape],
+            self.device_cfg.to_device([1.0]),
+            self.device_cfg.to_device([0.0]),
+        )[0]
+        penetration, sphere_index = distance.max(dim=1)
+        penetration_values = penetration.detach().cpu().tolist()
+        sphere_indices = sphere_index.detach().cpu().tolist()
+        if sphere_link_names is not None:
+            if len(sphere_link_names) != int(distance.shape[1]):
+                raise ValueError("world collision sphere-link list has the wrong length")
+            names = sphere_link_names
+        else:
+            if kinematics_config is None:
+                raise ValueError("world collision query requires sphere link metadata")
+            link_indices = (
+                kinematics_config.link_sphere_idx_map.reshape(-1).detach().cpu().tolist()
+            )
+            index_to_name = {
+                value: name for name, value in kinematics_config.link_name_to_idx_map.items()
+            }
+            try:
+                names = tuple(index_to_name[int(value)] for value in link_indices)
+            except KeyError as error:
+                raise RuntimeError(
+                    "CUDA world collision query could not resolve a sphere link"
+                ) from error
+        return [
+            None if float(value) <= 0.0 else (float(value), names[int(index)], sample)
+            for sample, (value, index) in enumerate(
+                zip(penetration_values, sphere_indices, strict=True)
+            )
+        ]
+
+    def first_collision(self, spheres, *, kinematics_config):
+        """Return the deepest CUDA-detected world collision, or ``None``."""
+
+        hits = [
+            value
+            for value in self.deepest_collisions(
+                spheres,
+                kinematics_config=kinematics_config,
+            )
+            if value is not None
+        ]
+        return max(hits, key=lambda value: value[0]) if hits else None
+
+
 def _self_collision_pair_penetrations(
     *,
     robot: dict,
@@ -479,9 +605,8 @@ def _validate_curobo_finger_sweep(
         raise RuntimeError("CuRobo Dex3 active-joint set differs from the requested model")
     start = np.asarray([start_by_name[name] for name in curobo_names], dtype=np.float64)
     target = np.asarray([target_by_name[name] for name in curobo_names], dtype=np.float64)
-    intervals = max(int(np.ceil(np.max(np.abs(target - start)) / 0.02)), 1)
-    alpha = np.linspace(0.0, 1.0, intervals + 1)[:, None]
-    sweep = start[None] + alpha * (target - start)[None]
+    sweep = sample_linear_joint_sweep(start, target)
+    intervals = len(sweep) - 1
     q = device_cfg.to_device(sweep).unsqueeze(0)
     state = checker.get_kinematics(q)
     collision_cost = checker.get_self_collision_distance(state.robot_spheres)

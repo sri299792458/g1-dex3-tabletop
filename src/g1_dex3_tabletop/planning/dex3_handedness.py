@@ -65,3 +65,29 @@ def dex3_execution_profile(arm: str) -> tuple[tuple[float, ...], tuple[float, ..
     if open_q == close_q:
         raise ValueError("canonical Dex3 open and close targets must differ")
     return open_q, close_q
+
+
+def dex3_empty_close_reference(arm: str) -> tuple[tuple[float, ...], float]:
+    """Return the commissioned empty close and opposed-obstruction margin."""
+
+    selected = validate_arm_side(arm)
+    document = json.loads(CANONICAL_DEX3_PROFILE.read_text(encoding="utf-8"))
+    commissioning = document.get("empty_close_commissioning")
+    if not isinstance(commissioning, dict):
+        raise RuntimeError(  # noqa: TRY004 - this is missing commissioned data
+            "Dex3 empty-close commissioning is missing"
+        )
+    entry = commissioning.get(selected)
+    if not isinstance(entry, dict):
+        raise RuntimeError(  # noqa: TRY004 - this is missing commissioned data
+            f"Dex3 empty-close reference is not commissioned for {selected}; "
+            f"run measure-dex3-empty-close --arm {selected} and commission its "
+            "empty_close.measured_q_rad first"
+        )
+    measured = np.asarray(entry.get("measured_q_rad"), dtype=np.float64).reshape(-1)
+    if measured.shape != (7,) or not np.all(np.isfinite(measured)):
+        raise ValueError(f"Dex3 {selected} empty-close reference is invalid")
+    threshold = float(commissioning.get("minimum_opposed_shortfall_rad", 0.0))
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("Dex3 opposed-obstruction threshold must be positive")
+    return tuple(float(value) for value in measured), threshold

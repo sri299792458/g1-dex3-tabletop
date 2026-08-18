@@ -62,7 +62,7 @@ def test_state_series_interpolates_both_imus() -> None:
     times = np.asarray([1_000_000, 3_000_000], dtype=np.int64)
     series = StateSeries(
         lowstate_time_ns=times,
-        q29_rad=np.stack([np.zeros(29), np.ones(29)]),
+        waist_q_rad=np.stack([np.zeros(3), np.ones(3)]),
         pelvis_quaternion_wxyz=np.stack(
             [_wxyz(Rotation.identity()), _wxyz(Rotation.from_euler("x", 0.2))]
         ),
@@ -76,7 +76,7 @@ def test_state_series_interpolates_both_imus() -> None:
 
     sample, gaps = series.sample(2_000_000)
 
-    assert sample.q29_rad == pytest.approx(np.full(29, 0.5))
+    assert sample.waist_q_rad == pytest.approx(np.full(3, 0.5))
     assert Rotation.from_matrix(
         sample.navigation_R_pelvis_imu.copy()
     ).magnitude() == pytest.approx(0.1)

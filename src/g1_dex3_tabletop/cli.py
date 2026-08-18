@@ -28,6 +28,7 @@ from g1_dex3_tabletop.planning.contracts import (
     RobotSnapshot,
 )
 from g1_dex3_tabletop.planning.g1_model import CUROBO_COMMIT
+from g1_dex3_tabletop.tabletop_object import DEFAULT_OBJECT_PROFILE_ID
 from g1_dex3_tabletop.tabletop_presentation import (
     DIRECT_PRESENTATION_ID,
     PRESENTATION_CONFIGS,
@@ -40,7 +41,6 @@ CALIBRATION_URDF = ROOT / "config/urdf/g1_29dof_rev_1_0_g1pilot_collision.urdf"
 ROBOT_CALIBRATION = ROOT / "third_party/robot_calibration"
 ROBOT_CALIBRATION_RUNNER = ROOT / "tools/g1_robot_calibration.sh"
 DEFAULT_TASK_CONFIG = ROOT / "config/tabletop/task.yaml"
-DEFAULT_CUBE_CONFIG = ROOT / "third_party/aprilcube/models/dex3_safe_cube/config.json"
 DEFAULT_QUALITY = ROOT / "config/capture_quality_dex3_aruco.yaml"
 
 
@@ -151,18 +151,20 @@ def build_parser() -> argparse.ArgumentParser:
     tabletop.add_argument("--hardware-config", type=Path)
     tabletop.add_argument("--calibration-bundle", type=Path, default=DEFAULT_BUNDLE)
     tabletop.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
-    tabletop.add_argument("--cube-config", type=Path, default=DEFAULT_CUBE_CONFIG)
+    tabletop.add_argument(
+        "--object-profile",
+        default=DEFAULT_OBJECT_PROFILE_ID,
+        help=(
+            "bundled tabletop object ID, or a repository-local profile YAML; "
+            f"default: {DEFAULT_OBJECT_PROFILE_ID}"
+        ),
+    )
     tabletop.add_argument("--quality-config", type=Path, default=DEFAULT_QUALITY)
     tabletop.add_argument(
         "--presentation",
         choices=(DIRECT_PRESENTATION_ID, *PRESENTATION_CONFIGS),
         default=DIRECT_PRESENTATION_ID,
         help="object presentation; direct keeps the existing tabletop behavior",
-    )
-    tabletop.add_argument(
-        "--grasp-shortlist",
-        type=Path,
-        help="optional direct-table shortlist override; unavailable for fixture modes",
     )
     tabletop.add_argument("--output-root", type=Path, default=ROOT / "runs")
     tabletop.add_argument("--observation-frames", type=int, default=5)
@@ -247,6 +249,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     compliance.add_argument(
+        "--lock-file",
+        type=Path,
+        default=Path("/tmp/g1-dex3-tabletop-command.lock"),
+    )
+    empty_close = subparsers.add_parser(
+        "measure-dex3-empty-close",
+        help="command one empty Dex3 hand open then closed and print measured joints",
+    )
+    empty_close.add_argument("--arm", choices=("left", "right"), required=True)
+    empty_close.add_argument("--network-interface", required=True)
+    empty_close.add_argument("--domain-id", type=int, default=0)
+    empty_close.add_argument("--hardware-config", type=Path)
+    empty_close.add_argument("--confirm", required=True)
+    empty_close.add_argument(
         "--lock-file",
         type=Path,
         default=Path("/tmp/g1-dex3-tabletop-command.lock"),
@@ -493,6 +509,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.hardware_config is None:
             args.hardware_config = hardware_path
         handlers["measure-seat-compliance"] = run_measure_seat_compliance
+    if args.command == "measure-dex3-empty-close":
+        from g1_dex3_tabletop.hardware_dex3_empty_close import (
+            run_measure_dex3_empty_close,
+        )
+
+        hardware_path, _target_path = _arm_paths(args.arm)
+        if args.hardware_config is None:
+            args.hardware_config = hardware_path
+        handlers["measure-dex3-empty-close"] = run_measure_dex3_empty_close
     try:
         return handlers[args.command](args)
     except KeyboardInterrupt:
