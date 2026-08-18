@@ -6,8 +6,8 @@ instead of replaying each frozen trajectory verbatim. The boundary-corrected
 frozen lifecycle supplies the selected grasp, a complete collision-checked
 route, exact phase boundaries, and reverse recovery trajectories. MPC uses that
 route as its local reference and replans short arm-command windows from fresh
-measured joint states. The outbound supported escape itself remains the exact
-trajectory that established the observation boundary.
+measured joint states. The outbound supported escape and its final exact reverse
+remain frozen trajectories because both touch the physically supported handoff.
 
 The isolated CUDA worker never publishes robot commands. Each returned window
 is hash-bound to the frozen execution plan and then installed atomically in the
@@ -21,7 +21,7 @@ cube changes physical role:
 
 | Motion endpoint | Finger/cube state | MPC collision model |
 | --- | --- | --- |
-| `clearance` | initial fingers; cube on table | supported start, cube is a world obstacle |
+| `clearance` | initial fingers; cube on table | frozen supported escape, not MPC |
 | `move_to_pregrasp` | open hand | cube and local table patch are world obstacles |
 | `grasp_approach` | open hand entering contact | designated fingertip links may contact the cube; table and all self-collisions remain checked |
 | `retention_test_lift` | measured stable-close fingers | cube is a 27-sphere payload attached to the grasp frame |
@@ -30,14 +30,14 @@ cube changes physical role:
 | `payload_replace` | same measured close | reuses the warm attached-payload model |
 | `grasp_retreat` | cube released; hand open | contact retreat with cube fixed in the world again |
 | `return_to_clearance` | open hand | cube and local table patch are world obstacles |
-| `__handoff__` | initial fingers restored | supported return, cube is a world obstacle |
+| `__handoff__` | initial fingers restored | frozen exact supported return, not MPC |
 
-The worker now retains one warmed controller for the complete lifecycle. The
-active seven arm joints, tensor sizes, collision-scene capacity, and CUDA graph
-addresses never change. At each phase boundary it copies pre-resolved
+The worker retains one warmed controller for all eight MPC-controlled phases.
+The active seven arm joints, tensor sizes, collision-scene capacity, and CUDA
+graph addresses never change. At each phase boundary it copies pre-resolved
 fixed-size kinematics and collision values into that controller, toggles the
-already allocated cube/table obstacles, and installs or removes the payload in
-reserved sphere slots. Returning to open-contact, open-free, or supported mode
+already allocated cube/table/fixture obstacles, and installs or removes the
+payload in reserved sphere slots. Returning to open-contact or open-free mode
 restores that mode's last action seed, preserving the useful reverse-path warm
 start without constructing another solver or CUDA graph.
 
@@ -45,6 +45,12 @@ Initial and deterministic open-finger kinematics are resolved before setup.
 The measured close posture cannot be known earlier; it is resolved once after
 the physical close stabilizes and then reused for all four connected payload
 motions. No geometry is approximated to make the switch cheap.
+
+For a presentation fixture, the attached cube/fixture pair is the one
+intentional support contact. The attached optimizer omits the fixture, and the
+independent exact-mesh check tests every robot sphere while excluding only the
+attached-object proxy. This matches the frozen payload planner without hiding
+any hand/fixture collision.
 
 Finger opening, stable-close acquisition, retention validation, release, and
 seated-control restoration remain discrete operations in the existing task
@@ -87,24 +93,31 @@ the last rejected window without adding file I/O to the live control period.
 
 ## Offline replay evidence
 
-The retained left-arm run `tabletop_20260815T224443Z` was replayed through all
-ten physical phases without ROS or robot commands. The single-solver replay
-completed 237 accepted windows with zero rejected windows. Every phase reached
-its frozen endpoint; the largest terminal joint error was 0.00495 rad and the
-maximum commanded velocity remained below the 0.1 rad/s contract.
+The current retained tripod run `tabletop_20260818T173706Z` was replayed without
+ROS or robot commands. The full clearance-boundary planner selected the same
+grasp as the successful hardware run, and the benchmark consumed that run's
+actual measured `grasp_close.json` rather than substituting the unreachable
+descriptor close target. All eight MPC-controlled phases reached their frozen
+endpoints through 179 accepted windows with zero rejected windows. The largest
+terminal joint error was 0.00429 rad and maximum velocity was 0.09877 rad/s
+against the unchanged 0.1 rad/s contract. The supported escape and its exact
+reverse are the two deliberately frozen trajectories outside this count.
 
-Final preparation fell from 22.84 s with four warmed solvers to 14.19 s with
-one: a 37.9% reduction. Complete benchmark wall time fell from 36.80 s to 27.75
-s, a 24.6% reduction. Rolling optimization remained essentially unchanged at
-11.55 s and overlaps physical motion.
+The current pinned optimizer advances in 25-iteration inner blocks. With 100
+warm-start iterations, the exact tripod replay produced 102 ms open-contact
+windows before IPC, violating the unchanged 100 ms source-state age contract.
+Fifty iterations was fast but produced a 0.10569 rad/s window that the velocity
+validator correctly rejected. Seventy-five iterations is therefore the lowest
+tested valid setting. Three complete repeatability runs each reached all eight
+endpoints with zero rejections; their worst window was 87.28 ms, leaving the
+state-age check intact instead of enlarging it.
 
-Every first-use cold solve is deliberately completed during phase preparation,
-before a live LowState freshness timestamp exists. Consequently the largest
-live window fell from an intermediate 94.6 ms to 64.1 ms against the unchanged
-100 ms age limit. Remaining preparation is primarily the first
-solver/CUDA-graph setup and prewarm (11.98 s), the one unavoidable
-measured-contact finger resolution (1.82 s), and about 0.28 s of first-use
-phase prewarming. Cached phase switches take roughly 1--10 ms.
+The production replay took 20.31 s of command-free compute. Initial solver and
+CUDA setup took 10.94 s, measured-close kinematics and attached-mode prewarm
+took 1.81 s, and cached phase switches took less than 10 ms after their first
+use. Rolling solves overlap physical motion. The largest production replay
+window was 84.81 ms; the three-run repeatability maximum above is the retained
+timing bound.
 
 An independent audit rebuilt each former physical-mode robot from its source
 configuration and compared it with the in-place model. Fixed transforms, joint

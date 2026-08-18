@@ -94,6 +94,11 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--clearance-request", type=Path, required=True)
     benchmark.add_argument("--plan", type=Path, required=True)
     benchmark.add_argument("--output", type=Path, required=True)
+    benchmark.add_argument(
+        "--grasp-close",
+        type=Path,
+        help="retained hardware grasp_close.json used for attached-payload replay",
+    )
     benchmark.add_argument("--maximum-steps", type=int, default=300)
     waist = subparsers.add_parser(
         "analyze-waist-yaw",
@@ -254,6 +259,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.plan,
                 args.output,
                 maximum_steps=args.maximum_steps,
+                grasp_close_path=args.grasp_close,
             )
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0

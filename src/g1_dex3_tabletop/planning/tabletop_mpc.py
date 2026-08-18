@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import copy
 import gc
+import hashlib
+import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,10 +53,13 @@ MPC_OPTIMIZATION_DT_S = 0.04
 MPC_INTERPOLATION_STEPS = 4
 MPC_DOCUMENTED_COMMAND_DT_S = MPC_OPTIMIZATION_DT_S / MPC_INTERPOLATION_STEPS
 MPC_COLD_START_ITERATIONS = 200
-MPC_WARM_START_ITERATIONS = 100
+# The pinned CuRobo optimizer advances in 25-iteration inner blocks. On the
+# retained current tripod scene, 100 iterations exceeded the unchanged 100 ms
+# source-state age contract, while 50 iterations produced an over-speed window.
+# Three complete 75-iteration replays stayed below 87.3 ms and 0.1 rad/s.
+MPC_WARM_START_ITERATIONS = 75
 MPC_EXPOSED_INTERPOLATION_WINDOWS = 3
 MPC_PHASE_ORDER = (
-    "clearance",
     "move_to_pregrasp",
     "grasp_approach",
     "retention_test_lift",
@@ -63,7 +68,6 @@ MPC_PHASE_ORDER = (
     "payload_replace",
     "grasp_retreat",
     "return_to_clearance",
-    "__handoff__",
 )
 MPC_ATTACHED_PHASES = frozenset(
     ("retention_test_lift", "payload_lift", "payload_lower", "payload_replace")
@@ -80,6 +84,7 @@ class MPCPhaseSpec:
     finger_state: str
     include_cube_in_optimizer: bool
     include_table_patch: bool
+    include_fixture_in_optimizer: bool
     allow_fingertip_cube_contact: bool
     attached_payload: bool
 
@@ -89,17 +94,6 @@ def mpc_phase_spec(phase: str) -> MPCPhaseSpec:
 
     if phase not in MPC_PHASE_ORDER:
         raise ValueError(f"unsupported tabletop MPC phase: {phase}")
-    if phase in ("clearance", "__handoff__"):
-        return MPCPhaseSpec(
-            phase=phase,
-            mode="supported",
-            request_state="loaded",
-            finger_state="initial",
-            include_cube_in_optimizer=True,
-            include_table_patch=False,
-            allow_fingertip_cube_contact=False,
-            attached_payload=False,
-        )
     if phase in ("move_to_pregrasp", "return_to_clearance"):
         return MPCPhaseSpec(
             phase=phase,
@@ -108,6 +102,7 @@ def mpc_phase_spec(phase: str) -> MPCPhaseSpec:
             finger_state="open",
             include_cube_in_optimizer=True,
             include_table_patch=True,
+            include_fixture_in_optimizer=True,
             allow_fingertip_cube_contact=False,
             attached_payload=False,
         )
@@ -122,6 +117,7 @@ def mpc_phase_spec(phase: str) -> MPCPhaseSpec:
             # the strict post-check independently enforces the same policy.
             include_cube_in_optimizer=True,
             include_table_patch=True,
+            include_fixture_in_optimizer=True,
             allow_fingertip_cube_contact=True,
             attached_payload=False,
         )
@@ -132,9 +128,25 @@ def mpc_phase_spec(phase: str) -> MPCPhaseSpec:
         finger_state="measured_contact",
         include_cube_in_optimizer=False,
         include_table_patch=False,
+        # The attached cube starts and ends in deliberate contact with its
+        # presenter. The frozen payload planner therefore omits the fixture
+        # from optimization and independently checks every robot sphere (but
+        # not the attached-object proxy) against its exact mesh.
+        include_fixture_in_optimizer=False,
         allow_fingertip_cube_contact=False,
         attached_payload=True,
     )
+
+
+def _fixture_excluded_links(spec: MPCPhaseSpec, *, arm: str) -> tuple[str, ...]:
+    """Return only the links intentionally excluded from fixture checking."""
+
+    links: list[str] = []
+    if spec.allow_fingertip_cube_contact:
+        links.extend(_contact_links(arm))
+    if spec.attached_payload:
+        links.append(attachment_link(arm))
+    return tuple(links)
 
 
 def _numpy(value) -> np.ndarray:
@@ -738,6 +750,11 @@ class TabletopPhaseMPC:
             "open_transit_table_patch",
             enable=spec.include_table_patch,
         )
+        if self.clearance_request.fixture is not None:
+            checker.enable_obstacle(
+                self.clearance_request.fixture.fixture_id,
+                enable=spec.include_fixture_in_optimizer,
+            )
 
     def _apply_phase_payload(self, *, attached: bool) -> None:
         if not attached:
@@ -1039,11 +1056,10 @@ class TabletopPhaseMPC:
 
         if self._fixture_checker is not None:
             fixture_spheres = sphere_tensor
-            if self.spec.allow_fingertip_cube_contact:
-                # The frozen linear-contact planner applies the same exception
-                # to these three links while the fingers enter the grasp.
+            excluded_fixture_links = _fixture_excluded_links(self.spec, arm=self.arm)
+            if excluded_fixture_links:
                 fixture_spheres = sphere_tensor.clone()
-                for link_name in _contact_links(self.arm):
+                for link_name in excluded_fixture_links:
                     indices = config.get_sphere_index_from_link_name(link_name).reshape(-1)
                     fixture_spheres[..., indices, 3] = -100.0
             fixture_hit = self._fixture_checker.first_collision(
@@ -1638,6 +1654,7 @@ def benchmark_tabletop_lifecycle_mpc(
     execution: TabletopExecutionPlan,
     *,
     config: MPCBenchmarkConfig | None = None,
+    measured_active_dex3_q_rad: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Replay every normal phase with its exact physical MPC model, command-free."""
 
@@ -1652,12 +1669,23 @@ def benchmark_tabletop_lifecycle_mpc(
     controller: TabletopPhaseMPC | None = None
     phase_results: list[dict[str, Any]] = []
     setup_events: list[dict[str, Any]] = []
-    command_q = np.asarray(execution.trajectories[0].command_q_rad[0], dtype=np.float64)
-    dq = np.zeros(7, dtype=np.float64)
-    contact_fingers = np.asarray(
-        execution.task.close_target_active_dex3_q_rad,
-        dtype=np.float64,
+    first_phase = MPC_PHASE_ORDER[0]
+    first_route = next(
+        trajectory for trajectory in execution.trajectories if trajectory.to_pose_id == first_phase
     )
+    command_q = np.asarray(first_route.command_q_rad[0], dtype=np.float64)
+    dq = np.zeros(7, dtype=np.float64)
+    if measured_active_dex3_q_rad is None:
+        contact_fingers = np.asarray(
+            execution.task.close_target_active_dex3_q_rad,
+            dtype=np.float64,
+        )
+        measured_close_source = "descriptor_target"
+    else:
+        contact_fingers = np.asarray(measured_active_dex3_q_rad, dtype=np.float64).reshape(-1)
+        if contact_fingers.shape != (7,) or not np.all(np.isfinite(contact_fingers)):
+            raise ValueError("measured MPC close posture must contain seven finite values")
+        measured_close_source = "retained_hardware_grasp_close"
     try:
         for phase in MPC_PHASE_ORDER:
             measured = contact_fingers if phase in MPC_ATTACHED_PHASES else None
@@ -1726,6 +1754,8 @@ def benchmark_tabletop_lifecycle_mpc(
         "clearance_request_sha256": clearance_request.content_sha256,
         "execution_plan_sha256": execution.content_sha256,
         "arm": execution.task.arm,
+        "measured_close_source": measured_close_source,
+        "active_dex3_close_q_rad": contact_fingers.tolist(),
         "complete": (
             len(phase_results) == len(MPC_PHASE_ORDER)
             and all(bool(item["reached_terminal"]) for item in phase_results)
@@ -1760,17 +1790,32 @@ def benchmark_from_paths(
     output_path: Path,
     *,
     maximum_steps: int,
+    grasp_close_path: Path | None = None,
 ) -> dict[str, Any]:
     from g1_dex3_tabletop.planning.contracts import atomic_write_json
 
     loaded_request = TabletopTaskRequest.from_json(loaded_request_path)
     clearance_request = TabletopTaskRequest.from_json(clearance_request_path)
     execution = TabletopExecutionPlan.from_json(execution_path)
+    measured_close = None
+    grasp_close_provenance = None
+    if grasp_close_path is not None:
+        raw = grasp_close_path.read_bytes()
+        document = json.loads(raw)
+        if document.get("active_side") != execution.task.arm:
+            raise ValueError("retained grasp close selects a different arm")
+        measured_close = np.asarray(document.get("close_q_rad"), dtype=np.float64)
+        grasp_close_provenance = {
+            "path": str(grasp_close_path.resolve()),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        }
     result = benchmark_tabletop_lifecycle_mpc(
         loaded_request,
         clearance_request,
         execution,
         config=MPCBenchmarkConfig(maximum_steps=maximum_steps),
+        measured_active_dex3_q_rad=measured_close,
     )
+    result["grasp_close_provenance"] = grasp_close_provenance
     atomic_write_json(output_path, result)
     return result

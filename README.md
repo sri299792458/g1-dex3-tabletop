@@ -214,9 +214,10 @@ that passed intrinsic retention and the stationary-cube fixed-close 5 mm table
 contract. No controller or safety setting changes with the profile.
 
 The default replays the complete frozen CuRobo trajectory lifecycle. To use
-the phase-aware rolling CuRobo controller for every normal arm motion, add
-`--motion-controller mpc`. Finger contact/retention transitions and rejection
-recovery remain with the existing state machine. The physical phase mapping,
+the phase-aware rolling CuRobo controller for the eight free, contact, and
+payload arm motions between the frozen supported escape and its exact return,
+add `--motion-controller mpc`. Finger contact/retention transitions and
+rejection recovery remain with the existing state machine. The phase mapping,
 window checks, retained offline replay, and current limitations are documented
 in [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 

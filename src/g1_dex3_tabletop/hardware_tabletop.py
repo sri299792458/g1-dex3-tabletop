@@ -1599,7 +1599,11 @@ def run_tabletop(args) -> int:
                 right=initial_right,
                 label="initial finger posture restoration",
             )
-            execute_phase("__handoff__")
+            # The arm starts and ends physically supported by the table. Use
+            # the supported escape's exact validated reverse here, matching
+            # the fixed outbound escape instead of substituting an MPC model
+            # built from the later clearance body snapshot.
+            execute_phase("__handoff__", use_mpc=False)
             if grasp_close is None or retention_evidence is None or retention_route is None:
                 raise RuntimeError("tabletop lifecycle ended without retention evidence")
             _restore_seated_control(

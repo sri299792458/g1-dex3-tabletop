@@ -3941,3 +3941,35 @@ the full two-color plate and check the marker with the detector.
   bursts; CLAHE produced `324/326` valid frame poses and the one false burst
   rejection above. The AprilCube library default, pose gates, and thresholds
   remain unchanged.
+
+## 2026-08-18 — Current tripod MPC lifecycle replay
+
+- The trajectory pipeline was checkpointed first as commit `4bb74cc`; the
+  pre-existing dirty `third_party/aprilcube` submodule remained excluded.
+- A command-free replay rebuilt the nominal full lifecycle from successful
+  left-arm tripod run `tabletop_20260818T173706Z`. It selected the same
+  `cube_head__seed_0000000129__sample_218` grasp and consumed the retained
+  physical `grasp_close.json` for attached-payload kinematics.
+- The first replay exposed two MPC/frozen-planner mismatches. Supported escape
+  and return were being modeled with the later clearance snapshot even though
+  these contact motions already have an exact validated frozen route. They are
+  now both kept outside MPC. Attached mode also checked the cube's intentional
+  tripod support contact as a collision. It now mirrors the frozen payload
+  planner: the fixture is absent from attached optimization, while the strict
+  exact-mesh check retains every robot sphere and excludes only the attached
+  object proxy. No table, collision, or speed threshold changed.
+- The corrected replay completed all eight MPC-controlled phases through `179`
+  accepted windows with zero rejections. Maximum endpoint error was
+  `0.004289 rad`; maximum velocity was `0.098770 rad/s` under the unchanged
+  `0.1 rad/s` limit.
+- The remaining timing failure was isolated to CuRobo optimization, not strict
+  validation: exact checks cost about `2.4 ms`, while 100 warm iterations made
+  open-contact windows reach `102 ms` before IPC. CuRobo requires multiples of
+  25 iterations. A 50-iteration replay generated a `0.105691 rad/s` window and
+  was rejected. Three complete 75-iteration replays had zero rejections and a
+  worst window of `87.277 ms`; 75 is therefore the lowest tested valid value,
+  with the `100 ms` source-state age limit unchanged.
+- The official benchmark now accepts a retained `--grasp-close` artifact and
+  hash-records it. The final artifact is ignored at
+  `work/mpc_replay_20260818T173706Z/mpc_benchmark_final.json`. No robot command
+  was sent.

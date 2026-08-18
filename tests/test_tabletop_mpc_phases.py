@@ -6,6 +6,7 @@ import pytest
 from g1_dex3_tabletop.planning.tabletop_mpc import (
     MPC_ATTACHED_PHASES,
     MPC_PHASE_ORDER,
+    _fixture_excluded_links,
     _payload_link_spheres,
     _world_collision_buffer_deltas,
     mpc_phase_spec,
@@ -31,8 +32,8 @@ class _ArrayValue:
 def test_every_normal_tabletop_motion_has_one_physical_mpc_state() -> None:
     specs = {phase: mpc_phase_spec(phase) for phase in MPC_PHASE_ORDER}
 
-    assert specs["clearance"].mode == "supported"
-    assert specs["__handoff__"].mode == "supported"
+    assert "clearance" not in specs
+    assert "__handoff__" not in specs
     assert specs["move_to_pregrasp"].mode == "open_free"
     assert specs["return_to_clearance"].mode == "open_free"
     assert specs["grasp_approach"].mode == "open_contact"
@@ -41,6 +42,27 @@ def test_every_normal_tabletop_motion_has_one_physical_mpc_state() -> None:
     assert all(
         spec.finger_state == "measured_contact" for spec in specs.values() if spec.attached_payload
     )
+    assert all(
+        not spec.include_fixture_in_optimizer for spec in specs.values() if spec.attached_payload
+    )
+
+
+def test_supported_routes_remain_frozen_instead_of_entering_mpc() -> None:
+    for phase in ("clearance", "__handoff__"):
+        with pytest.raises(ValueError, match="unsupported tabletop MPC phase"):
+            mpc_phase_spec(phase)
+
+
+def test_fixture_exclusions_match_contact_and_attached_payload_policies() -> None:
+    contact = _fixture_excluded_links(mpc_phase_spec("grasp_approach"), arm="left")
+    attached = _fixture_excluded_links(mpc_phase_spec("retention_test_lift"), arm="left")
+
+    assert contact == (
+        "left_hand_thumb_2_link",
+        "left_hand_middle_1_link",
+        "left_hand_index_1_link",
+    )
+    assert attached == ("left_attached_object",)
 
 
 def test_contact_routes_keep_cube_for_noncontact_links_without_attaching_it() -> None:
@@ -110,18 +132,7 @@ def test_planning_session_reuses_one_warmed_solver_across_every_mode(monkeypatch
     session._clearance_request = object()
     session._execution = SimpleNamespace(content_sha256="plan")
 
-    phases = (
-        "clearance",
-        "move_to_pregrasp",
-        "grasp_approach",
-        "retention_test_lift",
-        "payload_lift",
-        "payload_lower",
-        "payload_replace",
-        "grasp_retreat",
-        "return_to_clearance",
-        "__handoff__",
-    )
+    phases = MPC_PHASE_ORDER
     contact = np.zeros(7)
     for index, phase in enumerate(phases):
         result = session.prepare_mpc_phase(
