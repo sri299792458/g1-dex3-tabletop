@@ -79,6 +79,10 @@ def test_tabletop_cli_records_camera_by_default_and_exposes_explicit_skip() -> N
     args = build_parser().parse_args(command)
     assert args.object_profile == "cube40-r3"
     assert args.skip_camera_recording is False
+    assert args.maximum_arm_velocity_rad_s is None
+    assert build_parser().parse_args(
+        [*command, "--maximum-arm-velocity-rad-s", "0.2"]
+    ).maximum_arm_velocity_rad_s == pytest.approx(0.2)
     assert (
         build_parser().parse_args([*command, "--skip-camera-recording"]).skip_camera_recording
         is True

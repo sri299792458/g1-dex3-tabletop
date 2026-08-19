@@ -57,6 +57,7 @@ def build_tabletop_request(
     grasp_shortlist_path: str | Path,
     task_config_path: str | Path,
     object_dimensions_m: tuple[float, float, float],
+    maximum_arm_velocity_rad_s: float | None = None,
     presentation_id: str = "direct",
     fixture: TabletopFixture | None = None,
 ) -> TabletopTaskRequest:
@@ -71,6 +72,12 @@ def build_tabletop_request(
         relative_shortlist = shortlist.resolve().relative_to(root)
     except ValueError as error:
         raise ValueError("grasp shortlist must be inside the repository") from error
+    configured_velocity = float(task["motion"]["maximum_arm_velocity_rad_s"])
+    selected_velocity = (
+        configured_velocity
+        if maximum_arm_velocity_rad_s is None
+        else float(maximum_arm_velocity_rad_s)
+    )
     return TabletopTaskRequest(
         observation=observation,
         arm=validate_arm_side(arm),
@@ -91,7 +98,7 @@ def build_tabletop_request(
         supported_escape_m=float(task["motion"]["supported_escape_m"]),
         retention_test_lift_m=float(task["motion"]["retention_test_lift_m"]),
         lift_m=float(task["motion"]["payload_lift_m"]),
-        maximum_arm_velocity_rad_s=float(task["motion"]["maximum_arm_velocity_rad_s"]),
+        maximum_arm_velocity_rad_s=selected_velocity,
     )
 
 

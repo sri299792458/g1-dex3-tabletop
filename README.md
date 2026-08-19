@@ -390,11 +390,15 @@ clearance, must attain and retain 5 mm in free space, and must return over the
 exact reverse without going below the same boundary. The rule does not apply to
 the resting cube or its conservative payload proxy at initial support contact.
 
-For initial physical commissioning, `config/tabletop/task.yaml` limits every
-selected-arm trajectory to `0.100 rad/s`. The limit is hash-bound into each
+By default, `config/tabletop/task.yaml` limits every selected-arm trajectory to
+`0.100 rad/s`. A deliberate single-run trial can instead pass
+`--maximum-arm-velocity-rad-s 0.2`. The selected value is hash-bound into each
 planning request and stored in planner provenance; the executor independently
-rejects a plan above the hardware configuration's `0.200 rad/s` ceiling. Dex3
-posture changes retain their separately commissioned two-second smooth ramp.
+rejects anything above the hardware configuration's `0.200 rad/s` ceiling.
+Dex3 posture changes retain their separately commissioned two-second smooth
+ramp. The 0.2 trial was first replayed offline against retained successful 40 mm
+geometry; use it on the harnessed, cleared single-cube task before applying it
+to any new multi-object workflow.
 
 The persistent planner's complete output is streamed to the terminal and
 retained as `planner.log` in that run directory. Terminal IK failures name the candidate

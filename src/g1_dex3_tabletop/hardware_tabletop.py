@@ -736,6 +736,28 @@ def _save_frames(directory: Path, frames: tuple[ROSImageFrame, ...]) -> None:
     atomic_write_json(directory / "manifest.json", {"frames": manifest})
 
 
+def _resolve_task_velocity(
+    configured_velocity_rad_s: float,
+    requested_velocity_rad_s: float | None,
+    controller_ceiling_rad_s: float,
+) -> float:
+    """Resolve one explicit run limit without weakening the hardware ceiling."""
+
+    selected = (
+        float(configured_velocity_rad_s)
+        if requested_velocity_rad_s is None
+        else float(requested_velocity_rad_s)
+    )
+    if not np.isfinite(selected) or selected <= 0.0:
+        raise ValueError("tabletop arm velocity must be positive and finite")
+    if selected > float(controller_ceiling_rad_s):
+        raise ValueError(
+            f"tabletop arm velocity {selected:.4f}rad/s exceeds the commissioned "
+            f"controller ceiling {float(controller_ceiling_rad_s):.4f}rad/s"
+        )
+    return selected
+
+
 def run_tabletop(args) -> int:
     """Run one complete seated selected-Dex3 task after a single SPACE."""
 
@@ -748,9 +770,7 @@ def run_tabletop(args) -> int:
     presentation = load_tabletop_presentation(
         args.presentation,
         direct_object_profile_id=(
-            object_profile.profile_id
-            if args.presentation == DIRECT_PRESENTATION_ID
-            else None
+            object_profile.profile_id if args.presentation == DIRECT_PRESENTATION_ID else None
         ),
         direct_shortlist_override=(
             object_profile.direct_grasp_shortlist_path
@@ -800,12 +820,12 @@ def run_tabletop(args) -> int:
     recording, pairing = recording_configs(args.hardware_config)
     control_config, rate_hz = executor_config(args.hardware_config)
     control_config = replace(control_config, require_motion_endpoint_tolerance=False)
-    task_velocity = float(task_config["motion"]["maximum_arm_velocity_rad_s"])
-    if task_velocity > control_config.maximum_joint_velocity_rad_s:
-        raise ValueError(
-            f"tabletop arm velocity {task_velocity:.4f}rad/s exceeds the commissioned "
-            f"controller ceiling {control_config.maximum_joint_velocity_rad_s:.4f}rad/s"
-        )
+    configured_task_velocity = float(task_config["motion"]["maximum_arm_velocity_rad_s"])
+    task_velocity = _resolve_task_velocity(
+        configured_task_velocity,
+        args.maximum_arm_velocity_rad_s,
+        control_config.maximum_joint_velocity_rad_s,
+    )
     empty_pose_set = PoseSet(
         robot_model=model.name,
         mode_machine=5,
@@ -822,6 +842,12 @@ def run_tabletop(args) -> int:
         "object_profile_id": object_profile.profile_id,
         "presentation_id": presentation.presentation_id,
         "motion_controller": args.motion_controller,
+        "maximum_arm_velocity_rad_s": task_velocity,
+        "arm_velocity_source": (
+            "task_config_default"
+            if args.maximum_arm_velocity_rad_s is None
+            else "command_line_override"
+        ),
     }
     primary_error: BaseException | None = None
     rejection_return_completed = False
@@ -1043,6 +1069,7 @@ def run_tabletop(args) -> int:
                 grasp_shortlist_path=grasp_shortlist_path,
                 task_config_path=args.task_config,
                 object_dimensions_m=object_profile.dimensions_m,
+                maximum_arm_velocity_rad_s=task_velocity,
                 presentation_id=presentation.presentation_id,
                 fixture=presentation.fixture,
             )
@@ -1991,9 +2018,7 @@ def run_tabletop(args) -> int:
                     {
                         "schema_version": 2,
                         "controller": "curobo_mpc",
-                        "camera_state_correction": status[
-                            "mpc_camera_state_correction"
-                        ],
+                        "camera_state_correction": status["mpc_camera_state_correction"],
                         "run_status": status["status"],
                         "plan_sha256s": sorted(set(phase_plan_sha256.values())),
                         "phase_plan_sha256": phase_plan_sha256,

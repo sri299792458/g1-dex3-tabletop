@@ -489,6 +489,18 @@ def test_task_config_uses_only_a_local_open_transit_table_patch() -> None:
     assert request.retention_test_lift_m == 0.030
     assert request.minimum_hand_plane_clearance_m == 0.005
 
+    faster_request = build_tabletop_request(
+        arm="right",
+        observation=_observation(),
+        calibration_bundle=bundle,
+        calibration_bundle_path=bundle_path,
+        grasp_shortlist_path=shortlist,
+        task_config_path=task,
+        object_dimensions_m=(0.040, 0.040, 0.040),
+        maximum_arm_velocity_rad_s=0.200,
+    )
+    assert faster_request.maximum_arm_velocity_rad_s == 0.200
+
 
 def test_tabletop_trajectory_is_retimed_to_task_velocity() -> None:
     model_q = np.zeros((2, 7), dtype=np.float64)

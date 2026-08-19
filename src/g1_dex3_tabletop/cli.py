@@ -174,6 +174,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tabletop.add_argument(
+        "--maximum-arm-velocity-rad-s",
+        type=float,
+        default=None,
+        help=(
+            "explicit per-run arm trajectory limit; omitted uses the conservative "
+            "task-config default"
+        ),
+    )
+    tabletop.add_argument(
         "--pc2-host",
         default=os.environ.get("G1_PC2_HOST", "unitree@192.168.123.164"),
     )

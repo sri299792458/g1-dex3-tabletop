@@ -30,6 +30,17 @@ class _Rclpy:
         self._events.append("rclpy.shutdown")
 
 
+def test_task_velocity_defaults_and_explicit_override_preserve_hardware_ceiling() -> None:
+    assert hardware_tabletop._resolve_task_velocity(0.1, None, 0.2) == pytest.approx(0.1)
+    assert hardware_tabletop._resolve_task_velocity(0.1, 0.2, 0.2) == pytest.approx(0.2)
+
+    for invalid in (0.0, -0.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="positive and finite"):
+            hardware_tabletop._resolve_task_velocity(0.1, invalid, 0.2)
+    with pytest.raises(ValueError, match="exceeds the commissioned controller ceiling"):
+        hardware_tabletop._resolve_task_velocity(0.1, 0.2001, 0.2)
+
+
 def test_ros_teardown_refuses_active_direct_robot_ownership(monkeypatch) -> None:
     events: list[str] = []
     monkeypatch.setattr(
