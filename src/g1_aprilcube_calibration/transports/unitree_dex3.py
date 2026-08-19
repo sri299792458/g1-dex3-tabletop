@@ -665,6 +665,8 @@ class UnitreeDex3PostureController:
         self._initial_posture: Dex3StatePair | None = None
         self._active_left_target: np.ndarray | None = None
         self._active_right_target: np.ndarray | None = None
+        self._active_left_acceptance: np.ndarray | None = None
+        self._active_right_acceptance: np.ndarray | None = None
         self._active_grasp_close: Dex3GraspCloseEvidence | None = None
         self._active_retention: Dex3RetentionEvidence | None = None
         self._retention_test_active = False
@@ -697,6 +699,8 @@ class UnitreeDex3PostureController:
         )
         self._active_left_target = initial.left.position.copy()
         self._active_right_target = initial.right.position.copy()
+        self._active_left_acceptance = initial.left.position.copy()
+        self._active_right_acceptance = initial.right.position.copy()
         self._active_grasp_close = None
         self._active_retention = None
         self._retention_test_active = False
@@ -720,6 +724,8 @@ class UnitreeDex3PostureController:
         )
         self._active_left_target = np.asarray(self.config.left_target_q_rad, dtype=np.float64)
         self._active_right_target = np.asarray(self.config.right_target_q_rad, dtype=np.float64)
+        self._active_left_acceptance = self._active_left_target.copy()
+        self._active_right_acceptance = self._active_right_target.copy()
         self._active_grasp_close = None
         self._active_retention = None
         self._retention_test_active = False
@@ -730,6 +736,8 @@ class UnitreeDex3PostureController:
         *,
         left_target_q_rad,
         right_target_q_rad,
+        left_acceptance_q_rad=None,
+        right_acceptance_q_rad=None,
         label: str,
         safety_heartbeat: Callable[[], None] | None = None,
     ) -> Dex3StatePair:
@@ -741,16 +749,34 @@ class UnitreeDex3PostureController:
             raise ValueError("explicit Dex3 posture must contain seven values per hand")
         if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
             raise ValueError("explicit Dex3 posture contains NaN or infinity")
+        left_acceptance = np.asarray(
+            left if left_acceptance_q_rad is None else left_acceptance_q_rad,
+            dtype=np.float64,
+        ).reshape(-1)
+        right_acceptance = np.asarray(
+            right if right_acceptance_q_rad is None else right_acceptance_q_rad,
+            dtype=np.float64,
+        ).reshape(-1)
+        if left_acceptance.shape != (DEX3_MOTOR_COUNT,) or right_acceptance.shape != (
+            DEX3_MOTOR_COUNT,
+        ):
+            raise ValueError("explicit Dex3 acceptance posture must contain seven values per hand")
+        if not np.all(np.isfinite(left_acceptance)) or not np.all(np.isfinite(right_acceptance)):
+            raise ValueError("explicit Dex3 acceptance posture contains NaN or infinity")
         if not label.strip():
             raise ValueError("explicit Dex3 posture label must be non-empty")
         result = self._move_to_targets(
             left_target_q_rad=left,
             right_target_q_rad=right,
+            left_acceptance_q_rad=left_acceptance,
+            right_acceptance_q_rad=right_acceptance,
             label=label.strip(),
             safety_heartbeat=safety_heartbeat,
         )
         self._active_left_target = left.copy()
         self._active_right_target = right.copy()
+        self._active_left_acceptance = left_acceptance.copy()
+        self._active_right_acceptance = right_acceptance.copy()
         self._active_grasp_close = None
         self._active_retention = None
         self._retention_test_active = False
@@ -793,6 +819,8 @@ class UnitreeDex3PostureController:
         )
         self._active_left_target = left.copy()
         self._active_right_target = right.copy()
+        self._active_left_acceptance = left.copy()
+        self._active_right_acceptance = right.copy()
         self._active_grasp_close = evidence
         self._active_retention = None
         self._retention_test_active = False
@@ -843,6 +871,8 @@ class UnitreeDex3PostureController:
         )
         self._active_left_target = self._initial_posture.left.position.copy()
         self._active_right_target = self._initial_posture.right.position.copy()
+        self._active_left_acceptance = self._initial_posture.left.position.copy()
+        self._active_right_acceptance = self._initial_posture.right.position.copy()
         self._active_grasp_close = None
         self._active_retention = None
         self._retention_test_active = False
@@ -1204,12 +1234,22 @@ class UnitreeDex3PostureController:
         *,
         left_target_q_rad: np.ndarray,
         right_target_q_rad: np.ndarray,
+        left_acceptance_q_rad: np.ndarray | None = None,
+        right_acceptance_q_rad: np.ndarray | None = None,
         label: str,
         safety_heartbeat: Callable[[], None] | None,
     ) -> Dex3StatePair:
         self._require_active()
         initial = self.observer.observe()
         starts = {"left": initial.left.position, "right": initial.right.position}
+        acceptance = {
+            "left": (
+                left_target_q_rad if left_acceptance_q_rad is None else left_acceptance_q_rad
+            ),
+            "right": (
+                right_target_q_rad if right_acceptance_q_rad is None else right_acceptance_q_rad
+            ),
+        }
         started = self.clock.monotonic()
         deadline = started + self.config.posture_timeout_s
         settled_since: float | None = None
@@ -1236,8 +1276,8 @@ class UnitreeDex3PostureController:
             }
             self._publish_targets(pair, targets)
             _, _, maximum_error = pair.maximum_target_error(
-                tuple(left_target_q_rad),
-                tuple(right_target_q_rad),
+                tuple(acceptance["left"]),
+                tuple(acceptance["right"]),
             )
             in_position = (
                 fraction == 1.0 and maximum_error <= self.config.posture_position_tolerance_rad
@@ -1277,24 +1317,24 @@ class UnitreeDex3PostureController:
             )
             if now >= deadline and (not may_finish_existing_window or settle_window_broken):
                 side, motor_index, maximum_error = pair.maximum_target_error(
-                    tuple(left_target_q_rad),
-                    tuple(right_target_q_rad),
+                    tuple(acceptance["left"]),
+                    tuple(acceptance["right"]),
                 )
                 measured_q = (
                     pair.left.position[motor_index]
                     if side == "left"
                     else pair.right.position[motor_index]
                 )
-                target_q = (
-                    left_target_q_rad[motor_index]
+                acceptance_q = (
+                    acceptance["left"][motor_index]
                     if side == "left"
-                    else right_target_q_rad[motor_index]
+                    else acceptance["right"][motor_index]
                 )
                 raise RuntimeError(
-                    f"Dex3 {label} timed out: worst target "
+                    f"Dex3 {label} timed out: worst acceptance "
                     f"error={maximum_error:.4f}rad at {side} motor {motor_index} "
                     f"({dex3_motor_joint_name(side, motor_index)}) "
-                    f"(measured={measured_q:.4f}rad, target={target_q:.4f}rad, "
+                    f"(measured={measured_q:.4f}rad, acceptance={acceptance_q:.4f}rad, "
                     f"limit={self.config.posture_position_tolerance_rad:.4f}), "
                     "position spread="
                     f"{'n/a' if last_spread_rad is None else f'{last_spread_rad:.4f}rad'} "
@@ -1328,7 +1368,12 @@ class UnitreeDex3PostureController:
     def maintain_active_posture(self) -> None:
         """Maintain the last acquired/restored/task-specific posture."""
 
-        if self._active_left_target is None or self._active_right_target is None:
+        if (
+            self._active_left_target is None
+            or self._active_right_target is None
+            or self._active_left_acceptance is None
+            or self._active_right_acceptance is None
+        ):
             raise RuntimeError("Dex3 posture has not been acquired")
         if self._active_grasp_close is not None:
             now = self.clock.monotonic()
@@ -1342,6 +1387,8 @@ class UnitreeDex3PostureController:
         self._maintain_targets(
             left_target_q_rad=self._active_left_target,
             right_target_q_rad=self._active_right_target,
+            left_acceptance_q_rad=self._active_left_acceptance,
+            right_acceptance_q_rad=self._active_right_acceptance,
             label="active task posture",
         )
 
@@ -1390,6 +1437,8 @@ class UnitreeDex3PostureController:
         *,
         left_target_q_rad: np.ndarray,
         right_target_q_rad: np.ndarray,
+        left_acceptance_q_rad: np.ndarray | None = None,
+        right_acceptance_q_rad: np.ndarray | None = None,
         label: str,
     ) -> None:
         """Publish one frozen target after checking fresh measured tracking."""
@@ -1403,12 +1452,14 @@ class UnitreeDex3PostureController:
             return
         pair = self.observer.observe()
         side, motor_index, maximum_error = pair.maximum_target_error(
-            tuple(left_target_q_rad),
-            tuple(right_target_q_rad),
+            tuple(left_target_q_rad if left_acceptance_q_rad is None else left_acceptance_q_rad),
+            tuple(
+                right_target_q_rad if right_acceptance_q_rad is None else right_acceptance_q_rad
+            ),
         )
         if maximum_error > self.config.posture_position_tolerance_rad:
             raise RuntimeError(
-                f"Dex3 departed the {label}: worst target error is "
+                f"Dex3 departed the {label}: worst acceptance error is "
                 f"{maximum_error:.4f}rad at {side} motor {motor_index} "
                 f"({dex3_motor_joint_name(side, motor_index)}); limit "
                 f"is {self.config.posture_position_tolerance_rad:.4f}rad"

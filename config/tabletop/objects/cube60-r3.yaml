@@ -6,4 +6,4 @@ detector_config: config/tabletop/objects/cube60_r3/detector.json
 direct_grasp_shortlist: config/tabletop/objects/cube60_r3/shortlist.yaml
 sha256:
   detector_config: 57bd5905460b06960ecca027087ca2358dc3c3ae1d616557052ffec97c61bebc
-  direct_grasp_shortlist: a9e81acce2cfe043343cd1ccf2419b0c85dce1aa75a51cf3f0e92dac3a4ca569
+  direct_grasp_shortlist: cb92d409b24876f6bf5a57cebff841121f4ca4e47fa197d872f489233328bcda

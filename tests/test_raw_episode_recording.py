@@ -58,7 +58,7 @@ def test_camera_recording_is_on_by_default_and_can_be_excluded_as_one_pair() -> 
 
 
 def test_tabletop_cli_records_camera_by_default_and_exposes_explicit_skip() -> None:
-    command = [
+    incomplete_command = [
         "run-tabletop",
         "--arm",
         "right",
@@ -67,8 +67,18 @@ def test_tabletop_cli_records_camera_by_default_and_exposes_explicit_skip() -> N
         "--confirm",
         "test acknowledgement",
     ]
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(incomplete_command)
 
-    assert build_parser().parse_args(command).skip_camera_recording is False
+    command = [
+        *incomplete_command,
+        "--object-profile",
+        "cube40-r3",
+    ]
+
+    args = build_parser().parse_args(command)
+    assert args.object_profile == "cube40-r3"
+    assert args.skip_camera_recording is False
     assert (
         build_parser().parse_args([*command, "--skip-camera-recording"]).skip_camera_recording
         is True

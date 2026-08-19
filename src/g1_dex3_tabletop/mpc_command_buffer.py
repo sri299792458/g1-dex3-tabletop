@@ -28,6 +28,53 @@ def _q7(value: Any, *, name: str) -> tuple[float, ...]:
     return tuple(float(item) for item in array)
 
 
+def command_sequence_from_measured_plan(
+    planned_measured_q_rad: Any,
+    *,
+    measured_q_rad: Any,
+    active_command_q_rad: Any,
+    future_sample_time_s: Any,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Carry the live position-loop offset through a measured-state MPC plan.
+
+    CuRobo plans absolute future joint positions from the measured state.  The
+    G1 position controller can simultaneously be holding a different command
+    because gravity and load leave a finite tracking error.  Applying the
+    measured-state plan directly would remove that existing corrective effort
+    in the first sample.  Preserve that desired-versus-measured offset for the
+    complete short command horizon::
+
+        bias_now = q_command_now - q_measured_now
+        q_command(t) = q_mpc_measured(t) + bias_now
+
+    This is desired-state continuity, not an integral controller.  The offset
+    is remeasured from the live command and state for every rolling window.
+    Keeping it prevents receding-horizon replanning from repeatedly removing
+    the position error that supplies the commissioned motor PD holding effort.
+    The caller must still apply the normal hard-limit, collision, and
+    command-velocity checks independently to the measured plan and translated
+    command sequence.
+    """
+
+    planned = np.asarray(planned_measured_q_rad, dtype=np.float64)
+    if planned.ndim != 2 or planned.shape[0] < 1 or planned.shape[1] != 7:
+        raise ValueError("measured-state MPC plan must be a non-empty N x 7 array")
+    if not np.all(np.isfinite(planned)):
+        raise ValueError("measured-state MPC plan must contain only finite values")
+    times = np.asarray(future_sample_time_s, dtype=np.float64).reshape(-1)
+    if (
+        times.shape != (len(planned),)
+        or not np.all(np.isfinite(times))
+        or times[0] <= 0.0
+        or not np.all(np.diff(times) > 0.0)
+    ):
+        raise ValueError("future MPC sample times must be finite, positive, and increasing")
+    measured = np.asarray(_q7(measured_q_rad, name="measured position"))
+    active = np.asarray(_q7(active_command_q_rad, name="active command"))
+    tracking_offset = active - measured
+    return planned + tracking_offset[None, :], tracking_offset
+
+
 @dataclass(frozen=True, slots=True)
 class MPCCommandWindow:
     """One hash-bound, finite-horizon command returned by CuRobo MPC.

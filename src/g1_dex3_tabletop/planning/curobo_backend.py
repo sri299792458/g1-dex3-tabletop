@@ -43,6 +43,24 @@ from g1_dex3_tabletop.planning.g1_model import (
     palm_link,
 )
 
+
+def _clearance_from_activation_cost(cost: np.ndarray, activation_distance_m: float) -> np.ndarray:
+    """Invert CuRobo's exact smooth collision-activation function."""
+
+    values = np.asarray(cost, dtype=np.float64)
+    activation = float(activation_distance_m)
+    if not np.isfinite(activation) or activation <= 0.0:
+        raise ValueError("collision activation distance must be positive")
+    return np.where(
+        values <= 0.0,
+        activation,
+        np.where(
+            values <= 0.5 * activation,
+            activation - np.sqrt(2.0 * activation * np.maximum(values, 0.0)),
+            0.5 * activation - values,
+        ),
+    )
+
 IK_SEEDS = 16
 IK_RETURN_SEEDS = 4
 IK_POSITION_TOLERANCE_M = 0.002
@@ -50,6 +68,10 @@ IK_ROTATION_TOLERANCE_RAD = 0.02
 TRAJECTORY_INTERPOLATION_DT_S = 0.025
 EXECUTION_MAXIMUM_VELOCITY_RAD_S = 0.2
 COLLISION_ACTIVATION_DISTANCE_M = 0.01
+# Keep CuRobo's optimizer activation band separate from the hard open-hand
+# object margin. Entering the activation band should shape the optimizer cost;
+# it is not itself a physical collision.
+OPEN_TRANSIT_OBJECT_CLEARANCE_M = 0.005
 FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD = 0.02
 
 
@@ -543,6 +565,49 @@ class CuroboWorldCollisionChecker:
             if value is not None
         ]
         return max(hits, key=lambda value: value[0]) if hits else None
+
+    def minimum_clearance(
+        self,
+        spheres,
+        *,
+        kinematics_config,
+        activation_distance_m: float,
+    ) -> tuple[float, str, int]:
+        """Return the closest sphere/mesh clearance within a finite search band.
+
+        CuRobo's raw collision output is the smooth activation cost rather
+        than signed distance.  Invert that exact piecewise function here.  A
+        returned value equal to ``activation_distance_m`` means the true
+        clearance is at least that large.
+        """
+
+        from curobo._src.geom.collision.buffer_collision import CollisionBuffer
+
+        if not np.isfinite(activation_distance_m) or activation_distance_m <= 0.0:
+            raise ValueError("world-clearance activation distance must be positive")
+        query = self._query_shape(spheres)
+        shape = tuple(int(value) for value in query.shape)
+        if shape not in self._buffers:
+            self._buffers[shape] = CollisionBuffer.from_shape(shape, self.device_cfg)
+        activation = float(activation_distance_m)
+        cost = self.scene.get_sphere_distance_raw(
+            query,
+            self._buffers[shape],
+            self.device_cfg.to_device([1.0]),
+            self.device_cfg.to_device([activation]),
+        )[0]
+        maximum_cost, sphere_index = cost.max(dim=1)
+        values = maximum_cost.detach().cpu().numpy()
+        clearance = _clearance_from_activation_cost(values, activation)
+        sample_index = int(np.argmin(clearance))
+        selected_sphere = int(sphere_index[sample_index].item())
+        link_index = int(
+            kinematics_config.link_sphere_idx_map.reshape(-1)[selected_sphere].item()
+        )
+        index_to_name = {
+            value: name for name, value in kinematics_config.link_name_to_idx_map.items()
+        }
+        return float(clearance[sample_index]), index_to_name[link_index], sample_index
 
 
 def _self_collision_pair_penetrations(

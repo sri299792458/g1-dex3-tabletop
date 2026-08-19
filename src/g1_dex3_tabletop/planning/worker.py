@@ -99,6 +99,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="retained hardware grasp_close.json used for attached-payload replay",
     )
+    benchmark.add_argument(
+        "--camera-state-estimate",
+        type=Path,
+        help=(
+            "retained CameraStateEstimate or estimator installation-check JSON used "
+            "for command-free state-corrected replay"
+        ),
+    )
     benchmark.add_argument("--maximum-steps", type=int, default=300)
     waist = subparsers.add_parser(
         "analyze-waist-yaw",
@@ -260,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.output,
                 maximum_steps=args.maximum_steps,
                 grasp_close_path=args.grasp_close,
+                camera_state_estimate_path=args.camera_state_estimate,
             )
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0

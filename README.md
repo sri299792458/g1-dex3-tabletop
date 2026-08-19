@@ -185,8 +185,9 @@ recorded/replay measurement rather than an unvalidated estimator input.
 
 Physical starting state: G1 seated in FSM 3, both arms supported and stationary
 on the table, the selected AprilCube resting flat on any face and visible, the
-complete selected-arm sweep clear, and the RealSense node running. The default
-object profile is the printed 40 mm `dex3_safe_cube`.
+complete selected-arm sweep clear, and the RealSense node running. Object
+selection is always explicit: use `cube40-r3` for the printed 40 mm
+`dex3_safe_cube` or `cube60-r3` for the 60 mm R3 cube.
 Tabletop yaw is free;
 the detected face identity is only a coordinate convention and does not limit
 which face may be on top.
@@ -196,12 +197,13 @@ cd /home/kanth042/g1-dex3-tabletop
 ./tools/g1_tabletop_hardware.sh run-tabletop \
   --arm right \
   --network-interface enp134s0 \
+  --object-profile cube40-r3 \
   --calibration-bundle "$RUN/solve/calibration_bundle.json" \
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
-For the 60 mm R3 print with 45 mm `DICT_4X4_100` markers 10--15, add one
-argument to the same command:
+For the 60 mm R3 print with 45 mm `DICT_4X4_100` markers 10--15, select it
+instead:
 
 ```bash
   --object-profile cube60-r3
@@ -241,71 +243,85 @@ fixture checks. In fixture mode, the target-fixed hand portion of every
 removed before arm IK or trajectory optimization. The surviving arm IK
 endpoints are then strict-collision-checked in one GPU pass before route
 planning. After physical closure, the measured stable-close angles still
-revalidate the frozen payload route before beginning the payload lift.
+revalidate the frozen payload route before beginning the payload lift. If the
+actual contact-stalled fingers are already positively above the table but less
+than 5 mm away, the 30 mm test lift may escape from that exact boundary and its
+return must be the exact reverse: neither side may move closer than the measured
+boundary, and every intervening free-space sample must retain 5 mm.
 Each retained grasp receives one independent CuRobo IK problem with 16 seeds.
 The resulting finite joint-solution pool is then tested by the unchanged
 single-route planner and strict validators; candidates do not compete for one
 shared 16-seed goal set.
-The experimental `mpc` option does not yet consume this boundary estimate and
-prints that limitation explicitly.
+With `--motion-controller mpc`, the clearance observation instead anchors the
+fixed task for the complete rolling lifecycle. Every MPC window uses fresh
+pelvis orientation, waist joints, and torso IMU orientation to correct its
+camera/body pose, Cartesian goal, and collision scene. A presentation mesh is
+checked exactly after each optimized window with the existing 10 mm open-hand
+margin; it is not redundantly evaluated inside every optimizer iteration.
+This follows a stationary cube/fixture and does not perform mid-motion image
+tracking. See [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md) for the measured
+offline latency and remaining hardware-commissioning boundary.
 
-The direct-table behavior above remains the default. For the separate 50 mm
-tripod presenter, tape its base to the table and place the cube centred and
-yaw-aligned on the three pads, retain the default `cube40-r3` object profile,
-then add exactly one argument:
+The direct-table presentation above remains the default. To use the prime
+tower, fix its base to the table and place the selected cube centred and
+yaw-aligned on its top. Pass the object and presentation independently:
 
 ```bash
 ./tools/g1_tabletop_hardware.sh run-tabletop \
-  --presentation tripod-h50 \
   --arm right \
   --network-interface enp134s0 \
+  --object-profile cube40-r3 \
+  --presentation prime-tower \
   --calibration-bundle "$RUN/solve/calibration_bundle.json" \
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
-`tripod-h50` changes only the object presentation. It uses the exact printed
-STL as a CuRobo obstacle, derives its base pose from the freshly observed cube,
-and places the table plane 50 mm below the cube bottom. Camera observation,
+`prime-tower` changes only the object presentation. It uses the supplied
+35.42 x 34.75 x 60 mm STL as a CuRobo obstacle, derives its base pose from the
+freshly observed cube, and places the table plane 60 mm below the cube bottom.
+It supports both `cube40-r3` and `cube60-r3`; replace the object-profile value
+with `cube60-r3` for the larger cube. Camera observation,
 calibration, persistent planning, arm/Dex3 control, commissioned empty-close
 obstruction detection, 30 mm lifted retention checkpoint, reverse recovery,
 seated restoration, and MCAP recording are the same shared implementation. Omitting
-`--presentation tripod-h50`
+`--presentation prime-tower`
 removes the fixture completely from the request and scene.
 
-The packaged tripod shortlist contains all 372 independently h50-qualified
-candidates. Their achieved PhysX finger joints remain qualification evidence;
-they are not robot commands. Every physical grasp uses the one fixed close
-target from the Dex3 descriptor, while contact limits each finger's measured
-travel. Every candidate is qualified for the common 70 mm approach used at
-runtime; 365 and 353 also pass the longer 100 and 150 mm approaches respectively.
-CuRobo first checks all 372 fixed hand/fixture sweeps in batches, then gives the
-survivors independent batched arm IK problems and chooses using live
-reachability and complete-scene collision. Expensive trajectory optimization
-is reserved for the ranked strict-endpoint-valid branches.
+The packaged prime-tower shortlists contain 113 unchanged 40 mm poses and 312
+unchanged 60 mm poses, selected from their complete 3,178- and 3,279-pose
+intrinsic-retention pools. Qualification uses the real descriptor close—not a
+candidate-specific PhysX endpoint—and checks the exact 70 mm open approach and
+all 51 fixed-close samples against the exact tower and table. CuRobo repeats
+the fixed-close pruning against the live placed scene, gives survivors
+independent batched arm IK problems, and reserves expensive trajectory
+optimization for ranked strict-endpoint-valid branches.
 
 Before SPACE, this verifies the seated stationary state, both Dex3 states,
 camera profile, and cube observation without creating publishers. After SPACE,
 it acquires exact measured 29-joint lowcmd control, applies dual-Dex3 gravity
 feedforward, and observes the fixed cube in the loaded state. The worker first
 freezes only the supported escape and its exact reverse. After that lift reaches
-clearance, the controller holds the exact command, observes the unchanged cube
-again, and plans the only grasp lifecycle eligible for execution from that fresh
-camera/body state:
+clearance, the controller holds the exact arm command, sends the already-required
+descriptor open command to the empty selected hand, and records the achieved
+finger posture. It then observes the unchanged cube again and plans the only
+grasp lifecycle eligible for execution from that fresh camera/body and measured
+empty-open state:
 
 1. a straight supported-hand escape along the observed support-plane normal;
 2. bounded branch-aware complete-path selection from every stationary-cube,
-   fixed-close-qualified grasp in the selected object profile (five for 40 mm,
-   57 for 60 mm), with the exact side adapter applied
+   fixed-close-qualified grasp in the selected presentation/profile pair
+   (direct: five for 40 mm or 57 for 60 mm; prime tower: 113 or 312), with the
+   exact side adapter applied
    and every rejected IK branch and failure stage recorded;
 3. approach and smooth finger closure toward the fixed descriptor close target;
 4. a collision-aware 27-sphere conservative payload lift, exact reverse
    replacement, release, retreat, clearance return, and exact reverse
    supported return.
 
-The cube begins that lift in intentional contact with the tripod. During the
-direct separation and its exact reverse, only the attached-cube/tripod pair is
-excluded from CuRobo's optimizer world. The closed hand and every other robot
-sphere are independently checked against the exact tripod mesh over the
+The cube begins that lift in intentional contact with the prime tower. During
+the direct separation and its exact reverse, only the attached-cube/tower pair
+is excluded from CuRobo's optimizer world. The closed hand and every other robot
+sphere are independently checked against the exact tower mesh over the
 generated route; the cube-support exemption does not permit hand contact.
 
 The cube is the task-local table anchor during this boundary update; it must not
@@ -324,11 +340,23 @@ joint and one middle/index closing joint. A residual on only one side is an
 empty or pushed-cube result and is rejected. Raw pressure, `tau_est`, and
 velocity remain recorded diagnostics and never decide the live result.
 
+The run-start finger posture is arbitrary and is retained only for restoration
+before the exact supported return. It is not an open-hand reference. Open-hand
+collision geometry comes from the selected hand posture measured after the
+descriptor open command at clearance. The same descriptor target remains
+published after exact cube replacement, but completion is checked against that
+run-local measured empty-open posture using the commissioned tracking tolerance;
+the open command remains active throughout retreat. The two targets and both
+measured references are recorded in `dex3_run_local_references.json`. The task
+does not add an empty close/open cycle: the persistent empty-close commission is
+unchanged, and the empty-open measurement comes from the opening motion already
+required before pregrasp.
+
 Because the physical contact posture can differ from the simulated posture,
 the same worker rechecks the frozen payload route using the measured finger
 angles; it does not replan or alter the arm samples. Its arm-plus-finger FK and
 self-collision model is built once with the lifecycle and retained in memory.
-In tripod mode this same recheck also measures every robot collision sphere
+In presentation mode this same recheck also measures every robot collision sphere
 against the exact presenter mesh; direct mode incurs no fixture check.
 The one planned payload lift is split at its first sample at least `30 mm`
 above contact without changing any sample or invoking the planner again. The
@@ -354,10 +382,13 @@ shared grasp set and lifecycle with the left Dex3.
 
 For every post-escape wrist/hand route, merely positive table clearance is not
 accepted. `config/tabletop/task.yaml` requires 5 mm, matching the commissioned
-minimum collision clearance used by the calibration route validator. The same
-hash-bound floor is applied to frozen open/closed planning, the measured-contact
-payload-route check, and every MPC window. It does not apply to the resting cube
-or its conservative payload proxy at initial support contact.
+minimum collision clearance used by the calibration route validator. Frozen
+open/closed planning and every MPC window retain that hash-bound floor. The
+measured-contact payload route has one narrower boundary rule: a positive
+contact-stalled grasp below 5 mm may only escape without decreasing its starting
+clearance, must attain and retain 5 mm in free space, and must return over the
+exact reverse without going below the same boundary. The rule does not apply to
+the resting cube or its conservative payload proxy at initial support contact.
 
 For initial physical commissioning, `config/tabletop/task.yaml` limits every
 selected-arm trajectory to `0.100 rad/s`. The limit is hash-bound into each

@@ -26,6 +26,7 @@ from g1_dex3_tabletop.planning.curobo_backend import (
     COLLISION_ACTIVATION_DISTANCE_M,
     FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD,
     IK_SEEDS,
+    OPEN_TRANSIT_OBJECT_CLEARANCE_M,
     TRAJECTORY_INTERPOLATION_DT_S,
     CuroboKinematicCollisionChecker,
     CuroboWorldCollisionChecker,
@@ -62,6 +63,7 @@ IK_BRANCH_DUPLICATE_TOLERANCE_RAD = 1.0e-5
 PREGRASP_IK_POSITION_TOLERANCE_M = 0.005
 PREGRASP_IK_ORIENTATION_TOLERANCE_RAD = 0.05
 FIXED_CLOSE_COLLISION_BATCH_SAMPLES = 4096
+PLANE_CLEARANCE_NUMERICAL_TOLERANCE_M = 1.0e-6
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +93,16 @@ class _ApproachBranchPlan:
     minimum_plane_link: str
     minimum_plane_sample: int
     fixed_close_sweep: _FixedCloseSweepResult
+
+
+@dataclass(frozen=True, slots=True)
+class _StartRelativePlaneClearance:
+    minimum_m: float
+    minimum_link: str
+    minimum_sample: int
+    boundary_m: float
+    first_full_margin_sample: int
+    last_full_margin_sample: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -785,6 +797,31 @@ def _local_plane_clearance_from_spheres(
 ) -> tuple[float, str, int]:
     """Evaluate the table guard from already-computed CuRobo spheres."""
 
+    clearances, links = _local_plane_clearance_samples_from_spheres(
+        sphere_array,
+        config=config,
+        arm=arm,
+        plane_point=plane_point,
+        down=down,
+        include_payload=include_payload,
+        link_names=link_names,
+    )
+    minimum_sample = int(np.argmin(clearances))
+    return float(clearances[minimum_sample]), links[minimum_sample], minimum_sample
+
+
+def _local_plane_clearance_samples_from_spheres(
+    sphere_array: np.ndarray,
+    *,
+    config,
+    arm: str,
+    plane_point: np.ndarray,
+    down: np.ndarray,
+    include_payload: bool,
+    link_names: tuple[str, ...] | None = None,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Return the closest guarded link and signed clearance at every sample."""
+
     import torch
 
     values = np.asarray(sphere_array, dtype=np.float64)
@@ -793,9 +830,8 @@ def _local_plane_clearance_from_spheres(
     selected_links = list(_local_table_plane_links(arm) if link_names is None else link_names)
     if include_payload:
         selected_links.append(attachment_link(arm))
-    minimum = float("inf")
-    minimum_link = ""
-    minimum_sample = -1
+    minimum = np.full(values.shape[0], np.inf, dtype=np.float64)
+    minimum_link = np.full(values.shape[0], "", dtype=object)
     up = -np.asarray(down, dtype=np.float64)
     point = np.asarray(plane_point, dtype=np.float64)
     for link_name in selected_links:
@@ -810,16 +846,95 @@ def _local_plane_clearance_from_spheres(
         valid = selected[..., 3] > 0.0
         clearance = np.einsum("...i,i->...", selected[..., :3] - point, up) - selected[..., 3]
         clearance = np.where(valid, clearance, np.inf)
-        flat_index = int(np.argmin(clearance))
-        value = float(clearance.reshape(-1)[flat_index])
-        if value < minimum:
-            sample_index, _sphere_index = np.unravel_index(flat_index, clearance.shape)
-            minimum = value
-            minimum_link = link_name
-            minimum_sample = int(sample_index)
-    if not np.isfinite(minimum):
+        per_sample = np.min(clearance, axis=1)
+        update = per_sample < minimum
+        minimum[update] = per_sample[update]
+        minimum_link[update] = link_name
+    if not np.all(np.isfinite(minimum)) or np.any(minimum_link == ""):
         raise RuntimeError("table-plane guard found no enabled local collision spheres")
-    return minimum, minimum_link, minimum_sample
+    return minimum, tuple(str(value) for value in minimum_link)
+
+
+def _validate_start_relative_retention_clearance(
+    clearances_m: np.ndarray,
+    links: tuple[str, ...],
+    *,
+    required_m: float,
+) -> _StartRelativePlaneClearance:
+    """Validate an escape from, and exact return to, a positive grasp boundary."""
+
+    values = np.asarray(clearances_m, dtype=np.float64).reshape(-1)
+    if len(values) < 2 or len(links) != len(values) or not np.all(np.isfinite(values)):
+        raise ValueError("retention table clearances must describe every finite route sample")
+    if not np.isfinite(required_m) or required_m <= 0.0:
+        raise ValueError("retention free-space table margin must be positive and finite")
+    tolerance = PLANE_CLEARANCE_NUMERICAL_TOLERANCE_M
+    start = float(values[0])
+    end = float(values[-1])
+    minimum_sample = int(np.argmin(values))
+    minimum = float(values[minimum_sample])
+    minimum_link = links[minimum_sample]
+    if start <= 0.0 or end <= 0.0:
+        boundary_sample = 0 if start <= end else len(values) - 1
+        raise RuntimeError(
+            "measured close Dex3 grasp boundary is not above the observed table plane: "
+            f"clearance={values[boundary_sample]:.4f}m at {links[boundary_sample]} "
+            f"sample {boundary_sample}/{len(values) - 1}"
+        )
+    if abs(start - end) > tolerance:
+        raise RuntimeError(
+            "measured close payload route does not return to the same hand/table "
+            f"boundary: start={start:.6f}m, end={end:.6f}m"
+        )
+
+    full_margin = values >= required_m - tolerance
+    if not np.any(full_margin):
+        raise RuntimeError(
+            "measured close payload route never reaches the required free-space "
+            f"hand/table margin: maximum={np.max(values):.4f}m; required={required_m:.4f}m"
+        )
+    first_full = int(np.flatnonzero(full_margin)[0])
+    last_full = int(np.flatnonzero(full_margin)[-1])
+    boundary = min(start, end)
+
+    outbound_minimum_sample = int(np.argmin(values[: first_full + 1]))
+    if values[outbound_minimum_sample] < boundary - tolerance:
+        raise RuntimeError(
+            "measured close payload escape moves closer to the table than its "
+            f"already-achieved grasp boundary: clearance={values[outbound_minimum_sample]:.4f}m "
+            f"at {links[outbound_minimum_sample]} sample {outbound_minimum_sample}/"
+            f"{len(values) - 1}; boundary={boundary:.4f}m"
+        )
+
+    interior = values[first_full : last_full + 1]
+    interior_minimum_offset = int(np.argmin(interior))
+    interior_minimum_sample = first_full + interior_minimum_offset
+    if interior[interior_minimum_offset] < required_m - tolerance:
+        raise RuntimeError(
+            "measured close payload route drops below the required free-space "
+            f"hand/table margin: clearance={values[interior_minimum_sample]:.4f}m at "
+            f"{links[interior_minimum_sample]} sample {interior_minimum_sample}/"
+            f"{len(values) - 1}; required={required_m:.4f}m"
+        )
+
+    return_minimum_offset = int(np.argmin(values[last_full:]))
+    return_minimum_sample = last_full + return_minimum_offset
+    if values[return_minimum_sample] < boundary - tolerance:
+        raise RuntimeError(
+            "measured close payload return moves closer to the table than its "
+            f"grasp boundary: clearance={values[return_minimum_sample]:.4f}m at "
+            f"{links[return_minimum_sample]} sample {return_minimum_sample}/"
+            f"{len(values) - 1}; boundary={boundary:.4f}m"
+        )
+
+    return _StartRelativePlaneClearance(
+        minimum_m=minimum,
+        minimum_link=minimum_link,
+        minimum_sample=minimum_sample,
+        boundary_m=boundary,
+        first_full_margin_sample=first_full,
+        last_full_margin_sample=last_full,
+    )
 
 
 class _FixedCloseSweepValidator:
@@ -1141,7 +1256,7 @@ def _world_cuboid_clearances(
     checker: CuroboKinematicCollisionChecker | None = None,
     sphere_array: np.ndarray | None = None,
 ) -> list[dict[tuple[str, str], float]]:
-    """Return signed robot-sphere clearances to nearby named scene cuboids."""
+    """Return robot-sphere/cuboid pairs below the hard object margin."""
 
     values = np.asarray(q_samples, dtype=np.float64)
     active = checker or CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
@@ -1184,7 +1299,7 @@ def _world_cuboid_clearances(
             0.0,
         )
         clearances = signed_box_distance - spheres[..., 3]
-        hits = np.argwhere(enabled & (clearances < COLLISION_ACTIVATION_DISTANCE_M))
+        hits = np.argwhere(enabled & (clearances < OPEN_TRANSIT_OBJECT_CLEARANCE_M))
         for sample_index, sphere_index in hits:
             link_name = sphere_links[int(sphere_index)]
             key = (link_name, object_name)
@@ -2247,14 +2362,18 @@ def _validate_open_route(
         disabled_links=disabled_cube_links,
         checker=strict_checker,
     )
+    closest_cube = None
     for sample_index, clearances in enumerate(route_cube_clearances):
-        if not clearances:
-            continue
-        (link_name, object_name), clearance = min(clearances.items(), key=lambda item: item[1])
+        for (link_name, object_name), clearance in clearances.items():
+            if closest_cube is None or clearance < closest_cube[3]:
+                closest_cube = (sample_index, link_name, object_name, clearance)
+    if closest_cube is not None:
+        sample_index, link_name, object_name, clearance = closest_cube
         raise _BranchRejected(
             "open_route_strict_cube_collision",
             f"{link_name}/{object_name}={clearance * 1000.0:+.3f}mm "
-            f"clearance at sample {sample_index}",
+            f"clearance at sample {sample_index}; required "
+            f"{OPEN_TRANSIT_OBJECT_CLEARANCE_M * 1000.0:.3f}mm",
         )
 
     open_clearance, open_link, open_sample = _local_plane_clearance(
@@ -2694,7 +2813,7 @@ class RetentionRouteValidator:
             joint_names=self.active_joint_names,
         )
         spheres = sphere_tensor.detach().cpu().numpy().reshape(len(route_q), -1, 4)
-        hand_clearance, hand_link, hand_sample = _local_plane_clearance_from_spheres(
+        hand_clearances, hand_links = _local_plane_clearance_samples_from_spheres(
             spheres,
             config=self.checker.config.kinematics_config,
             arm=self.arm,
@@ -2702,13 +2821,14 @@ class RetentionRouteValidator:
             down=self.down,
             include_payload=False,
         )
-        if hand_clearance < self.tabletop.minimum_hand_plane_clearance_m:
-            raise RuntimeError(
-                "measured close Dex3 posture leaves insufficient hand/table execution "
-                f"margin: clearance={hand_clearance:.4f}m at {hand_link} sample "
-                f"{hand_sample}/{len(route_q) - 1}; required="
-                f"{self.tabletop.minimum_hand_plane_clearance_m:.4f}m"
-            )
+        plane_policy = _validate_start_relative_retention_clearance(
+            hand_clearances,
+            hand_links,
+            required_m=self.tabletop.minimum_hand_plane_clearance_m,
+        )
+        hand_clearance = plane_policy.minimum_m
+        hand_link = plane_policy.minimum_link
+        hand_sample = plane_policy.minimum_sample
         if self.fixture_checker is not None:
             fixture_hit = self.fixture_checker.first_collision(
                 sphere_tensor,
@@ -2724,7 +2844,11 @@ class RetentionRouteValidator:
                 )
         report(
             "measured close-hand retention route passed strict self-collision and "
-            f"table-plane checks; minimum hand clearance={hand_clearance:.4f}m"
+            "start-relative table-plane checks; "
+            f"boundary/minimum hand clearance={plane_policy.boundary_m:.4f}m/"
+            f"{hand_clearance:.4f}m, full {self.tabletop.minimum_hand_plane_clearance_m:.4f}m "
+            f"margin over samples {plane_policy.first_full_margin_sample}-"
+            f"{plane_policy.last_full_margin_sample}"
             + (
                 " and CUDA fixture collision check passed"
                 if self.fixture_checker is not None
@@ -2749,6 +2873,10 @@ class RetentionRouteValidator:
                 "cached_kinematics": True,
                 "cache_build_s": self.cache_build_s,
                 "required_hand_plane_clearance_m": (self.tabletop.minimum_hand_plane_clearance_m),
+                "table_plane_policy": "positive_start_relative_escape_exact_reverse_return",
+                "boundary_hand_plane_clearance_m": plane_policy.boundary_m,
+                "first_full_margin_sample": plane_policy.first_full_margin_sample,
+                "last_full_margin_sample": plane_policy.last_full_margin_sample,
                 "policy": (
                     "frozen split payload arm route; measured stable-close active Dex3; "
                     "strict full-robot self-collision, selected wrist/hand table plane, "
@@ -2800,8 +2928,14 @@ def _plan_tabletop(
                 f"required grasp candidate {required_candidate_id!r} is not uniquely present"
             )
         report(f"preserving previously selected grasp {required_candidate_id}")
-    open_profile, close_target_profile = dex3_execution_profile(arm)
-    open_q = np.asarray(open_profile, dtype=np.float64)
+    open_target_profile, close_target_profile = dex3_execution_profile(arm)
+    open_target_q = np.asarray(open_target_profile, dtype=np.float64)
+    open_q = np.asarray(
+        request.planning_snapshot.left_dex3_q_rad
+        if arm == "left"
+        else request.planning_snapshot.right_dex3_q_rad,
+        dtype=np.float64,
+    )
     close_target_q = np.asarray(close_target_profile, dtype=np.float64)
     reference = np.asarray(request.planning_snapshot.measured_q29_rad)[
         np.asarray(arm_indices(arm))
@@ -3234,7 +3368,7 @@ def _plan_tabletop(
                 object_T_grasp=tuple(
                     tuple(float(value) for value in row) for row in object_T_grasp
                 ),
-                open_active_dex3_q_rad=tuple(open_q),
+                open_active_dex3_q_rad=tuple(open_target_q),
                 outbound=approach_plan.approach,
                 inbound=inbound,
                 planner_provenance={
@@ -3287,6 +3421,7 @@ def _plan_tabletop(
                     "open_hand_minimum_plane_clearance_sample": (
                         approach_plan.minimum_plane_sample
                     ),
+                    "measured_empty_open_active_dex3_q_rad": list(open_q),
                     "fixed_close_sweep_sample_count": (
                         approach_plan.fixed_close_sweep.sample_count
                     ),
@@ -3373,7 +3508,7 @@ def _plan_tabletop(
             arm=arm,
             selected_candidate_id=str(selected["candidate_id"]),
             object_T_grasp=tuple(tuple(float(v) for v in row) for row in object_T_grasp),
-            open_active_dex3_q_rad=tuple(open_q),
+            open_active_dex3_q_rad=tuple(open_target_q),
             close_target_active_dex3_q_rad=tuple(close_target_q),
             initial_active_dex3_q_rad=(
                 request.planning_snapshot.left_dex3_q_rad
@@ -3450,6 +3585,7 @@ def _plan_tabletop(
                     "one descriptor-defined target for every grasp; physical contact limits "
                     "measured travel; candidate PhysX endpoints are qualification evidence only"
                 ),
+                "measured_empty_open_active_dex3_q_rad": list(open_q),
                 "fixed_close_sweep_sample_count": fixed_close_sweep_plan.sample_count,
                 "fixed_close_sweep_maximum_joint_step_rad": (FINGER_SWEEP_MAXIMUM_JOINT_STEP_RAD),
                 "fixed_close_sweep_minimum_plane_clearance_m": (

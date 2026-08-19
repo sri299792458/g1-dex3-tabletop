@@ -35,6 +35,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _table_from_resting_object,
     _try_branch_pool,
     _validate_open_route_segments,
+    _validate_start_relative_retention_clearance,
     _validate_strict_supported_escape_self_collision,
 )
 from g1_dex3_tabletop.tabletop_contracts import SupportedEscapePlan, TabletopObservation
@@ -166,6 +167,83 @@ def test_linear_finger_sweep_has_exact_endpoints_and_bounded_steps() -> None:
     np.testing.assert_array_equal(sweep[0], start)
     np.testing.assert_array_equal(sweep[-1], target)
     assert np.max(np.abs(np.diff(sweep, axis=0))) <= 0.02
+
+
+def test_measured_close_route_can_escape_from_a_positive_submargin_boundary() -> None:
+    clearances = np.asarray(
+        [
+            0.0038077514,
+            0.0038077511,
+            0.0041641479,
+            0.0049591359,
+            0.0062544693,
+            0.0102200422,
+            0.0062544693,
+            0.0049591359,
+            0.0041641479,
+            0.0038077514,
+        ]
+    )
+    links = ("left_hand_middle_1_link",) * len(clearances)
+
+    result = _validate_start_relative_retention_clearance(
+        clearances,
+        links,
+        required_m=0.005,
+    )
+
+    assert result.minimum_m == pytest.approx(0.0038077511)
+    assert result.boundary_m == pytest.approx(0.0038077514)
+    assert result.first_full_margin_sample == 4
+    assert result.last_full_margin_sample == 6
+
+
+def test_measured_close_escape_cannot_move_below_its_starting_clearance() -> None:
+    clearances = np.asarray([0.0038, 0.0030, 0.0060, 0.0038])
+    links = ("left_hand_middle_1_link",) * len(clearances)
+
+    with pytest.raises(RuntimeError, match="moves closer.*already-achieved grasp boundary"):
+        _validate_start_relative_retention_clearance(
+            clearances,
+            links,
+            required_m=0.005,
+        )
+
+
+def test_measured_close_route_cannot_dip_below_margin_in_free_space() -> None:
+    clearances = np.asarray([0.0038, 0.0060, 0.0040, 0.0060, 0.0038])
+    links = ("left_hand_middle_1_link",) * len(clearances)
+
+    with pytest.raises(RuntimeError, match="drops below.*free-space"):
+        _validate_start_relative_retention_clearance(
+            clearances,
+            links,
+            required_m=0.005,
+        )
+
+
+def test_measured_close_route_must_reach_full_free_space_margin() -> None:
+    clearances = np.asarray([0.0038, 0.0045, 0.0038])
+    links = ("left_hand_middle_1_link",) * len(clearances)
+
+    with pytest.raises(RuntimeError, match="never reaches.*free-space"):
+        _validate_start_relative_retention_clearance(
+            clearances,
+            links,
+            required_m=0.005,
+        )
+
+
+def test_measured_close_start_relative_rule_never_allows_table_penetration() -> None:
+    clearances = np.asarray([-0.0001, 0.0060, -0.0001])
+    links = ("left_hand_middle_1_link",) * len(clearances)
+
+    with pytest.raises(RuntimeError, match="not above the observed table plane"):
+        _validate_start_relative_retention_clearance(
+            clearances,
+            links,
+            required_m=0.005,
+        )
 
 
 def test_fixed_close_sweep_rejects_table_crossing_before_pregrasp(monkeypatch) -> None:

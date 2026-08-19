@@ -3,11 +3,18 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from g1_aprilcube_calibration.transforms import invert_transform
+from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
+from g1_dex3_tabletop.planning.curobo_backend import _clearance_from_activation_cost
 from g1_dex3_tabletop.planning.tabletop_mpc import (
     MPC_ATTACHED_PHASES,
     MPC_PHASE_ORDER,
+    MPCBenchmarkConfig,
+    TabletopPhaseMPC,
     _fixture_excluded_links,
+    _nominal_base_T_live_base,
     _payload_link_spheres,
+    _simulate_phase,
     _world_collision_buffer_deltas,
     mpc_phase_spec,
 )
@@ -29,6 +36,104 @@ class _ArrayValue:
         return self._value
 
 
+def test_lifecycle_benchmark_preserves_configured_tracking_offset() -> None:
+    offset = np.asarray([0.005, -0.002, 0.001, -0.008, 0.004, 0.0, 0.001])
+    terminal = np.full(7, 0.01)
+
+    class Controller:
+        names = tuple(f"joint_{index}" for index in range(7))
+        request = SimpleNamespace(joint_position_offsets_rad={})
+        spec = SimpleNamespace(
+            phase="move_to_pregrasp",
+            mode="open_free",
+            reference_fixed_goal=False,
+        )
+        path_model_q = np.stack((np.zeros(7), terminal))
+
+        def next_nominal_window(
+            self,
+            *,
+            measured_command_q_rad,
+            measured_dq_rad_s,
+            active_command_q_rad,
+            state_monotonic_s,
+            reference_T_camera,
+        ):
+            del measured_dq_rad_s, state_monotonic_s, reference_T_camera
+            np.testing.assert_allclose(
+                np.asarray(active_command_q_rad) - np.asarray(measured_command_q_rad),
+                offset,
+            )
+            return MPCCommandWindow(
+                generation=0,
+                plan_sha256="a" * 64,
+                state_monotonic_s=1.0,
+                sample_time_s=(0.0, 0.2),
+                command_q_rad=(
+                    tuple(active_command_q_rad),
+                    tuple(terminal + offset),
+                ),
+                feasible=True,
+                terminal=True,
+                solve_time_s=0.01,
+                diagnostics={},
+            )
+
+    phase, measured, velocity = _simulate_phase(
+        Controller(),
+        command_q_rad=np.zeros(7),
+        model_dq_rad_s=np.zeros(7),
+        config=MPCBenchmarkConfig(
+            maximum_steps=2,
+            simulated_tracking_offset_rad=tuple(offset),
+        ),
+    )
+
+    assert phase["reached_terminal"]
+    assert phase["accepted_windows"] == 1
+    np.testing.assert_allclose(measured, terminal)
+    np.testing.assert_allclose(velocity, np.zeros(7))
+
+
+def test_curobo_activation_cost_is_inverted_to_signed_clearance() -> None:
+    activation = 0.01
+    outside_clearance = 0.004
+    outside_cost = 0.5 * (activation - outside_clearance) ** 2 / activation
+    penetration = 0.002
+    penetration_cost = activation + penetration - 0.5 * activation
+
+    clearance = _clearance_from_activation_cost(
+        np.asarray([0.0, outside_cost, penetration_cost]),
+        activation,
+    )
+
+    np.testing.assert_allclose(clearance, [activation, outside_clearance, -penetration])
+
+
+def test_strict_mpc_check_rejects_translated_command_outside_hard_limits() -> None:
+    limits = _ArrayValue(np.vstack((np.full(7, -1.0), np.full(7, 1.0))))
+    checker = SimpleNamespace(
+        kinematics=SimpleNamespace(
+            get_joint_limits=lambda: SimpleNamespace(position=limits),
+        )
+    )
+    controller = object.__new__(TabletopPhaseMPC)
+    controller._strict_checker = checker
+    controller._active_world_correction = {}
+    controller.names = tuple(f"joint_{index}" for index in range(7))
+
+    diagnostics = controller._strict_window_diagnostics(
+        np.asarray([[0.0] * 6 + [1.01]], dtype=np.float64)
+    )
+
+    assert not diagnostics["strict_valid"]
+    assert diagnostics["strict_failure"] == "joint_limit"
+    assert diagnostics["strict_failure_sample"] == 0
+    assert diagnostics["strict_failure_links"] == ["joint_6"]
+    assert diagnostics["strict_failure_position_rad"] == pytest.approx(1.01)
+    assert diagnostics["strict_failure_limits_rad"] == [-1.0, 1.0]
+
+
 def test_every_normal_tabletop_motion_has_one_physical_mpc_state() -> None:
     specs = {phase: mpc_phase_spec(phase) for phase in MPC_PHASE_ORDER}
 
@@ -42,9 +147,81 @@ def test_every_normal_tabletop_motion_has_one_physical_mpc_state() -> None:
     assert all(
         spec.finger_state == "measured_contact" for spec in specs.values() if spec.attached_payload
     )
+    assert all(not spec.include_fixture_in_optimizer for spec in specs.values())
+    assert not specs["return_to_clearance"].reference_fixed_goal
     assert all(
-        not spec.include_fixture_in_optimizer for spec in specs.values() if spec.attached_payload
+        spec.reference_fixed_goal
+        for phase, spec in specs.items()
+        if phase != "return_to_clearance"
     )
+
+
+def test_live_body_frame_maps_into_the_frozen_strict_scene() -> None:
+    base_T_torso0 = np.eye(4)
+    base_T_torso0[:3, 3] = [0.1, -0.2, 0.6]
+    reference_T_torso0 = np.eye(4)
+    reference_T_torso0[:3, 3] = [-0.3, 0.4, 0.8]
+    reference_T_torso = np.eye(4)
+    reference_T_torso[:3, :3] = np.asarray(
+        [
+            [0.999390827, 0.0, 0.034899497],
+            [0.0, 1.0, 0.0],
+            [-0.034899497, 0.0, 0.999390827],
+        ]
+    )
+    reference_T_torso[:3, 3] = [-0.29, 0.395, 0.804]
+    nominal_base_T_live_base = _nominal_base_T_live_base(
+        base_T_torso0=base_T_torso0,
+        reference_T_torso0=reference_T_torso0,
+        reference_T_torso=reference_T_torso,
+    )
+
+    reference_point = np.asarray([0.2, -0.1, 0.05, 1.0])
+    nominal_base_T_reference = base_T_torso0 @ invert_transform(reference_T_torso0)
+    live_base_T_reference = base_T_torso0 @ invert_transform(reference_T_torso)
+    live_point = live_base_T_reference @ reference_point
+
+    np.testing.assert_allclose(
+        nominal_base_T_live_base @ live_point,
+        nominal_base_T_reference @ reference_point,
+        atol=1.0e-9,
+    )
+
+
+def test_planning_session_forwards_hash_bound_camera_state_correction() -> None:
+    received = {}
+    result = object()
+
+    class FakeMPC:
+        spec = SimpleNamespace(phase="move_to_pregrasp")
+
+        def next_nominal_window(self, **kwargs):
+            received.update(kwargs)
+            return result
+
+    correction = {
+        "reference_T_camera": np.eye(4).tolist(),
+        "timestamp_ns": 12,
+        "anchor_timestamp_ns": 10,
+        "source_monotonic_s": 1.0,
+    }
+    session = TabletopPlanningSession()
+    session._active_phase_mpc = FakeMPC()
+
+    actual = session.step_mpc_phase(
+        {
+            "phase": "move_to_pregrasp",
+            "measured_command_q_rad": [0.0] * 7,
+            "measured_dq_rad_s": [0.0] * 7,
+            "active_command_q_rad": [0.0] * 7,
+            "state_monotonic_s": 1.0,
+            "camera_state_correction": correction,
+        }
+    )
+
+    assert actual is result
+    np.testing.assert_allclose(received["reference_T_camera"], np.eye(4))
+    assert received["camera_state_provenance"] == correction
 
 
 def test_supported_routes_remain_frozen_instead_of_entering_mpc() -> None:
@@ -408,3 +585,39 @@ def test_precomputed_spheres_preserve_named_cuboid_clearance_policy() -> None:
         sphere_array=spheres,
     )
     assert disabled == [{}]
+
+
+def test_named_cuboid_clearance_uses_five_mm_hard_margin() -> None:
+    checker = SimpleNamespace(
+        config=SimpleNamespace(
+            kinematics_config=SimpleNamespace(
+                link_sphere_idx_map=_ArrayValue([0]),
+                link_name_to_idx_map={"wrist": 0},
+            )
+        )
+    )
+    scene = {
+        "cuboid": {
+            "cube": {
+                "dims": [2.0, 2.0, 2.0],
+                "pose": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            }
+        }
+    }
+    q_samples = np.zeros((2, 7))
+    # A 0.1 m radius sphere centered at x=1.104 m has 4 mm clearance;
+    # x=1.106 m has 6 mm clearance. Only the former violates the 5 mm gate.
+    spheres = np.asarray([[[1.104, 0.0, 0.0, 0.1]], [[1.106, 0.0, 0.0, 0.1]]])
+
+    clearances = _world_cuboid_clearances(
+        robot={},
+        q_samples=q_samples,
+        scene=scene,
+        device_cfg=None,
+        disabled_links=set(),
+        checker=checker,
+        sphere_array=spheres,
+    )
+
+    assert clearances[0] == {("wrist", "cube"): pytest.approx(0.004)}
+    assert clearances[1] == {}

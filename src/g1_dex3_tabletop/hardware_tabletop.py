@@ -75,7 +75,10 @@ from g1_dex3_tabletop.planning.contracts import (
     RobotSnapshot,
     atomic_write_json,
 )
-from g1_dex3_tabletop.planning.dex3_handedness import dex3_empty_close_reference
+from g1_dex3_tabletop.planning.dex3_handedness import (
+    dex3_empty_close_reference,
+    dex3_execution_profile,
+)
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
 from g1_dex3_tabletop.state_estimation import (
     AnchoredCameraPoseEstimators,
@@ -195,6 +198,35 @@ def _wait_for_camera_state_input(
             last = str(error)
         time.sleep(0.005)
     raise RuntimeError("timed out pairing camera-state inputs: " + last)
+
+
+def _mpc_camera_state_record(
+    synchronized_input,
+    estimate,
+    state,
+    *,
+    maximum_time_difference_s: float,
+) -> dict:
+    """Bind one estimator result to the arm state used by the same MPC solve."""
+
+    estimate_monotonic_s = estimate.timestamp_ns / 1.0e9
+    arm_state_monotonic_s = float(state.receipt_monotonic_s)
+    estimate_to_arm_state_s = arm_state_monotonic_s - estimate_monotonic_s
+    if abs(estimate_to_arm_state_s) > maximum_time_difference_s:
+        raise RuntimeError(
+            "MPC camera/body estimate and arm state differ by "
+            f"{estimate_to_arm_state_s:+.6f}s; limit is "
+            f"{maximum_time_difference_s:.6f}s"
+        )
+    return {
+        **estimate.to_dict(),
+        "input": synchronized_input.to_dict(),
+        "arm_state_monotonic_s": arm_state_monotonic_s,
+        "estimate_to_arm_state_s": estimate_to_arm_state_s,
+        # The window depends on both measurements, so its freshness clock is
+        # deliberately the older of the two rather than only the arm sample.
+        "source_monotonic_s": min(arm_state_monotonic_s, estimate_monotonic_s),
+    }
 
 
 def _wait_for_activation(observer, states, pose_set, recording, timeout_s: float = 5.0):
@@ -374,21 +406,27 @@ def _command_fingers(
     *,
     left,
     right,
+    left_acceptance=None,
+    right_acceptance=None,
     label: str,
-) -> None:
+):
     driver.safety_heartbeat = watchdog_value.pulse
 
     def check() -> None:
         driver.check()
         watchdog_value.pulse()
 
-    controller.command_posture(
-        left_target_q_rad=left,
-        right_target_q_rad=right,
-        label=label,
-        safety_heartbeat=check,
-    )
-    driver.safety_heartbeat = _finger_heartbeat(watchdog_value, controller)
+    try:
+        return controller.command_posture(
+            left_target_q_rad=left,
+            right_target_q_rad=right,
+            left_acceptance_q_rad=left_acceptance,
+            right_acceptance_q_rad=right_acceptance,
+            label=label,
+            safety_heartbeat=check,
+        )
+    finally:
+        driver.safety_heartbeat = _finger_heartbeat(watchdog_value, controller)
 
 
 def _command_retention_test_close(
@@ -498,6 +536,7 @@ def _execute_mpc_phase(
     control_config,
     measured_active_dex3_q_rad=None,
     phase_record: dict | None = None,
+    camera_state_provider=None,
 ) -> tuple[dict, list[dict]]:
     """Execute one normal frozen route through phase-aware rolling MPC."""
 
@@ -542,7 +581,19 @@ def _execute_mpc_phase(
     )
 
     def request_window() -> MPCCommandWindow:
+        camera_state = None
+        if camera_state_provider is not None:
+            synchronized_input, estimate = camera_state_provider()
         state, active_command = synchronized.observe_control_input()
+        state_source_monotonic_s = float(state.receipt_monotonic_s)
+        if camera_state_provider is not None:
+            camera_state = _mpc_camera_state_record(
+                synchronized_input,
+                estimate,
+                state,
+                maximum_time_difference_s=(control_config.state_freshness_timeout_s),
+            )
+            state_source_monotonic_s = camera_state["source_monotonic_s"]
         event = planner.request_payload(
             "step-mpc-phase",
             payload={
@@ -550,12 +601,21 @@ def _execute_mpc_phase(
                 "measured_command_q_rad": state.arm_q(arm).tolist(),
                 "measured_dq_rad_s": state.arm_dq(arm).tolist(),
                 "active_command_q_rad": active_command.tolist(),
-                "state_monotonic_s": state.receipt_monotonic_s,
+                "state_monotonic_s": state_source_monotonic_s,
+                "camera_state_correction": camera_state,
             },
             control_check=driver.check,
             timeout_s=max(1.0, control_config.state_freshness_timeout_s * 10.0),
         )
-        return MPCCommandWindow.from_dict(event["payload"])
+        window = MPCCommandWindow.from_dict(event["payload"])
+        if camera_state is not None:
+            if window.diagnostics.get("camera_state_correction") != camera_state:
+                raise RuntimeError(
+                    "CuRobo MPC window did not preserve its camera-state correction"
+                )
+            if phase_record is not None:
+                phase_record["camera_state_corrections"].append(camera_state)
+        return window
 
     windows: list[dict] = []
     first = request_window()
@@ -683,9 +743,15 @@ def run_tabletop(args) -> int:
         raise ValueError(f"--confirm must equal exactly: {MOTION_ACK}")
     arm = validate_arm_side(args.arm)
     empty_close_reference_q_rad, minimum_opposed_shortfall_rad = dex3_empty_close_reference(arm)
+    active_open_target_q_rad, _active_close_target_q_rad = dex3_execution_profile(arm)
     object_profile = load_tabletop_object_profile(args.object_profile)
     presentation = load_tabletop_presentation(
         args.presentation,
+        direct_object_profile_id=(
+            object_profile.profile_id
+            if args.presentation == DIRECT_PRESENTATION_ID
+            else None
+        ),
         direct_shortlist_override=(
             object_profile.direct_grasp_shortlist_path
             if args.presentation == DIRECT_PRESENTATION_ID
@@ -694,6 +760,7 @@ def run_tabletop(args) -> int:
     )
     presentation.require_arm(arm)
     presentation.require_object_profile(object_profile.profile_id)
+    grasp_shortlist_path = presentation.grasp_shortlist_for(object_profile.profile_id)
     hardware = load_hardware(args.hardware_config)
     configured_arms = {
         str(hardware["robot"]["calibration_arm"]),
@@ -719,7 +786,7 @@ def run_tabletop(args) -> int:
     task_config_bytes = args.task_config.read_bytes()
     object_profile_bytes = object_profile.config_path.read_bytes()
     detector_config_bytes = object_profile.detector_config_path.read_bytes()
-    grasp_shortlist_bytes = object_profile.direct_grasp_shortlist_path.read_bytes()
+    grasp_shortlist_bytes = grasp_shortlist_path.read_bytes()
     presentation_config_bytes = (
         None if presentation.config_path is None else presentation.config_path.read_bytes()
     )
@@ -840,8 +907,8 @@ def run_tabletop(args) -> int:
             )
             if presentation.fixture is not None:
                 print(
-                    "TRIPOD-H50 CONTRACT — fixture base fixed to the table; cube centred "
-                    "and yaw-aligned on its three pads; the exact fixture mesh will be a "
+                    "PRIME-TOWER CONTRACT — 60 mm tower base fixed to the table; cube "
+                    "centred and yaw-aligned on its top; the exact tower mesh will be a "
                     "CuRobo obstacle",
                     flush=True,
                 )
@@ -875,7 +942,7 @@ def run_tabletop(args) -> int:
                 raise RuntimeError("tabletop object profile changed after preflight")
             if object_profile.detector_config_path.read_bytes() != detector_config_bytes:
                 raise RuntimeError("object detector config changed after preflight")
-            if object_profile.direct_grasp_shortlist_path.read_bytes() != grasp_shortlist_bytes:
+            if grasp_shortlist_path.read_bytes() != grasp_shortlist_bytes:
                 raise RuntimeError("object grasp shortlist changed after preflight")
             if (
                 presentation.config_path is not None
@@ -973,7 +1040,7 @@ def run_tabletop(args) -> int:
                 observation=loaded_observation,
                 calibration_bundle=bundle,
                 calibration_bundle_path=args.calibration_bundle,
-                grasp_shortlist_path=presentation.grasp_shortlist_path,
+                grasp_shortlist_path=grasp_shortlist_path,
                 task_config_path=args.task_config,
                 object_dimensions_m=object_profile.dimensions_m,
                 presentation_id=presentation.presentation_id,
@@ -1026,7 +1093,17 @@ def run_tabletop(args) -> int:
                 plan_sha256=escape.content_sha256,
                 control_config=control_config,
             )
+            clearance_fingers_changed = False
             try:
+                clearance_fingers_changed = True
+                measured_open_pair = _command_fingers(
+                    dex_controller,
+                    driver,
+                    guard,
+                    left=active_open_target_q_rad if arm == "left" else initial_left,
+                    right=active_open_target_q_rad if arm == "right" else initial_right,
+                    label=f"{arm}-hand empty-open acquisition at clearance",
+                )
                 clearance_frames = _collect_frames(
                     rclpy,
                     node,
@@ -1037,6 +1114,42 @@ def run_tabletop(args) -> int:
                 )
                 boundary_state = synchronized.observe_state()
                 boundary_hands = dex_controller.observer.observe()
+                measured_empty_open_q_rad = (
+                    boundary_hands.left.position.copy()
+                    if arm == "left"
+                    else boundary_hands.right.position.copy()
+                )
+                acquisition_empty_open_q_rad = (
+                    measured_open_pair.left.position.copy()
+                    if arm == "left"
+                    else measured_open_pair.right.position.copy()
+                )
+                atomic_write_json(
+                    task_run / "dex3_run_local_references.json",
+                    {
+                        "active_side": arm,
+                        "open_command_target_q_rad": list(active_open_target_q_rad),
+                        "measured_empty_open_at_acquisition_q_rad": (
+                            acquisition_empty_open_q_rad.tolist()
+                        ),
+                        "measured_empty_open_at_visual_anchor_q_rad": (
+                            measured_empty_open_q_rad.tolist()
+                        ),
+                        "commissioned_empty_close_q_rad": list(empty_close_reference_q_rad),
+                        "posture_position_tolerance_rad": (
+                            dex_controller.config.posture_position_tolerance_rad
+                        ),
+                    },
+                )
+                print(
+                    "RUN-LOCAL EMPTY OPEN READY — descriptor zero remains the command; "
+                    "planning and release use the measured clearance posture; maximum "
+                    "descriptor residual="
+                    f"{np.max(np.abs(measured_empty_open_q_rad)):.4f}rad, "
+                    "acquisition-to-anchor change="
+                    f"{np.max(np.abs(measured_empty_open_q_rad - acquisition_empty_open_q_rad)):.4f}rad",
+                    flush=True,
+                )
                 boundary_observation = observe_resting_cube(
                     [item.image_bgr for item in clearance_frames],
                     camera_info=expected_camera,
@@ -1087,6 +1200,22 @@ def run_tabletop(args) -> int:
                         ),
                     },
                 )
+
+                def current_mpc_camera_state():
+                    current = _wait_for_camera_state_input(
+                        camera_state_inputs,
+                        target_monotonic_s=None,
+                        maximum_age_s=control_config.state_freshness_timeout_s,
+                        maximum_gap_s=pairing.maximum_bracket_span_s,
+                        control_check=driver.check,
+                    )
+                    estimate = camera_estimator.estimate(current.sample)
+                    if estimate.anchor_timestamp_ns != camera_state_anchor.sample.timestamp_ns:
+                        raise RuntimeError(
+                            "live MPC camera estimate belongs to another visual anchor"
+                        )
+                    return current, estimate
+
                 escape_return = _trajectory_with_endpoints(
                     escape.inbound,
                     from_pose_id="return_to_clearance",
@@ -1145,6 +1274,15 @@ def run_tabletop(args) -> int:
             except (PlannerRequestRejected, RuntimeError, ValueError) as error:
                 driver.check()
                 try:
+                    if clearance_fingers_changed:
+                        _command_fingers(
+                            dex_controller,
+                            driver,
+                            guard,
+                            left=initial_left,
+                            right=initial_right,
+                            label="initial finger posture restoration after clearance failure",
+                        )
                     _execute_trajectory(
                         synchronized,
                         driver,
@@ -1216,6 +1354,7 @@ def run_tabletop(args) -> int:
                         "completed": False,
                         "preparation": None,
                         "windows": [],
+                        "camera_state_corrections": [],
                     }
                     mpc_phases[name] = phase_record
                     preparation, windows = _execute_mpc_phase(
@@ -1228,6 +1367,7 @@ def run_tabletop(args) -> int:
                         control_config=control_config,
                         measured_active_dex3_q_rad=measured_active_dex3_q_rad,
                         phase_record=phase_record,
+                        camera_state_provider=current_mpc_camera_state,
                     )
                     assert phase_record["preparation"] == preparation
                     assert phase_record["windows"] == windows
@@ -1260,6 +1400,10 @@ def run_tabletop(args) -> int:
                     guard,
                     left=active_open if arm == "left" else initial_left,
                     right=active_open if arm == "right" else initial_right,
+                    left_acceptance=(measured_empty_open_q_rad if arm == "left" else initial_left),
+                    right_acceptance=(
+                        measured_empty_open_q_rad if arm == "right" else initial_right
+                    ),
                     label=label,
                 )
 
@@ -1284,7 +1428,6 @@ def run_tabletop(args) -> int:
                 execute_phase("__handoff__", use_mpc=False)
                 rejection_return_completed = True
 
-            open_active_hand(f"{arm}-hand pregrasp open")
             execute_phase("move_to_pregrasp")
             if args.motion_controller == "trajectory":
                 original_pregrasp_plan = pregrasp_plan
@@ -1458,9 +1601,11 @@ def run_tabletop(args) -> int:
                 execute_phase("estimated_pregrasp", use_mpc=False)
             else:
                 print(
-                    "PREGRASP STATE CORRECTION NOT APPLIED — the optional MPC execution "
-                    "path retains its own frozen lifecycle; use the default trajectory "
-                    "controller for the commissioned stationary-boundary correction",
+                    "CONTINUOUS MPC CAMERA-STATE CORRECTION ACTIVE — the fixed cube "
+                    "clearance observation is the 6D reference anchor; every MPC window "
+                    "uses fresh pelvis orientation, three waist joints, and torso IMU "
+                    "orientation to move its task goal and fixed collision scene. No "
+                    "mid-motion image processing or moving-object tracking is implied",
                     flush=True,
                 )
             if task is None:
@@ -1797,6 +1942,35 @@ def run_tabletop(args) -> int:
                 "pregrasp_camera_state_estimate",
                 camera_state_estimate.to_dict(),
             )
+        if args.motion_controller == "mpc":
+            correction_windows = [
+                window
+                for phase in mpc_phases.values()
+                for window in phase["windows"]
+                if "camera_state_correction" in window["diagnostics"]
+            ]
+            status["mpc_camera_state_correction"] = {
+                "enabled": True,
+                "estimator": "hybrid_pelvis_position_torso_orientation",
+                "visual_anchor": "fixed_cube_at_clearance",
+                "corrected_window_count": len(correction_windows),
+                "maximum_goal_translation_correction_m": (
+                    max(
+                        float(window["diagnostics"]["goal_translation_correction_m"])
+                        for window in correction_windows
+                    )
+                    if correction_windows
+                    else None
+                ),
+                "maximum_goal_rotation_correction_deg": (
+                    max(
+                        float(window["diagnostics"]["goal_rotation_correction_deg"])
+                        for window in correction_windows
+                    )
+                    if correction_windows
+                    else None
+                ),
+            }
         try:
             if preflight_frames:
                 _save_frames(task_run / "preflight", preflight_frames)
@@ -1815,8 +1989,11 @@ def run_tabletop(args) -> int:
                 atomic_write_json(
                     task_run / "mpc_lifecycle.json",
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "controller": "curobo_mpc",
+                        "camera_state_correction": status[
+                            "mpc_camera_state_correction"
+                        ],
                         "run_status": status["status"],
                         "plan_sha256s": sorted(set(phase_plan_sha256.values())),
                         "phase_plan_sha256": phase_plan_sha256,

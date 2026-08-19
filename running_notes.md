@@ -3973,3 +3973,421 @@ the full two-color plate and check the marker with the detector.
   hash-records it. The final artifact is ignored at
   `work/mpc_replay_20260818T173706Z/mpc_benchmark_final.json`. No robot command
   was sent.
+
+## 2026-08-18 — Continuous MPC body correction and measured latency fix
+
+- The clearance cube observation is now the fixed six-dimensional task
+  anchor for the MPC path. Every rolling request receipt-pairs a fresh arm
+  state with the existing pelvis/waist/torso estimator, uses the older source
+  timestamp for the unchanged 100 ms freshness rule, and hash-binds the exact
+  `reference_T_camera` estimate into the returned command window.
+- The worker moves both the local Cartesian goal and the cube/table/fixture
+  scene from the frozen body frame into the estimated live body frame. Strict
+  robot spheres are transformed back into the nominal scene frame before the
+  existing full self/world checks. The final clearance endpoint remains the
+  exact body-relative joint junction with the frozen supported return.
+- Pose-only continuous CuRobo updates were tested and rejected. The redundant
+  seven-joint arm lost its validated branch, used 245 windows for the first
+  leg, and failed the cube check at grasp retreat. A nominal-joint posture
+  regularizer was faster but missed the cube activation band by 0.132 mm.
+  Production therefore retains CuRobo local retargeting IK seeded at the
+  matching frozen-route waypoint and requires the existing 0.005 rad corrected
+  endpoint agreement in addition to the existing Cartesian tolerances.
+- A temporary experiment reduced only that auxiliary IK iteration count; it
+  was reverted because iteration tuning was not the root cause. The 75 MPC
+  iterations, 0.1 rad/s speed, 100 ms freshness, 10 mm activation distance,
+  and every collision geometry remain unchanged.
+- Component profiling showed about 8--9 ms for body/goal correction and about
+  3 ms for the independent strict checks. Attached phases optimized in
+  31--34 ms. The slow open phases spent up to 98 ms inside optimization because
+  the tripod triangle mesh was queried at every one of 75 iterations. On the
+  identical pregrasp route, removing only the fixture from the iterative
+  optimizer reduced optimizer mean/max from 44.2/69.6 ms to 31.4/35.2 ms;
+  removing the table made no measurable difference and removing the cube only
+  a small difference.
+- The rolling optimizer now follows the already fixture-validated frozen route
+  with cube/table costs, while the independent CUDA checker remains the exact
+  fixture authority for every returned window. Open-hand phases enforce the
+  same 10 mm activation margin in that exact check. Attached phases retain the
+  pre-existing no-penetration policy because the cube deliberately rests on
+  the tripod. Exact-clearance replay measured every open phase at least 10 mm
+  away; attached retention/replacement reached 4.455/3.270 mm without
+  penetration.
+- Profiling also exposed two cold/correctness issues. The live-scene sphere
+  transform kernel had not been exercised during setup, causing one 80 ms
+  first-use spike; setup now warms the same path. When fixture-excluded contact
+  or payload links were present, strict fixture checking accidentally cloned
+  untransformed spheres; it now consistently uses the corrected nominal-scene
+  spheres before disabling only the named links.
+- Three complete final-code corrected eight-phase replays passed with 181
+  accepted and zero rejected windows each. Worst complete windows were 57.72,
+  51.72, and 53.16 ms, leaving at least 42 ms before the unchanged 100 ms
+  source-age limit. Every open phase retained at least 10 mm exact fixture
+  clearance; attached pickup/replacement reached 4.455/3.270 mm without
+  penetration. These are command-free retained-run results, not physical MPC
+  commissioning. No robot command was sent.
+
+## 2026-08-18 — MPC warm iterations raised to 100
+
+- The configured rolling CuRobo solve was changed from 75 to 100 warm
+  iterations at operator request. Speed remains 0.1 rad/s, state freshness
+  remains 100 ms, and exact fixture checking still validates every returned
+  window outside the iterative optimizer. A complete command-free retained-run
+  replay passed all eight phases in 161 accepted windows with zero rejections;
+  its worst complete window was 50.82 ms, maximum velocity was 0.088084 rad/s,
+  and every open phase retained at least 10 mm exact fixture clearance. The
+  preceding 75-iteration timing measurements remain historical evidence rather
+  than the current runtime bound. No robot command was sent.
+
+## 2026-08-18 — Prime tower replaces the tripod presentation
+
+- The `tripod-h50` presentation and all three packaged tripod artifacts were
+  removed. There is no compatibility alias. The new opt-in interface is
+  `--presentation prime-tower`, and direct-table behavior remains the default.
+- The operator-supplied `prime_tower_collision.stl` is one watertight,
+  axis-aligned 35.42 x 34.75 x 60.00 mm mesh, centered in X/Y with its base at
+  Z=0. Its SHA-256 is
+  `2e1409589b2a4cb394b8ac89756f8e9739e2c8ebbe2324815258f8cc7eb2ad56`.
+  The shared placement contract fixes its base to the table and centers either
+  cube, yaw-aligned, on the 60 mm top.
+- Profile-specific grasp lists sit behind the one presentation argument. The
+  existing full intrinsic-retention pools were filtered without changing any
+  `object_T_G`: 113/3,178 candidates for `cube40-r3` and 312/3,279 for
+  `cube60-r3` passed. Qualification reused the existing GraspGenX exact Dex3
+  geometry/FCL code, the actual fixed descriptor close, a 70 mm open approach,
+  51 close samples, the exact prime-tower mesh, and the table mesh. It did not
+  reuse candidate-specific Isaac closing joints or the old tripod shortlist.
+- Presentation loading now resolves and hash-binds the shortlist selected by
+  the object profile. The selected shortlist is also frozen across the
+  read-only preflight; previously the preflight byte check watched the direct
+  object shortlist even when a fixture-specific shortlist was selected.
+- `run-tabletop` now requires an explicit `--object-profile` on every run.
+  `--object-profile cube40-r3 --presentation prime-tower` and
+  `--object-profile cube60-r3 --presentation prime-tower` select the two
+  independent contracts without inferring cube geometry from presentation.
+- Full control tests passed `370 passed, 6 skipped`; the full planner
+  environment passed `369 passed, 1 skipped`. No robot command was sent.
+
+## 2026-08-18 — Wrist-heavy pregrasp selection retained for later study
+
+- Successful physical left-arm direct-table run `tabletop_20260818T234114Z`
+  selected `cube_head__seed_0000000169__sample_217`. Its clearance-to-pregrasp
+  route changed left wrist roll by `+128.86 deg`, wrist pitch by `-35.31 deg`,
+  and wrist yaw by `+65.08 deg`. FK confirms this was not a left/right Dex3
+  adapter error: the selected grasp required a `158.28 deg` physical palm
+  reorientation, and the planned endpoint matched that target within
+  `0.42 deg`.
+- The custom wrapper currently orders all strict-endpoint-valid IK branches by
+  unweighted Euclidean joint displacement from the measured start and accepts
+  the first branch whose route passes. This rule was introduced locally in
+  commit `4bb74cc`; it is not a CuRobo or GraspGenX selection policy.
+- Command-free replay of the exact hash-matching request tested two simple
+  alternatives without changing production code. Minimizing maximum
+  normalized joint travel selected a first-attempt route with `97.78 deg`
+  wrist roll but shifted `119.32 deg` into shoulder yaw. Minimizing maximum
+  absolute joint travel selected a second-attempt route with `106.77 deg`
+  wrist roll and `109.71 deg` maximum travel. Neither removes the large
+  reorientation, so the working selection policy remains unchanged pending a
+  broader comparison across arms, object sizes, and presentations. No robot
+  command was sent during this analysis.
+
+## 2026-08-19 — MPC cleanup and measured/command continuity
+
+- Physical MPC run `tabletop_20260819T002307Z` failed before motion because
+  its first future sample was planned from the measured arm while sample zero
+  was the different active position command. The largest retained tracking
+  offset was `0.02009 rad`; replacing only sample zero still produced a
+  `0.12382 rad/s` command edge against the unchanged `0.1 rad/s` limit.
+- The interim command boundary carried that measured-to-command offset into the
+  returned window but removed it linearly by the endpoint. Both the predicted
+  measured path and translated command path retained independent hard-limit and
+  collision validation. This first-window repair was later superseded: it did
+  not preserve desired-state continuity when gravity/load tracking error
+  persisted across every receding-horizon update. See the mature-controller
+  audit below.
+- The subsequent one-window, continuous route-projection, and direct-endpoint
+  experiments were removed. Production is restored to the previously proven
+  monotonic frozen-route lookup, one-action-horizon joint lookahead, and three
+  continuously replenished interpolation windows. Warm optimization remains
+  100 iterations.
+- A command-free replay using the exact retained active command, measured arm
+  state, and live camera correction made the first window feasible: the
+  uncorrected edge was `0.12558 rad/s`, the translated command peak was
+  `0.05219 rad/s`, and the strict checker passed. Its later windows used the
+  benchmark's ideal `measured == command` plant, however, so its full
+  eight-phase completion did **not** validate persistent tracking offset. The
+  temporary result is `/tmp/mpc_clean_route_full.json`; no robot command was
+  sent.
+- The controller continues to accept a generic `reference_T_camera` estimate
+  rather than depending on an AprilCube detector. The current producer uses
+  the fixed cube as its anchor. Future moving-cube work will replace that
+  producer with a fixed table marker and supply the cube separately as the
+  changing task target; it must not alter the command buffer or safety checks.
+- Full tests passed `373 passed, 6 skipped` in the control environment and
+  `372 passed, 1 skipped` in the planner environment. Ruff passed.
+
+## 2026-08-19 — Open-transit object margin changed to 5 mm
+
+- The operator requested a 5 mm hard hand-to-object margin for open transit.
+  CuRobo's separate 10 mm collision-cost activation distance remains
+  unchanged, as do self-collision, table, fixture, contact-phase, and payload
+  policies. MPC records both values independently.
+- The exact route diagnostic now reports the closest point over the complete
+  route rather than the first sample entering the rejection band. This exposed
+  that the earlier `8.996-9.870 mm` messages from run
+  `tabletop_20260819T115257Z` were first-entry values, not route minima.
+- The first command-free GPU replay under the new policy still found no
+  acceptable route: the optimizer had planned against the bare cube, and its
+  12 endpoint-valid branches reached true nominal minima of
+  `3.278-4.391 mm`, all at `left_hand_palm_link/cube`. The exact checker was
+  correct to reject them.
+- This experiment padded only the cube by 5 mm on every face while the
+  independent checker retained the physical cube and exact 5 mm distance
+  test. It was removed later the same day; see "Removed cube-specific optimizer
+  enlargement" below. Replaying the same retained request had selected candidate
+  `cube_head__seed_0000000129__sample_206`, solver branch 3, and the complete
+  pick/lift/replace/return planner passed. CuRobo's 10 mm cost activation,
+  every non-object collision policy, and all physical geometry remain
+  unchanged. No robot command was sent.
+- Full verification passed `375 passed, 6 skipped` in the control environment
+  and `374 passed, 1 skipped` in the planner environment. Ruff and repository
+  diff checks passed.
+
+## 2026-08-19 — Mature rolling-controller audit and persistent desired-state continuity
+
+### Why the previous fix was wrong
+
+- Physical run `tabletop_20260819T121046Z` accepted all 54/54 feasible MPC
+  windows but never reached the first phase endpoint. Route progress advanced
+  to index 6 and then remained there for 94 simulated/diagnostic updates. The
+  controller was repeatedly fading the live `active command - measured state`
+  offset to zero inside every short window. With a persistent gravity/load
+  offset, each replan therefore removed the same low-level position-loop
+  effort again. Cadence, iteration count, endpoint tolerance, and collision
+  margins do not repair that controller-boundary error.
+- The earlier full command-free replay was insufficient because only its first
+  window used the retained physical offset; its ideal plant then assigned the
+  command directly to measured state. An isolated policy replay with the
+  retained offset held persistently reproduced the stall: the linear-fade
+  policy remained at route index 6 for 94 of 100 feasible windows. Holding the
+  offset across each short window reached that isolated phase terminal in 35
+  windows, with a `0.08145 rad/s` maximum command speed. That comparison
+  established the continuity bug; it was not a complete production lifecycle
+  replay.
+
+### Source-backed controller patterns checked
+
+- CuRobo's maintainer describes MPC output as a trajectory to be interpolated
+  and tracked by a separate low-level controller, rather than as a new measured
+  position target that should erase the controller's existing tracking lead:
+  <https://github.com/NVlabs/curobo/discussions/681>.
+- ROS 2 `joint_trajectory_controller` has an explicit
+  `interpolate_from_desired_state` policy for successive trajectory messages.
+  Its documentation calls out MPC-like applications and preserving continuity
+  from the currently desired state instead of restarting each update from the
+  lagging measured state:
+  <https://github.com/ros-controls/ros2_controllers/blob/master/joint_trajectory_controller/src/joint_trajectory_controller_parameters.yaml>.
+- MoveIt Servo similarly continues from the buffered future command while it
+  is valid rather than discarding that command state at every update:
+  <https://github.com/moveit/moveit2/blob/main/moveit_ros/moveit_servo/src/servo_node.cpp>.
+- NVIDIA STORM separates the desired `q/dq/ddq` trajectory from the measured
+  state and uses a model-plus-PD tracking controller on the robot:
+  <https://github.com/NVlabs/storm> and
+  <https://github.com/mohakbhardwaj/franka_motion_control>. That validates the
+  separation of planner and tracking state, but transplanting STORM's torque
+  controller is **not** appropriate here because the commissioned Unitree
+  lowcmd PD and gravity-feedforward path already fills that role.
+- Unitree XR teleoperation likewise sends a desired arm position plus gravity
+  torque and bounds target changes relative to measured joints; it does not
+  deliberately collapse the desired/measured separation at the end of every
+  receding horizon:
+  <https://github.com/unitreerobotics/xr_teleoperate/wiki/Motion>.
+
+### Decision and scope
+
+- Preserve the live desired-state offset for the complete short CuRobo window:
+  `bias = active_command - measured`, then
+  `q_command(t) = q_curobo_measured(t) + bias`. Remeasure that bias from the
+  live command and state on every MPC update. This is a continuity translation,
+  not integral control and not accumulated error.
+- Keep the existing CuRobo route/IK branch, phase collision models, dual strict
+  validation of predicted measured motion and translated command motion,
+  Unitree lowcmd gains, gravity feedforward, hard limits, velocity limit,
+  source-age checks, command buffer, watchdog, and recovery unchanged.
+- Do not return to the rejected detours: direct phase-endpoint MPC, continuous
+  nearest-route projection, one-window open-loop execution, iteration/cadence
+  tuning as a controller fix, relaxed collision/velocity thresholds, or a new
+  torque controller. Those address different problems or duplicate mature
+  components already present in the stack.
+
+### Implementation and command-free production regression
+
+- Production now applies the complete live offset to every future sample in a
+  short CuRobo window and records
+  `command_tracking_offset_policy=hold_complete_window_remeasure_each_update`.
+  The offset is remeasured rather than accumulated. The former linear endpoint
+  fade is gone.
+- The offline lifecycle benchmark can now simulate a persistent seven-joint
+  tracking offset rather than silently using an ideal `measured == command`
+  plant. This is a benchmark-only option; it cannot publish a robot command.
+- Replaying the median offset from physical failure run
+  `tabletop_20260819T121046Z` advanced `move_to_pregrasp` for 30 accepted
+  windows to route index 36, instead of stalling at index 6/7. It then failed
+  closed because the translated command target produced a strict
+  `left_wrist_pitch_link/torso_link` sphere overlap of `0.060 mm`. Maximum
+  command speed was `0.07321 rad/s`. The artifact is
+  `/tmp/mpc_persistent_offset_full.json`.
+- A temporary reference-governor experiment was tested and removed. It moved
+  farther, but then CuRobo's predicted physical path itself crossed the same
+  strict pair by `0.045 mm`. No threshold, collision exclusion, sphere change,
+  or start-overlap exception was retained. Therefore the original continuity
+  stall is fixed, but this retained near-zero-clearance route does **not** prove
+  the complete physical lifecycle ready. The next independent issue is route
+  robustness, not another MPC cadence/iteration change.
+- Focused verification passes: `27 passed` across command-buffer and phase-MPC
+  tests. Full verification passes `376 passed, 6 skipped` in the control
+  environment and `375 passed, 1 skipped` in the planner environment. Ruff
+  passes for the changed Python files; repository-wide Ruff still reports
+  pre-existing findings inside vendored `third_party` trees. No robot command
+  was sent.
+
+## 2026-08-19 — Mature self-clearance implementation audit
+
+### This is related to, but not identical to, the cube margin
+
+- The open-transit cube fix enlarged only the optimizer's cube by the explicit
+  5 mm physical policy and then checked the returned route against the exact
+  physical cube and the same 5 mm distance requirement. That is the general
+  mature pattern: give the optimizer room to converge, then retain an
+  independent hard validation boundary.
+- CuRobo deliberately separates world geometry padding from self-collision
+  padding. `collision_sphere_buffer` changes robot radii used against the
+  world. During model loading, that radius change is subtracted back out of
+  the self-collision padding. Positive self-clearance must instead be expressed
+  through the per-link `self_collision_buffer` robot-model field.
+- The pinned CuRobo G1 configuration sets every `self_collision_buffer` entry
+  to zero. Its shipped Franka configuration uses nonzero per-link values (for
+  example 20 mm at the hand, 10 mm at the fingers, 50/100 mm at two base
+  links), and its UR10e configuration uses 70 mm at the shoulder. These are
+  commissioned, link-specific robot-model values, not task-time scalar sweeps.
+- CuRobo's `optimizer_collision_activation_distance` updates scene-collision
+  activation only. It does not give self-collision a 10 mm avoidance band.
+  The shipped MPC task configuration places self-collision in its constraint
+  manager, but with a zero G1 `self_collision_buffer` the boundary is still
+  zero penetration. Existing local provenance that calls the common 10 mm
+  constant a `self_collision_activation_distance` is therefore misleading and
+  must not be used to justify a self-clearance claim.
+
+### Comparison with other mature stacks
+
+- MoveIt's ordinary planning-scene self-collision check deliberately uses the
+  unpadded robot. World collision uses the padded robot. MoveIt Servo then adds
+  a separate online proximity policy: its collision monitor scales velocity
+  down as self distance enters a configured threshold and stops at collision;
+  the official UR Servo configuration uses a 10 mm self threshold.
+- Tesseract/TrajOpt supports collision as both cost and constraint. Its
+  maintainer's recommended setup uses a larger contact distance for the cost
+  than for the hard constraint and a positive contact-margin buffer to aid
+  convergence. This is the same separation between steering margin and hard
+  feasibility, expressed in the optimizer rather than by changing physical
+  geometry.
+
+Primary references:
+
+- <https://curobo.org/tutorials/1_robot_configuration.html>
+- <https://curobo.org/_api/curobo.cuda_robot_model.types.html>
+- <https://moveit.picknik.ai/main/doc/examples/planning_scene/planning_scene_tutorial.html>
+- <https://github.com/moveit/moveit2/blob/main/moveit_ros/moveit_servo/src/collision_monitor.cpp>
+- <https://github.com/UniversalRobots/Universal_Robots_ROS2_Driver/blob/main/ur_moveit_config/config/ur_servo.yaml>
+- <https://github.com/tesseract-robotics/tesseract_planning/discussions/190>
+
+### Decision before implementation
+
+- Do not add a generic self-collision padding sweep and choose the smallest
+  value that makes one retained replay pass. First define and measure the G1
+  tracking-clearance contract across retained runs and both arms, then encode
+  any selected clearance through CuRobo's upstream-supported per-link
+  `self_collision_buffer` in every boundary-planner and MPC optimizer model.
+- Keep the exact physical zero-penetration checker independent and unchanged.
+  It must continue to validate both predicted measured motion and translated
+  command motion. A planner buffer can steer away from the boundary; it cannot
+  redefine collision or excuse a failing route.
+- The current retained failure is specifically a 0.060 mm
+  `left_wrist_pitch_link/torso_link` overlap in the translated command target;
+  CuRobo's predicted measured-state path remains strict-clear in the retained
+  production replay. This is the dataset against which a source-supported
+  self-clearance policy should be evaluated before another hardware run.
+
+## 2026-08-19 — Removed cube-specific optimizer enlargement
+
+- The optimizer-only 5 mm enlargement of the cube was removed from both the
+  boundary planner and MPC. Both now use the exact configured object dimensions.
+- The independent 5 mm open-transit cube-clearance requirement is unchanged.
+  Every generated frozen route and every MPC predicted/command window still
+  fails closed below that distance. Contact-link exceptions remain limited to
+  their existing contact phases.
+- No replacement robot padding, obstacle padding, relaxed threshold, or new
+  collision exception was introduced. A route that CuRobo generates inside the
+  hard 5 mm band is rejected and the boundary planner may try another existing
+  grasp/IK branch.
+
+## 2026-08-19 — Measured-close start-relative retention escape
+
+- Trajectory run `tabletop_20260819T133703Z` passed the opposed-finger close
+  test but was rejected before its 30 mm retention lift. The planned fixed-close
+  hand had 5.838 mm table clearance; the contact-stalled physical posture put
+  `left_hand_middle_1_link` at 3.808 mm. Earlier successful measured closes had
+  remained above the 5 mm free-space floor, so the existing August 17 gate had
+  not exposed its boundary-policy error.
+- Command-free replay of all 81 measured-close route samples proved that the
+  retained path did not move farther toward the table. Samples 0--2 remained at
+  3.808 mm within float precision, sample 5 reached 4.959 mm, sample 6 reached
+  6.254 mm, and clearance then continued increasing. Samples 75--80 were the
+  exact symmetric return. There was no modeled table penetration.
+- The measured-close frozen payload validator now treats only this already-
+  achieved positive grasp boundary start-relatively. It requires the outbound
+  escape and exact return never to go below that boundary, requires the route to
+  reach the unchanged 5 mm floor, and enforces 5 mm throughout the intervening
+  free-space samples. Self-collision, fixture checks, open/fixed-close planning,
+  and the global configured clearance are unchanged. MPC retains its existing
+  stricter per-window table rule pending its separate physical commissioning.
+
+## 2026-08-19 — Run-local measured empty-open geometry and release evidence
+
+- Trajectory run `tabletop_20260819T135229Z` physically grasped, lifted, and
+  exactly replaced the cube. Software then rejected the descriptor open command:
+  `left_hand_middle_0_joint` reached `-0.1005 rad` against the ideal `0 rad`
+  target and the shared `0.08 rad` tolerance. The exception occurred before
+  grasp retreat, clearance return, initial-finger restoration, and seated
+  handback, so the existing failure cleanup deliberately selected zero torque.
+  Cleanup and the 6.42 GB MCAP recording both completed without error.
+- MCAP replay proved this was not a missing command. The hand received the zero
+  target continuously for the complete eight-second interval. Six joints opened
+  normally; the middle proximal joint moved monotonically from about `-0.297`
+  to `-0.1005 rad`. Earlier in the same run, while empty at clearance, it had
+  physically settled near `-0.0285 rad`. The post-replacement difference from
+  that physical empty-open state was `0.0720 rad`, inside the existing tracking
+  tolerance. Prior completed runs settled the same joint near `-0.027 rad`.
+- The arbitrary finger posture measured at lowcmd takeover is not an open-hand
+  reference; it can contain any operator/boot posture and exists only so it can
+  be restored before returning control. The persistent measured empty-close is
+  also not an open reference: it remains the no-object baseline used to detect
+  opposed grasp obstruction and is not repeated during every task.
+- The required descriptor open now occurs immediately after the supported arm
+  reaches stationary clearance, before the clearance image and grasp planning.
+  Its achieved active-hand posture is recorded at command acquisition and again
+  at the visual anchor in `dex3_run_local_references.json`. The latter posture
+  supplies the open-hand CuRobo geometry. The fixed descriptor zero target still
+  supplies every command.
+- After exact replacement, the controller continues publishing the descriptor
+  zero target but verifies settling against the run-local measured empty-open
+  posture. The same acceptance posture remains active during grasp retreat. If
+  it is not recovered, the hand does not retreat and the existing fail-closed
+  cleanup remains unchanged. A clearance-stage failure first restores the
+  arbitrary initial fingers before executing the supported escape's exact
+  reverse.
+- This reorders an existing finger motion rather than adding a close/open cycle.
+  Full task planning begins after the measured open and fresh clearance image
+  because both bind the collision model; the persistent CUDA worker is already
+  warm. Nominal motion time is therefore unchanged. No robot command was sent
+  while implementing this change.

@@ -28,7 +28,6 @@ from g1_dex3_tabletop.planning.contracts import (
     RobotSnapshot,
 )
 from g1_dex3_tabletop.planning.g1_model import CUROBO_COMMIT
-from g1_dex3_tabletop.tabletop_object import DEFAULT_OBJECT_PROFILE_ID
 from g1_dex3_tabletop.tabletop_presentation import (
     DIRECT_PRESENTATION_ID,
     PRESENTATION_CONFIGS,
@@ -153,11 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
     tabletop.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
     tabletop.add_argument(
         "--object-profile",
-        default=DEFAULT_OBJECT_PROFILE_ID,
-        help=(
-            "bundled tabletop object ID, or a repository-local profile YAML; "
-            f"default: {DEFAULT_OBJECT_PROFILE_ID}"
-        ),
+        required=True,
+        help="bundled tabletop object ID, or a repository-local profile YAML",
     )
     tabletop.add_argument("--quality-config", type=Path, default=DEFAULT_QUALITY)
     tabletop.add_argument(

@@ -319,6 +319,9 @@ class TabletopPlanningSession:
                 "kinematics_cache_hit": switch["kinematics_cache_hit"],
                 "kinematics_resolve_time_s": switch["kinematics_resolve_time_s"],
                 "optimizer_prewarm_time_s": switch["optimizer_prewarm_time_s"],
+                "state_correction_prewarm_time_s": switch.get(
+                    "state_correction_prewarm_time_s", 0.0
+                ),
                 "reconfiguration_time_s": switch["reconfiguration_time_s"],
                 "plan_sha256": self._execution.content_sha256,
             }
@@ -348,6 +351,9 @@ class TabletopPlanningSession:
             "kinematics_cache_hit": True,
             "kinematics_resolve_time_s": 0.0,
             "optimizer_prewarm_time_s": 0.0,
+            "state_correction_prewarm_time_s": (
+                getattr(controller, "_last_state_correction_prewarm_s", 0.0)
+            ),
             "reconfiguration_time_s": 0.0,
             "plan_sha256": self._execution.content_sha256,
         }
@@ -363,6 +369,9 @@ class TabletopPlanningSession:
                 f"MPC step requests {requested_phase} while "
                 f"{self._active_phase_mpc.spec.phase} is prepared"
             )
+        camera_state = payload.get("camera_state_correction")
+        if camera_state is not None and not isinstance(camera_state, dict):
+            raise TypeError("MPC camera-state correction must be a dictionary")
         return self._active_phase_mpc.next_nominal_window(
             measured_command_q_rad=np.asarray(payload["measured_command_q_rad"], dtype=np.float64),
             measured_dq_rad_s=np.asarray(payload["measured_dq_rad_s"], dtype=np.float64),
@@ -370,9 +379,10 @@ class TabletopPlanningSession:
             state_monotonic_s=float(payload["state_monotonic_s"]),
             reference_T_camera=(
                 None
-                if payload.get("reference_T_camera") is None
-                else np.asarray(payload["reference_T_camera"], dtype=np.float64)
+                if camera_state is None
+                else np.asarray(camera_state.get("reference_T_camera"), dtype=np.float64)
             ),
+            camera_state_provenance=camera_state,
         )
 
     def close(self) -> None:

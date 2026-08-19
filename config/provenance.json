@@ -16,23 +16,27 @@
       "base_commit": "4325bc94988b44554f106b206fb1bcd650cfd619",
       "source": "artifacts/grasp_atlas/cube60_r3_experiment_v1/right/arm_grasp_pool.yaml",
       "source_sha256": "b7749554c66336a25b44afb525a3898dd8dbc0752ccd99e7faa685a689880a48",
-      "runtime_shortlist_sha256": "a9e81acce2cfe043343cd1ccf2419b0c85dce1aa75a51cf3f0e92dac3a4ca569",
+      "runtime_shortlist_sha256": "cb92d409b24876f6bf5a57cebff841121f4ca4e47fa197d872f489233328bcda",
       "detector_config_sha256": "57bd5905460b06960ecca027087ca2358dc3c3ae1d616557052ffec97c61bebc",
       "runtime_policy": "57 unchanged object_T_G candidates qualified with the stationary 60 mm R3 cube, the fixed descriptor close sweep, exact Dex3 collision meshes, a 5 mm table margin, and the exact left/right Dex3 side adapter"
     },
-    "cube_tripod_h50": {
-      "repository": "sri299792458/g1-aprilcube-demo",
-      "commit": "4325bc94988b44554f106b206fb1bcd650cfd619",
-      "fixture_source": "hardware/fixtures/cube_tripod_presenter/cube_tripod_presenter_h50.stl",
-      "fixture_shortlist_source": "artifacts/grasp_shortlists/cube_tripod_right_v1/h50/shortlist.yaml",
-      "arm_grasp_pool_source": "artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml",
-      "runtime_policy": "opt-in exact-mesh presenter with all 372 fixture-qualified candidates; PhysX contact endpoints are evidence only and hardware uses the fixed Dex3 descriptor close target"
+    "cube_prime_tower_h60": {
+      "qualification_source_repository": "sri299792458/g1-aprilcube-demo",
+      "qualification_source_revision": "4325bc94988b44554f106b206fb1bcd650cfd619",
+      "fixture_mesh_sha256": "2e1409589b2a4cb394b8ac89756f8e9739e2c8ebbe2324815258f8cc7eb2ad56",
+      "cube40_source_pool": "artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml",
+      "cube40_shortlist_sha256": "540c822b5cbc478c11c10d7315d91675bc1add492c30ab112f330d4d0133870b",
+      "cube40_admitted_candidate_count": 113,
+      "cube60_source_pool": "artifacts/grasp_atlas/cube60_r3_experiment_v1/right/arm_grasp_pool.yaml",
+      "cube60_shortlist_sha256": "ce20cf26111d36ee11596c49a60ac352f96e79ef3415e611794ccd473e597dfe",
+      "cube60_admitted_candidate_count": 312,
+      "runtime_policy": "one opt-in exact-mesh 60 mm prime-tower presenter for both cube profiles; unchanged object_T_G candidates pass exact 70 mm open approach and 51-sample fixed descriptor close checks against the tower and table"
     }
   },
   "upstream": {
     "aprilcube": {
       "repository": "sri299792458/aprilcube",
-      "commit": "80ed7c72ed00aef6dc70f77d8169a199e9a612cd"
+      "commit": "47431ed14309a9590ae54af457d63fe617650a09"
     },
     "curobo": {
       "repository": "NVlabs/curobo",

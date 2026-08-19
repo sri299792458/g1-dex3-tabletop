@@ -250,6 +250,62 @@ def test_posture_acquisition_requires_measured_target_and_timeout_is_explicit(
         assert by_topic[topic].closed
 
 
+def test_posture_command_can_publish_descriptor_target_against_measured_acceptance(
+    dex3_sdk,
+):
+    bindings, _ = dex3_sdk
+    clock = ManualClock(1.0)
+    observer = UnitreeDex3StateObserver(config(), bindings=bindings, clock=clock)
+    measured_open = np.zeros(7)
+    measured_open[3] = -0.10
+    empty_open_reference = np.zeros(7)
+    empty_open_reference[3] = -0.03
+    emit_pair(measured_open, np.zeros(7))
+    controller = UnitreeDex3PostureController(config(), observer=observer, clock=clock)
+    controller.acquire_measured_hold()
+
+    result = controller.command_posture(
+        left_target_q_rad=np.zeros(7),
+        right_target_q_rad=np.zeros(7),
+        left_acceptance_q_rad=empty_open_reference,
+        right_acceptance_q_rad=np.zeros(7),
+        label="measured empty-open release",
+    )
+
+    assert result.left.position[3] == pytest.approx(-0.10)
+    by_topic = {item.topic: item for item in Publisher.instances}
+    np.testing.assert_allclose(
+        [item.q for item in by_topic["rt/dex3/left/cmd"].messages[-1].motor_cmd],
+        0.0,
+    )
+    clock.advance(0.02)
+    controller.maintain_active_posture()
+    np.testing.assert_allclose(
+        [item.q for item in by_topic["rt/dex3/left/cmd"].messages[-1].motor_cmd],
+        0.0,
+    )
+
+    drifted = measured_open.copy()
+    drifted[3] = -0.12
+    clock.advance(0.02)
+    emit_pair(drifted, np.zeros(7))
+    with pytest.raises(RuntimeError, match="departed the active task posture"):
+        controller.maintain_active_posture()
+    controller.timeout_and_close()
+
+
+def test_retained_replacement_release_matches_its_run_local_empty_open() -> None:
+    measured_empty_open = np.asarray([-0.0320, 0.0149, 0.0149, -0.0285, -0.0289, -0.0438, -0.0191])
+    measured_release = np.asarray([-0.0320, 0.0163, 0.0275, -0.1005, -0.0530, -0.0450, -0.0226])
+
+    assert np.max(np.abs(measured_release)) > config().posture_position_tolerance_rad
+    assert np.max(np.abs(measured_release - measured_empty_open)) == pytest.approx(0.072)
+    assert (
+        np.max(np.abs(measured_release - measured_empty_open))
+        < config().posture_position_tolerance_rad
+    )
+
+
 def test_posture_acquisition_finishes_dwell_after_entry_deadline(dex3_sdk):
     bindings, _ = dex3_sdk
     clock = ManualClock(0.0)

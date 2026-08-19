@@ -6,4 +6,4 @@ detector_config: third_party/aprilcube/models/dex3_safe_cube/config.json
 direct_grasp_shortlist: config/tabletop/cube_dex3_executable_v1/shortlist.yaml
 sha256:
   detector_config: adcb22666e78052360b597796deec4cbe23d8489c489798a459992493f1572d9
-  direct_grasp_shortlist: 6bb5f53d2185a2ea960b65d9cf7516f0e0f155921e5a5616bd5897ec476cf89f
+  direct_grasp_shortlist: ac46c943c0e7d1808e5182b6fb71619e016c5ced97c77e4fe82c98697fe4eca1

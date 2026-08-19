@@ -74,3 +74,41 @@ def test_ros_teardown_runs_after_verified_external_takeover(monkeypatch) -> None
         "node.destroy_node",
         "rclpy.shutdown",
     ]
+
+
+def test_mpc_camera_state_record_uses_the_older_source_timestamp() -> None:
+    synchronized_input = SimpleNamespace(to_dict=lambda: {"timestamp_ns": 1_000_000_000})
+    estimate = SimpleNamespace(
+        timestamp_ns=1_000_000_000,
+        to_dict=lambda: {
+            "timestamp_ns": 1_000_000_000,
+            "anchor_timestamp_ns": 900_000_000,
+            "reference_T_camera": [[1.0, 0.0, 0.0, 0.0]] * 4,
+        },
+    )
+    state = SimpleNamespace(receipt_monotonic_s=1.025)
+
+    result = hardware_tabletop._mpc_camera_state_record(
+        synchronized_input,
+        estimate,
+        state,
+        maximum_time_difference_s=0.1,
+    )
+
+    assert result["source_monotonic_s"] == pytest.approx(1.0)
+    assert result["estimate_to_arm_state_s"] == pytest.approx(0.025)
+    assert result["input"] == {"timestamp_ns": 1_000_000_000}
+
+
+def test_mpc_camera_state_record_rejects_desynchronized_inputs() -> None:
+    synchronized_input = SimpleNamespace(to_dict=dict)
+    estimate = SimpleNamespace(timestamp_ns=1_000_000_000, to_dict=dict)
+    state = SimpleNamespace(receipt_monotonic_s=1.101)
+
+    with pytest.raises(RuntimeError, match="estimate and arm state differ"):
+        hardware_tabletop._mpc_camera_state_record(
+            synchronized_input,
+            estimate,
+            state,
+            maximum_time_difference_s=0.1,
+        )

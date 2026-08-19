@@ -292,15 +292,21 @@ reverse then remains the final return. Thus a state-estimation or planning
 rejection has a complete pre-existing return route and cannot silently switch
 to a different grasp.
 
-Planning may take long enough for the body state to change again. Immediately
-before installing the result, the code obtains another synchronized estimate
-and compares it with the estimate that was planned. It reuses the task's
-existing 5 mm / 2 degree perception-spread limits rather than adding another
-uncommissioned threshold. The executor then independently checks complete
-joint-state stability and exact command continuity during atomic replacement.
-Continuous mid-trajectory correction is intentionally absent. The optional
-MPC path still uses its frozen lifecycle and reports that it does not yet
-consume the stationary-boundary estimate.
+Planning may take long enough for the body state to change again. The default
+trajectory path therefore obtains another synchronized estimate before
+installation and compares it with the estimate that was planned. It reuses the
+task's existing 5 mm / 2 degree perception-spread limits rather than adding
+another uncommissioned threshold. The executor then independently checks
+complete joint-state stability and exact command continuity during atomic
+replacement.
+
+The optional MPC path now consumes the same estimator continuously. Every
+rolling window is based on one synchronized arm/body snapshot and moves both
+the fixed task scene and the local Cartesian goal into the estimated live body
+frame. The older of the arm and estimator timestamps remains the window's
+source time, so the unchanged 100 ms acceptance rule covers both inputs. The
+correction does not run image detection during motion and cannot follow a cube
+that moves after the visual anchor.
 
 ## Candidate upstream implementations
 

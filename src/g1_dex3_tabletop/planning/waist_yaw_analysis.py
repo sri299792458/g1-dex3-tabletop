@@ -21,7 +21,6 @@ from g1_dex3_tabletop.planning.curobo_backend import (
     IK_SEEDS,
     CuroboKinematicCollisionChecker,
 )
-from g1_dex3_tabletop.planning.dex3_handedness import dex3_execution_profile
 from g1_dex3_tabletop.planning.g1_model import (
     CUROBO_COMMIT,
     WAIST_YAW_JOINT_NAME,
@@ -343,7 +342,11 @@ def analyze_waist_yaw(
             raise ValueError(f"waist-yaw candidate filter contains unknown IDs: {missing}")
         candidates = [by_id[value] for value in requested_candidate_ids]
     candidate_ids = [str(item["candidate_id"]) for item in candidates]
-    open_q = dex3_execution_profile(request.arm)[0]
+    open_q = (
+        request.planning_snapshot.left_dex3_q_rad
+        if request.arm == "left"
+        else request.planning_snapshot.right_dex3_q_rad
+    )
     locked_robot, reference = build_tabletop_robot_config(
         arm=request.arm,
         snapshot=request.planning_snapshot,

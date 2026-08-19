@@ -12,7 +12,6 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 OBJECT_PROFILE_DIRECTORY = ROOT / "config/tabletop/objects"
-DEFAULT_OBJECT_PROFILE_ID = "cube40-r3"
 
 
 def _sha256(path: Path) -> str:
