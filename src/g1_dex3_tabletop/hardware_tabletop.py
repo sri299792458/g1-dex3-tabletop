@@ -88,7 +88,6 @@ from g1_dex3_tabletop.planning.tabletop_mpc import (
     MPC_KNOT_DT_S,
 )
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
-from g1_dex3_tabletop.seat_compliance import observe_charuco_board
 from g1_dex3_tabletop.state_estimation import (
     AnchoredCameraPoseEstimators,
     AnchoredCameraStateEstimator,
@@ -1026,7 +1025,6 @@ def run_tabletop(args) -> int:
     )
     camera_state_anchor = None
     camera_state_estimate = None
-    table_board_observation = None
     reference_T_camera0 = None
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
@@ -1389,19 +1387,13 @@ def run_tabletop(args) -> int:
                     minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
                     maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
                 )
-                if args.motion_controller == "mpc":
-                    table_board_observation, table_board_evidence = observe_charuco_board(
-                        [item.image_bgr for item in clearance_frames],
-                        camera_info=expected_camera,
-                        snapshot=_snapshot(boundary_state, boundary_hands),
-                    )
-                    reference_T_camera0 = invert_transform(
-                        np.asarray(table_board_observation.camera_T_board, dtype=np.float64)
-                    )
-                    atomic_write_json(
-                        task_run / "table_board_anchor.json",
-                        table_board_evidence,
-                    )
+                # Freeze an arbitrary reference frame at the cube's clearance
+                # pose.  The cube must remain stationary through this sample;
+                # later MPC observations are independent and may move within
+                # this frame while proprioception propagates the camera pose.
+                reference_T_camera0 = invert_transform(
+                    np.asarray(boundary_observation.camera_T_object, dtype=np.float64)
+                )
                 cube_anchor_motion = camera_motion_from_fixed_cube(
                     loaded_observation.camera_T_object,
                     boundary_observation.camera_T_object,
@@ -1428,11 +1420,7 @@ def run_tabletop(args) -> int:
                 )
                 anchor_estimate = camera_estimator.reset(
                     CameraPoseAnchor(
-                        reference_T_camera=(
-                            invert_transform(np.asarray(boundary_observation.camera_T_object))
-                            if reference_T_camera0 is None
-                            else reference_T_camera0
-                        ),
+                        reference_T_camera=reference_T_camera0,
                         sample=camera_state_anchor.sample,
                     )
                 )
@@ -1441,25 +1429,20 @@ def run_tabletop(args) -> int:
                     {
                         "estimate": anchor_estimate.to_dict(),
                         "input": camera_state_anchor.to_dict(),
-                        "visual_reference": (
-                            {
-                                "kind": "fixed_charuco_table_board",
-                                "observation": table_board_observation.to_dict(),
-                            }
-                            if table_board_observation is not None
-                            else {
-                                "kind": "stationary_cube",
-                                "observation_sha256": (
-                                    clearance_request.observation.content_sha256
-                                ),
-                            }
-                        ),
+                        "visual_reference": {
+                            "kind": "frozen_clearance_cube_frame",
+                            "observation_sha256": (
+                                clearance_request.observation.content_sha256
+                            ),
+                            "contract": (
+                                "cube stationary through clearance observation; "
+                                "later cube observations may move"
+                            ),
+                        },
                     },
                 )
 
                 def current_moving_grasp_target():
-                    if reference_T_camera0 is None:
-                        raise RuntimeError("moving-target MPC has no fixed table-board anchor")
                     frame = _collect_frames(
                         rclpy,
                         node,
@@ -1905,7 +1888,7 @@ def run_tabletop(args) -> int:
                     "LOCAL MOVING-TARGET MPC READY — MotionGen remains responsible for "
                     "clearance-to-pregrasp and every payload/return route. Only the open-hand "
                     "pregrasp-to-grasp segment uses native CuRobo Cartesian MPC; every window "
-                    "combines one fresh AprilCube image with the fixed ChArUco-board anchor "
+                    "combines one fresh AprilCube image with the frozen clearance-cube frame "
                     "and current pelvis/waist/torso state",
                     flush=True,
                 )

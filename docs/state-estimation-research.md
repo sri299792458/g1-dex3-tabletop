@@ -301,13 +301,14 @@ complete joint-state stability and exact command continuity during atomic
 replacement.
 
 The optional MPC path consumes the same estimator only during the local
-pregrasp-to-grasp segment. A fixed ChArUco table board replaces the cube as the
-visual anchor. Every rolling window pairs one fresh cube image with a
-synchronized arm/body snapshot, propagates the board-to-camera transform, and
-updates the cube and Cartesian grasp goal independently. The older input time
-remains the window source time, so the unchanged 100 ms acceptance rule covers
-both inputs. Global, payload, placement, and return motions remain frozen
-MotionGen trajectories.
+pregrasp-to-grasp segment. The stationary cube pose at clearance defines an
+arbitrary frozen reference; no separate board is required. Every rolling
+window pairs one fresh cube image with a synchronized arm/body snapshot,
+propagates the reference-to-camera transform, and updates the cube and
+Cartesian grasp goal independently. The older input time remains the window
+source time, so the unchanged 100 ms acceptance rule covers both inputs.
+Global, payload, placement, and return motions remain frozen MotionGen
+trajectories.
 
 ## Candidate upstream implementations
 

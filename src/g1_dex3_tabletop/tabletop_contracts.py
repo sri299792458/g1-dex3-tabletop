@@ -737,10 +737,10 @@ class TabletopTaskPlan:
 class MovingGraspContinuationRequest:
     """Rebuild the payload lifecycle at the grasp actually reached by MPC.
 
-    The fixed table-board frame and final fresh cube detection are kept
-    separate.  This prevents a moving cube from being mistaken for camera
-    motion and binds the continuation to the exact MPC approach that the
-    controller executed.
+    The frozen clearance reference and final fresh cube detection are kept
+    separate.  Proprioception propagates camera motion from that reference;
+    the independent cube observation supplies object motion and binds the
+    continuation to the exact MPC approach that the controller executed.
     """
 
     tabletop_request: TabletopTaskRequest

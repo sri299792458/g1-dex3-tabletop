@@ -17,23 +17,27 @@ selected explicitly with `--motion-controller mpc`.
 
 ## Perception contract
 
-Moving-target operation needs two observations with different roles:
+Moving-target operation uses the AprilCube for two observations with different
+roles:
 
-1. A fixed `DICT_5X5_50` 6 x 9 ChArUco board supplies the table reference
-   frame. It is observed at the stationary clearance boundary.
-2. The AprilCube supplies the changing object pose. One new rectified RGB
-   frame is decoded for each MPC update.
+1. The stationary cube observation at clearance defines an arbitrary reference
+   frame that is then frozen in software.
+2. One new rectified RGB frame supplies the changing cube pose for each MPC
+   update.
 
 Pelvis orientation, the three waist joints, and torso IMU orientation propagate
-the board-to-camera pose between images. The cube detection is transformed into
-that fixed board frame. Camera/body motion therefore does not masquerade as
-cube motion.
+the reference-to-camera pose after the clearance observation. Each new cube
+detection is transformed into that frozen frame, separating the estimated
+camera/body motion from the observed object motion.
 
-The board need not fill the complete table and is not a collision boundary. It
-must be rigidly fixed and visible in the clearance observation. The AprilCube
-must remain detectable during the open-hand MPC approach. Losing the visual
-target is a planning failure; the controller does not guess that an unobserved
-cube stayed still.
+The cube must remain stationary until its clearance reference has been
+recorded. It may move after the program reports that moving-target MPC is
+ready, and it must remain detectable during the open-hand MPC approach. Losing
+the visual target is a planning failure; the controller does not guess that an
+unobserved cube stayed still. No separate ChArUco board is required. This does
+not add external measurement of unmodelled seat translation; doing that would
+require a continuously observed fixed workspace landmark rather than the old
+one-time board sample.
 
 ## Physical lifecycle
 
@@ -41,7 +45,8 @@ The complete single-cube task remains:
 
 1. Plan and execute the reversible supported escape.
 2. Open the selected Dex3 hand at clearance.
-3. Observe the cube and board, then plan the complete nominal lifecycle.
+3. Observe the stationary cube, freeze its reference frame, then plan the
+   complete nominal lifecycle.
 4. Execute the MotionGen clearance-to-pregrasp route.
 5. Run moving-target MPC only from pregrasp to grasp.
 6. Close the Dex3 hand immediately at the reached grasp.
@@ -155,5 +160,5 @@ is:
 ```
 
 Do not use that command on hardware merely because the interface exists. The
-clearance board and cube visibility requirements and the current commissioning
+clearance-anchor and cube-visibility requirements and the current commissioning
 status above are part of the contract.

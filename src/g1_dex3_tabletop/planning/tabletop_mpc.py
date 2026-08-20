@@ -754,9 +754,9 @@ class MovingGraspMPC:
                 @ _matrix_from_pose_list(table_patch["pose"])
             )
         self._base_T_torso0 = _rigid_transform(base_T_torso)
-        # ``reference`` is a genuinely fixed table frame for moving-target
-        # operation.  Legacy command-free replays may omit it and retain the
-        # original stationary-cube frame.
+        # ``reference`` is an arbitrary frame frozen at the initial clearance
+        # observation.  Production uses the initial cube pose itself; legacy
+        # command-free replays may omit it and obtain the same convention.
         self._reference_T_camera0 = _rigid_transform(
             invert_transform(
                 np.asarray(clearance_request.planning_camera_T_object, dtype=np.float64)
@@ -779,8 +779,8 @@ class MovingGraspMPC:
         for obstacle_group in ("cuboid", "mesh"):
             for name, obstacle in scene.get(obstacle_group, {}).items():
                 # The detected object is updated independently from every
-                # live image.  It must never be propagated as a fixed board
-                # obstacle when the table frame and object frame are separate.
+                # live image.  It must never be propagated as a fixed
+                # reference-frame obstacle.
                 if name in ("cube", "open_transit_table_patch"):
                     continue
                 base_T_obstacle = _matrix_from_pose_list(obstacle["pose"])
@@ -1894,7 +1894,7 @@ class MovingGraspMPC:
         reference_T_camera: np.ndarray,
         camera_T_object: np.ndarray,
     ) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
-        """Map one board/camera/object observation into the MPC base frame."""
+        """Map one reference/camera/object observation into the MPC base frame."""
 
         reference_T_camera = _rigid_transform(reference_T_camera)
         camera_T_object = _rigid_transform(camera_T_object)
@@ -1942,13 +1942,13 @@ class MovingGraspMPC:
     ) -> dict[str, Any]:
         """Install one live object pose and one reachable approach-line goal.
 
-        ``reference`` is the fixed table-board frame.  The cube is observed in
-        the camera frame on every update, while the existing proprioceptive
-        estimator supplies the board-to-camera transform.  CuRobo therefore
-        receives both the live cube obstacle and the corresponding short
-        look-ahead on the already validated object-relative grasp line.  The
-        global route is not replayed by MPC; it supplies the selected arm
-        branch and the geometric grasp line only.
+        ``reference`` is frozen at the cube's initial clearance pose.  The cube
+        is observed in the camera frame on every update, while the existing
+        proprioceptive estimator supplies the reference-to-camera transform.
+        CuRobo therefore receives both the live cube obstacle and the
+        corresponding short look-ahead on the already validated object-relative
+        grasp line.  The global route is not replayed by MPC; it supplies the
+        selected arm branch and the geometric grasp line only.
         """
 
         from curobo.types import GoalToolPose, Pose
@@ -2065,7 +2065,7 @@ class MovingGraspMPC:
         object_delta = reference_T_object @ invert_transform(self._reference_T_object0)
         return {
             **state_correction,
-            "goal_source": "live_cube_pose_in_fixed_table_board_frame",
+            "goal_source": "live_cube_pose_in_frozen_clearance_frame",
             "goal_tracking": "object_relative_approach_line_lookahead",
             "terminal_grasp_goal": terminal_goal,
             "nominal_goal_model_q_rad": nominal_goal_q.tolist(),

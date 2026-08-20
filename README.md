@@ -228,10 +228,11 @@ contract. No controller or safety setting changes with the profile.
 The default replays the complete frozen CuRobo MotionGen lifecycle. The
 experimental `--motion-controller mpc` path keeps MotionGen for global,
 payload, placement, and return motion and uses MPC only for the visually
-updated pregrasp-to-grasp segment. It requires the fixed ChArUco table board as
-a camera/body reference and a detectable AprilCube during the approach. The
-exact lifecycle, window checks, retained offline evidence, and current
-commissioning status are documented in
+updated pregrasp-to-grasp segment. The stationary cube observation at clearance
+defines its frozen reference frame; no separate board is required. The
+AprilCube must remain detectable during the approach. The exact lifecycle,
+window checks, retained offline evidence, and current commissioning status are
+documented in
 [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 
 With the default `trajectory` controller, the program performs one additional
@@ -264,15 +265,15 @@ Each retained grasp receives one independent CuRobo IK problem with 16 seeds.
 The resulting finite joint-solution pool is then tested by the unchanged
 single-route planner and strict validators; candidates do not compete for one
 shared 16-seed goal set.
-With `--motion-controller mpc`, the clearance observation records both the
-fixed ChArUco table board and the cube. Each local grasp-approach window uses a
-fresh cube image plus pelvis, waist, and torso state to update the Cartesian
-goal in the fixed board frame. After the hand closes, the attached-payload
-lifecycle is rebuilt at the reached object pose and executed as frozen
-MotionGen trajectories. Heavy CuRobo structures are paid at the stationary
-clearance boundary; the retained composed replay reduced the post-grasp rebuild
-to about 2.0 seconds. This path still requires staged hardware commissioning.
-See [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
+With `--motion-controller mpc`, the cube must remain stationary through the
+clearance observation. That pose is frozen as the reference frame. Each local
+grasp-approach window then uses a fresh cube image plus pelvis, waist, and torso
+state to update the Cartesian goal relative to it. After the hand closes, the
+attached-payload lifecycle is rebuilt at the reached object pose and executed
+as frozen MotionGen trajectories. Heavy CuRobo structures are paid at the
+stationary clearance boundary; the retained composed replay reduced the
+post-grasp rebuild to about 2.0 seconds. This path still requires staged
+hardware commissioning. See [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 
 The direct-table presentation above remains the default. To use the prime
 tower, fix its base to the table and place the selected cube centred and

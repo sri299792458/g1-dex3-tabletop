@@ -4745,3 +4745,28 @@ Primary references:
 - Final verification passed Ruff, `414 passed, 7 skipped` in the control
   environment, and `414 passed, 1 skipped` in the CUDA planner environment. No
   robot command was sent during implementation or replay.
+
+## 2026-08-20 — Removed the one-time ChArUco dependency from moving-target MPC
+
+- Physical run `tabletop_20260820T225844Z` reached clearance and passed the
+  supported escape, but the moving-target path rejected all five frames because
+  no ChArUco board was present. The AprilCube itself was visible.
+- Inspection showed that MPC observed the board only once at clearance. It did
+  not reobserve the board during the approach, so the board supplied no ongoing
+  external correction and could not measure unmodelled seat translation.
+- The stationary cube observation at clearance now defines the same kind of
+  frozen arbitrary reference frame. The cube must remain stationary through
+  that observation. Every later MPC window independently detects the cube and
+  combines it with the unchanged pelvis/waist/torso camera-state propagation,
+  so the cube may move after the moving-target controller is ready.
+- The runtime no longer imports or invokes ChArUco detection, writes a
+  `table_board_anchor.json`, or blocks MPC when the board is absent. The
+  separate chair-compliance and state-estimation research tools retain their
+  ChArUco board because they use it as external measurement/evaluation evidence.
+- This simplification does not claim to observe camera translation missing from
+  the proprioceptive estimator. Adding that capability later would require a
+  continuously visible fixed workspace landmark, not the removed one-time
+  sample.
+- Verification passed Ruff, `414 passed, 7 skipped` in the control environment,
+  and `414 passed, 1 skipped` in the CUDA planner environment. No robot command
+  was sent.
