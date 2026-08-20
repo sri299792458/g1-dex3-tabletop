@@ -733,6 +733,146 @@ class TabletopTaskPlan:
         atomic_write_json(path, self.to_dict())
 
 
+@dataclass(frozen=True, slots=True)
+class MovingGraspContinuationRequest:
+    """Rebuild the payload lifecycle at the grasp actually reached by MPC.
+
+    The fixed table-board frame and final fresh cube detection are kept
+    separate.  This prevents a moving cube from being mistaken for camera
+    motion and binds the continuation to the exact MPC approach that the
+    controller executed.
+    """
+
+    tabletop_request: TabletopTaskRequest
+    prior_task_plan: TabletopTaskPlan
+    terminal_command_q_rad: tuple[float, ...]
+    terminal_active_dex3_q_rad: tuple[float, ...]
+    reference_T_camera: tuple[tuple[float, ...], ...]
+    camera_T_object: tuple[tuple[float, ...], ...]
+    executed_grasp_approach: PlannedTrajectory
+    terminal_mpc_window_sha256: str
+    target_provenance: dict[str, Any]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    operation: str = "plan_moving_grasp_continuation"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PLANNER_SCHEMA_VERSION:
+            raise ValueError("unsupported moving-grasp continuation schema version")
+        if self.operation != "plan_moving_grasp_continuation":
+            raise ValueError("unsupported moving-grasp continuation operation")
+        if not isinstance(self.tabletop_request, TabletopTaskRequest):
+            object.__setattr__(
+                self,
+                "tabletop_request",
+                TabletopTaskRequest.from_dict(self.tabletop_request),
+            )
+        if not isinstance(self.prior_task_plan, TabletopTaskPlan):
+            object.__setattr__(
+                self,
+                "prior_task_plan",
+                TabletopTaskPlan.from_dict(self.prior_task_plan),
+            )
+        if self.prior_task_plan.request_sha256 != self.tabletop_request.content_sha256:
+            raise ValueError("moving-grasp prior task belongs to another tabletop request")
+        if self.prior_task_plan.arm != self.tabletop_request.arm:
+            raise ValueError("moving-grasp request and prior task select different arms")
+        object.__setattr__(
+            self,
+            "terminal_command_q_rad",
+            _finite_vector(self.terminal_command_q_rad, 7, "terminal_command_q_rad"),
+        )
+        object.__setattr__(
+            self,
+            "terminal_active_dex3_q_rad",
+            _finite_vector(
+                self.terminal_active_dex3_q_rad,
+                7,
+                "terminal_active_dex3_q_rad",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "reference_T_camera",
+            _finite_transform(self.reference_T_camera, "reference_T_camera"),
+        )
+        object.__setattr__(
+            self,
+            "camera_T_object",
+            _finite_transform(self.camera_T_object, "camera_T_object"),
+        )
+        if not isinstance(self.executed_grasp_approach, PlannedTrajectory):
+            object.__setattr__(
+                self,
+                "executed_grasp_approach",
+                PlannedTrajectory.from_dict(self.executed_grasp_approach),
+            )
+        approach = self.executed_grasp_approach
+        if (approach.from_pose_id, approach.to_pose_id) != (
+            "move_to_pregrasp",
+            "grasp_approach",
+        ):
+            raise ValueError("executed MPC approach has invalid endpoints")
+        expected_start = np.asarray(self.prior_task_plan.trajectories[1].command_q_rad[0])
+        if float(np.max(np.abs(np.asarray(approach.command_q_rad[0]) - expected_start))) > 1.0e-8:
+            raise ValueError("executed MPC approach does not start at the frozen pregrasp")
+        if (
+            float(
+                np.max(
+                    np.abs(
+                        np.asarray(approach.command_q_rad[-1])
+                        - np.asarray(self.terminal_command_q_rad)
+                    )
+                )
+            )
+            > 1.0e-8
+        ):
+            raise ValueError("executed MPC approach does not end at its terminal command")
+        if len(self.terminal_mpc_window_sha256) != 64:
+            raise ValueError("terminal MPC window SHA-256 must contain 64 characters")
+        provenance = json.loads(json.dumps(self.target_provenance, sort_keys=True, allow_nan=False))
+        if not isinstance(provenance, dict):
+            raise TypeError("moving-grasp target provenance must be a JSON object")
+        object.__setattr__(self, "target_provenance", provenance)
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "operation": self.operation,
+            "tabletop_request": self.tabletop_request.to_dict(),
+            "prior_task_plan": self.prior_task_plan.to_dict(),
+            "terminal_command_q_rad": list(self.terminal_command_q_rad),
+            "terminal_active_dex3_q_rad": list(self.terminal_active_dex3_q_rad),
+            "reference_T_camera": [list(row) for row in self.reference_T_camera],
+            "camera_T_object": [list(row) for row in self.camera_T_object],
+            "executed_grasp_approach": self.executed_grasp_approach.to_dict(),
+            "terminal_mpc_window_sha256": self.terminal_mpc_window_sha256,
+            "target_provenance": self.target_provenance,
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MovingGraspContinuationRequest:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        request = cls(**values)
+        if expected_hash is not None and expected_hash != request.content_sha256:
+            raise ValueError("moving-grasp continuation request SHA-256 mismatch")
+        return request
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> MovingGraspContinuationRequest:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
 PICK_PLACE_PHASE_ORDER = (
     "move_to_pregrasp",
     "grasp_approach",

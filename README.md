@@ -215,13 +215,14 @@ existing five candidates; `cube60-r3` contains all 57 unchanged candidates
 that passed intrinsic retention and the stationary-cube fixed-close 5 mm table
 contract. No controller or safety setting changes with the profile.
 
-The default replays the complete frozen CuRobo trajectory lifecycle. To use
-the phase-aware rolling CuRobo controller for the eight free, contact, and
-payload arm motions between the frozen supported escape and its exact return,
-add `--motion-controller mpc`. Finger contact/retention transitions and
-rejection recovery remain with the existing state machine. The phase mapping,
-window checks, retained offline replay, and current limitations are documented
-in [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
+The default replays the complete frozen CuRobo MotionGen lifecycle. The
+experimental `--motion-controller mpc` path keeps MotionGen for global,
+payload, placement, and return motion and uses MPC only for the visually
+updated pregrasp-to-grasp segment. It requires the fixed ChArUco table board as
+a camera/body reference and a detectable AprilCube during the approach. The
+exact lifecycle, window checks, retained offline evidence, and current
+hardware-blocking post-grasp latency are documented in
+[`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 
 With the default `trajectory` controller, the program performs one additional
 stationary correction after reaching pregrasp. The original clearance image
@@ -252,15 +253,14 @@ Each retained grasp receives one independent CuRobo IK problem with 16 seeds.
 The resulting finite joint-solution pool is then tested by the unchanged
 single-route planner and strict validators; candidates do not compete for one
 shared 16-seed goal set.
-With `--motion-controller mpc`, the clearance observation instead anchors the
-fixed task for the complete rolling lifecycle. Every MPC window uses fresh
-pelvis orientation, waist joints, and torso IMU orientation to correct its
-camera/body pose, Cartesian goal, and collision scene. A presentation mesh is
-checked exactly after each optimized window with the existing 10 mm open-hand
-margin; it is not redundantly evaluated inside every optimizer iteration.
-This follows a stationary cube/fixture and does not perform mid-motion image
-tracking. See [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md) for the measured
-offline latency and remaining hardware-commissioning boundary.
+With `--motion-controller mpc`, the clearance observation records both the
+fixed ChArUco table board and the cube. Each local grasp-approach window uses a
+fresh cube image plus pelvis, waist, and torso state to update the Cartesian
+goal in the fixed board frame. After the hand closes, the attached-payload
+lifecycle is rebuilt at the reached object pose and executed as frozen
+MotionGen trajectories. This is not yet cleared for hardware: the remaining
+post-grasp rebuild pauses for about 14 seconds in retained testing. See
+[`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 
 The direct-table presentation above remains the default. To use the prime
 tower, fix its base to the table and place the selected cube centred and

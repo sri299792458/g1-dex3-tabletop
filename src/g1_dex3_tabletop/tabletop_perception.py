@@ -16,6 +16,41 @@ from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.tabletop_contracts import TabletopObservation
 
 
+def observe_live_cube_frame(
+    image_bgr: np.ndarray,
+    *,
+    camera_info: RectifiedCameraInfo,
+    detector: CorrespondenceDetector,
+    minimum_tag_short_side_px: float = 25.0,
+    maximum_reprojection_error_px: float = 3.0,
+) -> dict[str, object]:
+    """Decode one fresh cube frame for reactive control.
+
+    Stationary planning continues to use a multi-frame aggregate.  A reactive
+    target must instead retain the timestamp and pose of one actual frame;
+    averaging a burst would deliberately lag a moving object.
+    """
+
+    value = np.asarray(image_bgr)
+    if value.ndim != 3 or value.shape[2] != 3 or value.dtype != np.uint8:
+        raise ValueError("image must be uint8 BGR")
+    estimate = detect_hand_target_pose(
+        value,
+        camera_info,
+        detector,
+        target_label="live tabletop AprilCube",
+        minimum_visible_faces=1,
+        minimum_tag_short_side_px=minimum_tag_short_side_px,
+        maximum_reprojection_error_px=maximum_reprojection_error_px,
+        single_best_face=True,
+    )
+    return {
+        "camera_T_object": estimate.camera_T_target.tolist(),
+        "source_frame_sha256": hashlib.sha256(value.tobytes()).hexdigest(),
+        "pose_evidence": estimate.to_dict(),
+    }
+
+
 def _average(transforms: Sequence[np.ndarray]) -> np.ndarray:
     result = np.eye(4, dtype=np.float64)
     result[:3, 3] = np.mean([item[:3, 3] for item in transforms], axis=0)

@@ -300,13 +300,14 @@ another uncommissioned threshold. The executor then independently checks
 complete joint-state stability and exact command continuity during atomic
 replacement.
 
-The optional MPC path now consumes the same estimator continuously. Every
-rolling window is based on one synchronized arm/body snapshot and moves both
-the fixed task scene and the local Cartesian goal into the estimated live body
-frame. The older of the arm and estimator timestamps remains the window's
-source time, so the unchanged 100 ms acceptance rule covers both inputs. The
-correction does not run image detection during motion and cannot follow a cube
-that moves after the visual anchor.
+The optional MPC path consumes the same estimator only during the local
+pregrasp-to-grasp segment. A fixed ChArUco table board replaces the cube as the
+visual anchor. Every rolling window pairs one fresh cube image with a
+synchronized arm/body snapshot, propagates the board-to-camera transform, and
+updates the cube and Cartesian grasp goal independently. The older input time
+remains the window source time, so the unchanged 100 ms acceptance rule covers
+both inputs. Global, payload, placement, and return motions remain frozen
+MotionGen trajectories.
 
 ## Candidate upstream implementations
 

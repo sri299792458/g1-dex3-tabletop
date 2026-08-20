@@ -170,7 +170,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="trajectory",
         help=(
             "controller between the frozen supported escape and exact return; "
-            "mpc uses phase-aware continuously replenished CuRobo windows"
+            "mpc experimentally tracks a visually updated cube only from "
+            "pregrasp to grasp"
         ),
     )
     tabletop.add_argument(

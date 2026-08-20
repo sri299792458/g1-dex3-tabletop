@@ -1,9 +1,9 @@
-"""Phase-aware CuRobo MPC for one frozen tabletop lifecycle.
+"""CuRobo MPC for the local, visually updated grasp approach.
 
-CuRobo continuously replans only arm motion.  The commissioned task state
-machine still owns the discrete physical transitions: open fingers, establish
-and validate contact, attach the cube model, release it, and restore the
-supported handoff.  Every MPC window is independently checked with the same
+MotionGen owns global motion to the pregrasp and the discrete task state machine
+owns finger contact, payload motion, release, and return.  MPC is deliberately
+limited to the one segment for which a changing visual goal is useful:
+pregrasp to grasp.  Every MPC window is independently checked with the same
 full-robot, cube, fixture, and table-plane policies used by the frozen planner
 before it may cross into the 250 Hz command process.
 """
@@ -49,12 +49,14 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _cuboid_cover_spheres,
     _fixture_collision_checker,
     _local_plane_clearance_from_spheres,
+    _object_contact_links,
     _selected_open_transit_world_robot,
     _table_from_resting_object,
     _use_moving_grasp_frame_only,
     _world_cuboid_clearances,
 )
 from g1_dex3_tabletop.tabletop_contracts import TabletopExecutionPlan, TabletopTaskRequest
+from g1_dex3_tabletop.tabletop_geometry import canonical_resting_cube_pose
 
 MPC_COMMAND_DT_S = 0.01
 MPC_KNOT_DT_S = 0.04
@@ -386,6 +388,18 @@ def _matrix_from_pose_list(value: Any) -> np.ndarray:
     return validate_transform(result)
 
 
+def _pose_list_from_matrix(value: Any) -> list[float]:
+    """Return CuRobo's xyz+wxyz pose list for one rigid transform."""
+
+    matrix = _rigid_transform(value)
+    quaternion_xyzw = Rotation.from_matrix(matrix[:3, :3].copy()).as_quat()
+    return [
+        *[float(item) for item in matrix[:3, 3]],
+        float(quaternion_xyzw[3]),
+        *[float(item) for item in quaternion_xyzw[:3]],
+    ]
+
+
 def _rigid_transform(value: Any) -> np.ndarray:
     """Project accumulated float32 transform arithmetic back onto SE(3)."""
 
@@ -575,7 +589,10 @@ def _world_collision_buffer_deltas(
         return {}
     target = _selected_open_transit_world_robot(strict_robot, arm=arm)
     if mode == "open_contact":
-        target = _disable_world_collision_links(target, link_names=_contact_links(arm))
+        target = _disable_world_collision_links(
+            target,
+            link_names=_object_contact_links(arm),
+        )
     source_buffer = strict_robot["kinematics"].get("collision_sphere_buffer", 0.0)
     target_buffer = target["kinematics"].get("collision_sphere_buffer", 0.0)
     return {
@@ -634,6 +651,7 @@ class TabletopPhaseMPC:
         phase: str,
         loaded_request: TabletopTaskRequest | None = None,
         measured_active_dex3_q_rad: np.ndarray | None = None,
+        reference_T_camera0: np.ndarray | None = None,
     ) -> None:
         import torch
         from curobo.model_predictive_control import (
@@ -731,6 +749,7 @@ class TabletopPhaseMPC:
             clearance_request,
             base_T_torso,
         )
+        self._base_T_object0 = _rigid_transform(base_T_object)
         self._fixture_checker = _fixture_collision_checker(
             clearance_request,
             base_T_object,
@@ -744,20 +763,43 @@ class TabletopPhaseMPC:
             include_cube=True,
             include_open_transit_table_patch=False,
         )
+        self._object0_T_table_patch: np.ndarray | None = None
+        table_patch = scene.get("cuboid", {}).get("open_transit_table_patch")
+        if table_patch is not None:
+            self._object0_T_table_patch = _rigid_transform(
+                invert_transform(base_T_object)
+                @ _matrix_from_pose_list(table_patch["pose"])
+            )
         self._base_T_torso0 = _rigid_transform(base_T_torso)
+        # ``reference`` is a genuinely fixed table frame for moving-target
+        # operation.  Legacy command-free replays may omit it and retain the
+        # original stationary-cube frame.
         self._reference_T_camera0 = _rigid_transform(
             invert_transform(
                 np.asarray(clearance_request.planning_camera_T_object, dtype=np.float64)
             )
+            if reference_T_camera0 is None
+            else reference_T_camera0
         )
         self._reference_T_torso0 = _rigid_transform(
             self._reference_T_camera0
             @ invert_transform(np.asarray(clearance_request.torso_T_camera, dtype=np.float64))
         )
+        nominal_base_T_reference = _rigid_transform(
+            self._base_T_torso0 @ invert_transform(self._reference_T_torso0)
+        )
+        self._reference_T_object0 = _rigid_transform(
+            invert_transform(nominal_base_T_reference) @ base_T_object
+        )
         torso0_T_base = invert_transform(self._base_T_torso0)
         self._reference_T_obstacles: dict[str, np.ndarray] = {}
         for obstacle_group in ("cuboid", "mesh"):
             for name, obstacle in scene.get(obstacle_group, {}).items():
+                # The detected object is updated independently from every
+                # live image.  It must never be propagated as a fixed board
+                # obstacle when the table frame and object frame are separate.
+                if name in ("cube", "open_transit_table_patch"):
+                    continue
                 base_T_obstacle = _matrix_from_pose_list(obstacle["pose"])
                 self._reference_T_obstacles[name] = _rigid_transform(
                     self._reference_T_torso0 @ torso0_T_base @ base_T_obstacle
@@ -837,11 +879,16 @@ class TabletopPhaseMPC:
         self._active_goal_pose: np.ndarray | None = None
         self._active_goal_model_q: np.ndarray | None = None
         self._active_goal_is_corrected = False
+        self._active_reference_T_object: np.ndarray | None = None
         self._lookahead_rad = (
             clearance_request.maximum_arm_velocity_rad_s
             * MPC_OPTIMIZER_VELOCITY_SCALE
             * self.mpc.action_horizon
             * MPC_KNOT_DT_S
+            # Every certified horizon must finish at zero velocity.  The
+            # largest symmetric accelerate/decelerate displacement at a
+            # bounded peak speed is v*T/2, not v*T.
+            * 0.5
         )
         self.spec = mpc_phase_spec(phase)
         self.request = clearance_request
@@ -1358,7 +1405,7 @@ class TabletopPhaseMPC:
                 return diagnostics
         else:
             disabled_cube_links = (
-                set(_contact_links(self.arm))
+                set(_object_contact_links(self.arm))
                 if self.spec.mode in ("open_free", "open_contact")
                 else set()
             )
@@ -1649,6 +1696,341 @@ class TabletopPhaseMPC:
                 np.degrees(Rotation.from_matrix(correction[:3, :3]).magnitude())
             ),
         }
+
+    def _moving_object_geometry(
+        self,
+        *,
+        reference_T_camera: np.ndarray,
+        camera_T_object: np.ndarray,
+    ) -> tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray]:
+        """Map one board/camera/object observation into the MPC base frame."""
+
+        reference_T_camera = _rigid_transform(reference_T_camera)
+        camera_T_object = _rigid_transform(camera_T_object)
+        state_correction = self._update_live_world(reference_T_camera)
+        reference_T_torso = _rigid_transform(
+            reference_T_camera
+            @ invert_transform(np.asarray(self.request.torso_T_camera, dtype=np.float64))
+        )
+        live_base_T_reference = _rigid_transform(
+            self._base_T_torso0 @ invert_transform(reference_T_torso)
+        )
+        nominal_base_T_reference = _rigid_transform(
+            self._base_T_torso0 @ invert_transform(self._reference_T_torso0)
+        )
+        reference_T_detected_object = _rigid_transform(
+            reference_T_camera @ camera_T_object
+        )
+        nominal_base_T_detected_object = _rigid_transform(
+            nominal_base_T_reference @ reference_T_detected_object
+        )
+        nominal_base_T_object = _rigid_transform(
+            canonical_resting_cube_pose(nominal_base_T_detected_object)
+        )
+        reference_T_object = _rigid_transform(
+            invert_transform(nominal_base_T_reference) @ nominal_base_T_object
+        )
+        live_base_T_object = _rigid_transform(
+            live_base_T_reference @ reference_T_object
+        )
+        return (
+            state_correction,
+            reference_T_object,
+            nominal_base_T_object,
+            live_base_T_object,
+        )
+
+    def update_moving_grasp_goal(
+        self,
+        *,
+        reference_T_camera: np.ndarray,
+        camera_T_object: np.ndarray,
+        nominal_goal_model_q_rad: np.ndarray,
+        terminal_goal: bool,
+        geometry: tuple[dict[str, Any], np.ndarray, np.ndarray, np.ndarray] | None = None,
+    ) -> dict[str, Any]:
+        """Install one live object pose and one reachable approach-line goal.
+
+        ``reference`` is the fixed table-board frame.  The cube is observed in
+        the camera frame on every update, while the existing proprioceptive
+        estimator supplies the board-to-camera transform.  CuRobo therefore
+        receives both the live cube obstacle and the corresponding short
+        look-ahead on the already validated object-relative grasp line.  The
+        global route is not replayed by MPC; it supplies the selected arm
+        branch and the geometric grasp line only.
+        """
+
+        from curobo.types import GoalToolPose, Pose
+
+        if self.spec.phase != "grasp_approach":
+            raise RuntimeError("moving-target MPC is only valid for grasp_approach")
+        if geometry is None:
+            geometry = self._moving_object_geometry(
+                reference_T_camera=reference_T_camera,
+                camera_T_object=camera_T_object,
+            )
+        (
+            state_correction,
+            reference_T_object,
+            nominal_base_T_object,
+            live_base_T_object,
+        ) = geometry
+        nominal_goal_q = np.asarray(nominal_goal_model_q_rad, dtype=np.float64).reshape(-1)
+        if nominal_goal_q.shape != (7,) or not np.all(np.isfinite(nominal_goal_q)):
+            raise ValueError("moving-target nominal goal must contain seven finite values")
+        if terminal_goal:
+            object0_T_goal = _rigid_transform(
+                np.asarray(self.execution.task.object_T_grasp, dtype=np.float64)
+            )
+        else:
+            object0_T_goal = _rigid_transform(
+                invert_transform(self._base_T_object0) @ self.tool_pose(nominal_goal_q)
+            )
+        live_base_T_goal = _rigid_transform(
+            live_base_T_object @ object0_T_goal
+        )
+
+        self.mpc.scene_collision_checker.update_obstacle_pose(
+            "cube",
+            Pose.from_matrix(self.device_cfg.to_device(live_base_T_object[None])),
+        )
+        self._cube_scene["cuboid"]["cube"]["pose"] = _pose_list_from_matrix(
+            nominal_base_T_object
+        )
+        if self._object0_T_table_patch is not None:
+            live_base_T_patch = _rigid_transform(
+                live_base_T_object @ self._object0_T_table_patch
+            )
+            self.mpc.scene_collision_checker.update_obstacle_pose(
+                "open_transit_table_patch",
+                Pose.from_matrix(self.device_cfg.to_device(live_base_T_patch[None])),
+            )
+        goal_pose = Pose.from_matrix(self.device_cfg.to_device(live_base_T_goal[None]))
+        goals = GoalToolPose.from_poses(
+            {grasp_frame(self.arm): goal_pose},
+            ordered_tool_frames=[grasp_frame(self.arm)],
+            num_goalset=1,
+        )
+        # Track the exact live Cartesian pose while using the matching frozen
+        # approach sample as redundant-arm posture regularization.  The route
+        # sample is already exact when the observed object has not moved.  For
+        # a moved object, solve only the local retargeting IK from that branch.
+        nominal_goal_pose = self.tool_pose(nominal_goal_q)
+        goal_translation_delta = float(
+            np.linalg.norm(nominal_goal_pose[:3, 3] - live_base_T_goal[:3, 3])
+        )
+        goal_rotation_delta = float(
+            Rotation.from_matrix(
+                nominal_goal_pose[:3, :3].T @ live_base_T_goal[:3, :3]
+            ).magnitude()
+        )
+        goal_model_q = nominal_goal_q.copy()
+        if goal_translation_delta > 1.0e-5 or goal_rotation_delta > 1.0e-4:
+            nominal_goal_state = _joint_state(
+                self.device_cfg,
+                nominal_goal_q,
+                np.zeros(7, dtype=np.float64),
+                np.zeros(7, dtype=np.float64),
+                self.names,
+            )
+            ik_result = self.mpc.ik_solver.solve_pose(
+                goal_tool_poses=goals,
+                current_state=nominal_goal_state,
+                seed_config=nominal_goal_state.position.view(1, 1, 7).clone(),
+                return_seeds=1,
+            )
+            if ik_result is None or not bool(ik_result.success.reshape(-1)[0].item()):
+                evidence = "no result"
+                if ik_result is not None:
+                    evidence = (
+                        "position_error="
+                        f"{float(_numpy(ik_result.position_error).reshape(-1)[0]):.6f}m, "
+                        "rotation_error="
+                        f"{float(_numpy(ik_result.rotation_error).reshape(-1)[0]):.6f}rad, "
+                        f"feasible={bool(_numpy(ik_result.feasible).reshape(-1)[0])}"
+                    )
+                raise RuntimeError(
+                    f"CuRobo MPC could not retarget the live approach branch: {evidence}"
+                )
+            goal_model_q = _numpy(ik_result.solution).reshape(-1, 7)[0]
+        if not self.mpc.update_goal_tool_poses(goals, run_ik=False):
+            raise RuntimeError("CuRobo MPC rejected the live Cartesian grasp goal")
+        self.mpc.update_goal_state(
+            _joint_state(
+                self.device_cfg,
+                goal_model_q,
+                np.zeros(7, dtype=np.float64),
+                np.zeros(7, dtype=np.float64),
+                self.names,
+            )
+        )
+        self.mpc.enable_joint_position_tracking()
+        self.mpc.enable_tool_pose_tracking()
+        self._active_goal_pose = live_base_T_goal
+        self._active_goal_model_q = goal_model_q.copy()
+        self._active_goal_is_corrected = True
+        self._active_reference_T_object = reference_T_object
+
+        object_delta = reference_T_object @ invert_transform(self._reference_T_object0)
+        return {
+            **state_correction,
+            "goal_source": "live_cube_pose_in_fixed_table_board_frame",
+            "goal_tracking": "object_relative_approach_line_lookahead",
+            "terminal_grasp_goal": terminal_goal,
+            "nominal_goal_model_q_rad": nominal_goal_q.tolist(),
+            "retargeted_goal_model_q_rad": goal_model_q.tolist(),
+            "goal_translation_from_nominal_m": goal_translation_delta,
+            "goal_rotation_from_nominal_deg": float(np.degrees(goal_rotation_delta)),
+            "object_translation_from_plan_m": float(
+                np.linalg.norm(reference_T_object[:3, 3] - self._reference_T_object0[:3, 3])
+            ),
+            "object_rotation_from_plan_deg": float(
+                np.degrees(Rotation.from_matrix(object_delta[:3, :3]).magnitude())
+            ),
+            "reference_T_object": reference_T_object.tolist(),
+            "live_base_T_object": live_base_T_object.tolist(),
+            "live_base_T_grasp": live_base_T_goal.tolist(),
+        }
+
+    def next_moving_target_window(
+        self,
+        *,
+        handoff_predicted_q_rad: np.ndarray,
+        handoff_predicted_dq_rad_s: np.ndarray,
+        handoff_predicted_ddq_rad_s2: np.ndarray,
+        handoff_command_q_rad: np.ndarray,
+        source_state_monotonic_s: float,
+        valid_from_monotonic_s: float,
+        predecessor_sha256: str | None,
+        reference_T_camera: np.ndarray,
+        camera_T_object: np.ndarray,
+        target_provenance: dict[str, Any],
+        committed_route_progress_index: int,
+    ) -> MPCCommandWindow:
+        """Optimize one immutable window toward the latest visual grasp pose."""
+
+        window_started = time.perf_counter()
+        predicted_command = np.asarray(handoff_predicted_q_rad, dtype=np.float64).reshape(-1)
+        if predicted_command.shape != (7,) or not np.all(np.isfinite(predicted_command)):
+            raise ValueError("predicted MPC handoff position must contain seven finite values")
+        if not isinstance(target_provenance, dict):
+            raise TypeError("moving-target provenance must be a dictionary")
+        recorded_camera = _rigid_transform(target_provenance.get("reference_T_camera"))
+        recorded_object = _rigid_transform(target_provenance.get("camera_T_object"))
+        if not np.allclose(recorded_camera, _rigid_transform(reference_T_camera), atol=1.0e-12):
+            raise ValueError("moving-target provenance and reference camera pose differ")
+        if not np.allclose(recorded_object, _rigid_transform(camera_T_object), atol=1.0e-12):
+            raise ValueError("moving-target provenance and cube pose differ")
+
+        model_q = np.asarray(
+            [
+                value + self.request.joint_position_offsets_rad.get(name, 0.0)
+                for name, value in zip(self.names, predicted_command, strict=True)
+            ],
+            dtype=np.float64,
+        )
+        if committed_route_progress_index < 0 or committed_route_progress_index >= len(
+            self.path_model_q
+        ):
+            raise ValueError("committed moving-target route progress is outside the approach")
+        geometry = self._moving_object_geometry(
+            reference_T_camera=reference_T_camera,
+            camera_T_object=camera_T_object,
+        )
+        live_base_T_object = geometry[3]
+        object_T_current = invert_transform(live_base_T_object) @ self.tool_pose(model_q)
+        route_progress_index = committed_route_progress_index
+        remaining_indices = range(route_progress_index, len(self.path_model_q))
+        object_relative_distances = np.asarray(
+            [
+                np.linalg.norm(
+                    (
+                        invert_transform(self._base_T_object0)
+                        @ self.tool_pose(self.path_model_q[index])
+                    )[:3, 3]
+                    - object_T_current[:3, 3]
+                )
+                for index in remaining_indices
+            ],
+            dtype=np.float64,
+        )
+        route_progress_index += int(np.argmin(object_relative_distances))
+        goal_q, waypoint_index, requested_terminal = _bounded_route_goal(
+            self.path_model_q,
+            current_q=self.path_model_q[route_progress_index],
+            route_progress_index=route_progress_index,
+            maximum_distance_rad=self._lookahead_rad,
+        )
+        goal_update_started = time.perf_counter()
+        target_update = self.update_moving_grasp_goal(
+            reference_T_camera=reference_T_camera,
+            camera_T_object=camera_T_object,
+            nominal_goal_model_q_rad=goal_q,
+            terminal_goal=requested_terminal,
+            geometry=geometry,
+        )
+        goal_update_time_s = time.perf_counter() - goal_update_started
+        window = self.solve_window(
+            model_q_rad=model_q,
+            model_dq_rad_s=np.asarray(handoff_predicted_dq_rad_s, dtype=np.float64),
+            model_ddq_rad_s2=np.asarray(handoff_predicted_ddq_rad_s2, dtype=np.float64),
+            active_command_q_rad=np.asarray(handoff_command_q_rad, dtype=np.float64),
+            source_state_monotonic_s=source_state_monotonic_s,
+            valid_from_monotonic_s=valid_from_monotonic_s,
+            predecessor_sha256=predecessor_sha256,
+            terminal=requested_terminal,
+        )
+        if self._active_goal_pose is None:
+            raise RuntimeError("moving-target MPC has no active Cartesian goal")
+        terminal_model = np.asarray(
+            window.diagnostics["predicted_terminal_model_q_rad"], dtype=np.float64
+        )
+        terminal_pose = self.tool_pose(terminal_model)
+        translation_error = float(
+            np.linalg.norm(terminal_pose[:3, 3] - self._active_goal_pose[:3, 3])
+        )
+        rotation_error = float(
+            Rotation.from_matrix(
+                terminal_pose[:3, :3].T @ self._active_goal_pose[:3, :3]
+            ).magnitude()
+        )
+        terminal = (
+            requested_terminal
+            and translation_error <= 0.005
+            and rotation_error <= 0.05
+        )
+        values = window.to_dict(include_hash=False)
+        values["terminal"] = bool(terminal and window.feasible)
+        total_window_time_s = time.perf_counter() - window_started
+        values["solve_time_s"] = total_window_time_s
+        values["diagnostics"] = {
+            **window.diagnostics,
+            **target_update,
+            "moving_target": dict(target_provenance),
+            "terminal_translation_error_m": translation_error,
+            "terminal_rotation_error_rad": rotation_error,
+            "terminal_corrected_joint_error_rad": None,
+            "committed_route_progress_index": committed_route_progress_index,
+            "proposed_route_progress_index": route_progress_index,
+            "route_progress_index": route_progress_index,
+            "route_waypoint_index": waypoint_index,
+            "object_relative_route_distance_m": float(
+                object_relative_distances[route_progress_index - committed_route_progress_index]
+            ),
+            "goal_update_time_s": goal_update_time_s,
+            "mpc_core_window_time_s": window.solve_time_s,
+            "worker_total_window_time_s": total_window_time_s,
+        }
+        window = MPCCommandWindow.from_dict(values)
+        if window.feasible:
+            self._last_window_valid_from_s = window.valid_from_monotonic_s
+            self._last_window_content_sha256 = window.content_sha256
+            self._committed_action_seed = (
+                self.mpc.trajectory_execution_manager.get_action_buffer().clone()
+            )
+        elif self._committed_action_seed is not None:
+            self.mpc.update_seed_trajectory(self._committed_action_seed)
+        return window
 
     def next_nominal_window(
         self,

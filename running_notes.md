@@ -4502,3 +4502,53 @@ Primary references:
   reference interface, not with a collision exception, a larger iteration cap,
   or another task-specific state machine.
 - No robot command was sent during this diagnosis or any replay above.
+
+## 2026-08-20 — Moving-target MPC scope and object-relative progress
+
+- The former eight-phase MPC lifecycle was the wrong abstraction for the
+  intended moving-cube task. MotionGen remains responsible for the supported
+  escape, global clearance-to-pregrasp route, payload lift, placement, and
+  return. MPC is now limited to the open-hand pregrasp-to-grasp segment where a
+  changing visual goal is useful. Dex3 transitions and all commissioned
+  ownership/safety behavior remain outside MPC.
+- Moving-target perception now separates a fixed table reference from the
+  object. The existing 6 x 9 `DICT_5X5_50` ChArUco board is observed once at
+  clearance. Every MPC window receives one fresh AprilCube frame plus a
+  synchronized pelvis/waist/torso estimate. Camera motion updates the board-to-
+  camera transform; cube motion independently updates the goal and cube
+  obstacle.
+- The first moving-target replay revealed the actual progress bug. Route
+  progress was inferred by comparing a corrected joint state against the old
+  nominal joint path. A moved cube necessarily changes the required joints, so
+  that comparison froze around route index 14 even while CuRobo returned valid
+  windows. Progress is now measured by the tool pose relative to the live cube
+  and advanced monotonically along the nominal object-relative approach.
+- Cube contact and fixture contact now have separate link policies. The cube
+  may contact all seven movable Dex3 finger links during final approach;
+  otherwise valid grasps were being rejected at proximal `middle_0` links.
+  The presentation fixture still permits only the existing three distal
+  contact links. Palm, wrist, table, torso, and self collision remain enabled.
+- In the retained CUDA replay with a 5 mm cube translation, the corrected
+  approach reached terminal in 85 accepted windows and 20.96 s of simulated
+  motion with zero rejected windows. Terminal error was 3.6329 mm and 0.9164
+  degrees, within the existing 5 mm / 0.05 rad contract. The old implementation
+  had not completed after 200 windows.
+- The exact command and predicted paths actually accepted by the controller are
+  stitched into a hash-bound trajectory. Before any new CUDA work, its exact
+  reverse plus the original pregrasp return are installed as provisional
+  recovery. The hand then closes immediately at the reached grasp. A
+  continuation request rebuilds the fixed-close check and attached payload
+  lift at the terminal live cube pose; successful replacement and retreat are
+  exact reverses of the new lift and accepted MPC approach.
+- A retained static continuation probe passed the fixed-close and attached-lift
+  checks, preserved the selected grasp, and produced an exact reverse. It took
+  about 14.29 s after grasp; attached-lift planning accounted for about 4.50 s
+  and repeated model/checker construction for most of the remainder. This is
+  the remaining operational blocker. It should be removed by preparing or
+  reusing compatible structures before motion, not by weakening collision
+  checks or changing the MPC formulation again.
+- Verification after the implementation: Ruff passed; the complete test suite
+  passed with `406 passed, 6 skipped`. All work was command-free; no robot
+  command was sent. This branch is not cleared for hardware MPC commissioning
+  until the post-grasp hold latency is removed and the composed lifecycle is
+  replayed.

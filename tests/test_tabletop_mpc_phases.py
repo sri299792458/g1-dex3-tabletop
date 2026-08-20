@@ -370,6 +370,48 @@ def test_planning_session_forwards_hash_bound_camera_state_correction() -> None:
     assert received["committed_route_progress_index"] == 4
 
 
+def test_planning_session_forwards_live_cartesian_target_and_route_progress() -> None:
+    received = {}
+    result = object()
+
+    class FakeMPC:
+        spec = SimpleNamespace(phase="grasp_approach")
+
+        def next_moving_target_window(self, **kwargs):
+            received.update(kwargs)
+            return result
+
+    target = {
+        "reference_T_camera": np.eye(4).tolist(),
+        "camera_T_object": np.eye(4).tolist(),
+        "source_monotonic_s": 1.0,
+        "source_frame_sha256": "f" * 64,
+    }
+    session = TabletopPlanningSession()
+    session._active_phase_mpc = FakeMPC()
+
+    actual = session.step_mpc_phase(
+        {
+            "phase": "grasp_approach",
+            "handoff_predicted_q_rad": [0.0] * 7,
+            "handoff_predicted_dq_rad_s": [0.0] * 7,
+            "handoff_predicted_ddq_rad_s2": [0.0] * 7,
+            "handoff_command_q_rad": [0.0] * 7,
+            "source_state_monotonic_s": 1.0,
+            "valid_from_monotonic_s": 1.2,
+            "predecessor_sha256": None,
+            "committed_route_progress_index": 99,
+            "moving_target": target,
+        }
+    )
+
+    assert actual is result
+    assert received["committed_route_progress_index"] == 99
+    np.testing.assert_allclose(received["reference_T_camera"], np.eye(4))
+    np.testing.assert_allclose(received["camera_T_object"], np.eye(4))
+    assert received["target_provenance"] == target
+
+
 def test_supported_routes_remain_frozen_instead_of_entering_mpc() -> None:
     for phase in ("clearance", "__handoff__"):
         with pytest.raises(ValueError, match="unsupported tabletop MPC phase"):

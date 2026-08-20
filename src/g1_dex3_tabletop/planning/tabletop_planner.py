@@ -49,6 +49,7 @@ from g1_dex3_tabletop.planning.g1_model import (
 from g1_dex3_tabletop.tabletop_contracts import (
     PICK_PLACE_PHASE_ORDER,
     CharucoSupportedEscapeRequest,
+    MovingGraspContinuationRequest,
     PickPlaceRetentionRouteValidationRequest,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
@@ -132,6 +133,15 @@ class _LiftBranchPlan:
     attachment_sphere_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class _MovingGraspGeometry:
+    base_T_torso: np.ndarray
+    base_T_detected_object: np.ndarray
+    base_T_object: np.ndarray
+    plane_point: np.ndarray
+    down: np.ndarray
+
+
 class _BranchRejected(RuntimeError):
     """An expected geometric/planning rejection of one finite IK branch."""
 
@@ -175,7 +185,29 @@ def prewarm_tabletop_model_resolution() -> float:
 
 
 def _contact_links(arm: str) -> tuple[str, ...]:
-    return tuple(f"{arm}_hand_{suffix}_link" for suffix in ("thumb_2", "middle_1", "index_1"))
+    """Return distal links allowed to contact a presentation fixture."""
+
+    return (
+        f"{arm}_hand_thumb_2_link",
+        f"{arm}_hand_middle_1_link",
+        f"{arm}_hand_index_1_link",
+    )
+
+
+def _object_contact_links(arm: str) -> tuple[str, ...]:
+    """Return movable finger links allowed to contact the grasped object.
+
+    The final open-hand approach places the cube between the fingers.  Dex3's
+    proximal finger collision spheres can therefore overlap the cube before a
+    distal tip sphere does.  Treating only the three distal links as contact
+    geometry makes the optimizer stop outside otherwise qualified grasps.  The
+    palm, wrist, table, fixture, opposite arm, and complete self geometry remain
+    enabled and are still checked independently on every route/window.
+    """
+
+    return tuple(
+        f"{arm}_hand_{suffix}_link" for suffix in DEX3_MOTOR_JOINT_SUFFIXES[arm]
+    )
 
 
 def _local_table_plane_links(arm: str) -> tuple[str, ...]:
@@ -689,8 +721,29 @@ def _base_scene(
     include_open_transit_table_patch: bool = False,
     include_environment_cuboids: bool = True,
     include_placement_support: bool = True,
+    base_T_object_override: np.ndarray | None = None,
+    base_T_detected_object_override: np.ndarray | None = None,
+    plane_point_override: np.ndarray | None = None,
+    down_override: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
+    overrides = (
+        base_T_object_override,
+        base_T_detected_object_override,
+        plane_point_override,
+        down_override,
+    )
+    if any(value is not None for value in overrides):
+        if not all(value is not None for value in overrides):
+            raise ValueError("live tabletop geometry overrides must be supplied together")
+        base_T_object = np.asarray(base_T_object_override, dtype=np.float64)
+        base_T_detected_object = np.asarray(
+            base_T_detected_object_override, dtype=np.float64
+        )
+        plane_point = np.asarray(plane_point_override, dtype=np.float64)
+        down = np.asarray(down_override, dtype=np.float64)
+    else:
+        plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
+        base_T_detected_object = _base_T_detected_object(request, base_T_torso)
     scene: dict[str, Any] = {"cuboid": {}}
     if include_cube:
         scene["cuboid"]["cube"] = {
@@ -698,7 +751,6 @@ def _base_scene(
             "pose": _pose_list(base_T_object),
         }
     if include_environment_cuboids:
-        base_T_detected_object = _base_T_detected_object(request, base_T_torso)
         for cuboid in request.environment_cuboids:
             if cuboid.role == "placement_support" and not include_placement_support:
                 continue
@@ -734,6 +786,11 @@ def _base_scene(
 def _attached_lift_scene(
     request: TabletopTaskRequest,
     base_T_torso: np.ndarray,
+    *,
+    base_T_object_override: np.ndarray | None = None,
+    base_T_detected_object_override: np.ndarray | None = None,
+    plane_point_override: np.ndarray | None = None,
+    down_override: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Scene for lifting an object away from its supporting fixture.
 
@@ -749,6 +806,10 @@ def _attached_lift_scene(
         base_T_torso,
         include_cube=False,
         include_placement_support=False,
+        base_T_object_override=base_T_object_override,
+        base_T_detected_object_override=base_T_detected_object_override,
+        plane_point_override=plane_point_override,
+        down_override=down_override,
     )
     if request.fixture is not None:
         meshes = scene.get("mesh", {})
@@ -2583,7 +2644,7 @@ def _validate_open_route_segments(
     grasp = np.asarray(grasp_q, dtype=np.float64)
     segments = (
         (transit, set(), 0),
-        (grasp, set(_contact_links(arm)), len(transit) - 1),
+        (grasp, set(_object_contact_links(arm)), len(transit) - 1),
     )
     clearances: list[tuple[float, str, int]] = []
     for route, disabled_cube_links, sample_offset in segments:
@@ -2643,7 +2704,7 @@ def _plan_open_branch(
         non_terminal_scale=1.0,
         project_distance_to_goal=True,
     )
-    contact_links = list(_contact_links(arm))
+    contact_links = list(_object_contact_links(arm))
     planner.update_tool_pose_criteria({grasp_frame(arm): criterion})
     planner.disable_link_collision(contact_links)
     try:
@@ -2707,12 +2768,16 @@ def _plan_attached_lift(
     down: np.ndarray,
     arm: str,
     fixed_close_validator: _FixedCloseSweepValidator,
+    contact_snapshot: RobotSnapshot | None = None,
+    base_T_object_override: np.ndarray | None = None,
+    base_T_detected_object_override: np.ndarray | None = None,
 ) -> _LiftBranchPlan:
     """Plan with the descriptor close target; live measured fingers are rechecked later."""
 
     planner = None
     try:
-        contact_snapshot = _snapshot_at_arm_q(request, contact_command_q)
+        if contact_snapshot is None:
+            contact_snapshot = _snapshot_at_arm_q(request, contact_command_q)
         close_target_robot, _ = build_tabletop_robot_config(
             arm=arm,
             snapshot=contact_snapshot,
@@ -2720,7 +2785,16 @@ def _plan_attached_lift(
             active_finger_q_rad=tuple(close_target_q),
         )
         _use_moving_grasp_frame_only(close_target_robot, arm=arm)
-        attached_scene = _attached_lift_scene(request, base_T_torso)
+        attached_scene = _attached_lift_scene(
+            request,
+            base_T_torso,
+            base_T_object_override=base_T_object_override,
+            base_T_detected_object_override=base_T_detected_object_override,
+            plane_point_override=(
+                plane_point if base_T_object_override is not None else None
+            ),
+            down_override=down if base_T_object_override is not None else None,
+        )
         planner, device_cfg = _planner(
             close_target_robot,
             attached_scene,
@@ -3096,10 +3170,232 @@ def _payload_route(task: TabletopTaskPlan) -> np.ndarray:
     )
 
 
+def plan_moving_grasp_continuation(
+    continuation: MovingGraspContinuationRequest,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> tuple[TabletopTaskPlan, _MovingGraspGeometry]:
+    """Rebuild only the close/lift/replace lifecycle after moving-target MPC.
+
+    The global clearance-to-pregrasp route is preserved.  The approach and
+    its reverse are the immutable MPC windows actually accepted by the robot
+    controller.  Only the payload lift is newly optimized at the reached
+    object pose.
+    """
+
+    report = progress or (lambda _message: None)
+    request = continuation.tabletop_request
+    prior = continuation.prior_task_plan
+    arm = request.arm
+    terminal_command = np.asarray(continuation.terminal_command_q_rad, dtype=np.float64)
+    snapshot = request.planning_snapshot
+    q29 = np.asarray(snapshot.measured_q29_rad, dtype=np.float64).copy()
+    q29[np.asarray(arm_indices(arm))] = terminal_command
+    active_fingers = tuple(continuation.terminal_active_dex3_q_rad)
+    contact_snapshot = RobotSnapshot(
+        measured_q29_rad=tuple(q29),
+        left_dex3_q_rad=(active_fingers if arm == "left" else snapshot.left_dex3_q_rad),
+        right_dex3_q_rad=(active_fingers if arm == "right" else snapshot.right_dex3_q_rad),
+    )
+    contact_model = np.asarray(
+        continuation.executed_grasp_approach.model_q_rad[-1],
+        dtype=np.float64,
+    )
+
+    import torch
+    from curobo.types import DeviceCfg
+
+    device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+    robot, _ = build_tabletop_robot_config(
+        arm=arm,
+        snapshot=contact_snapshot,
+        joint_position_offsets_rad=request.joint_position_offsets_rad,
+        active_finger_q_rad=active_fingers,
+    )
+    checker = CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+    contact_state = _joint_state(device_cfg, contact_model, arm_joint_names(arm))
+    base_T_torso = (
+        checker.kinematics.compute_kinematics(contact_state)
+        .tool_poses["torso_link"]
+        .get_matrix()[0]
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    base_T_torso[:3, :3] = Rotation.from_matrix(base_T_torso[:3, :3]).as_matrix()
+    reference_T_camera = np.asarray(continuation.reference_T_camera, dtype=np.float64)
+    camera_T_object = np.asarray(continuation.camera_T_object, dtype=np.float64)
+    reference_T_torso = reference_T_camera @ invert_transform(
+        np.asarray(request.torso_T_camera, dtype=np.float64)
+    )
+    base_T_reference = base_T_torso @ invert_transform(reference_T_torso)
+    base_T_detected_object = base_T_reference @ reference_T_camera @ camera_T_object
+    base_T_object = canonical_resting_cube_pose(base_T_detected_object)
+    down = -base_T_object[:3, 2]
+    fixture_height = 0.0 if request.fixture is None else request.fixture.support_height_m
+    plane_point = base_T_object[:3, 3] + (
+        0.5 * request.object_dimensions_m[2] + fixture_height
+    ) * down
+    geometry = _MovingGraspGeometry(
+        base_T_torso=base_T_torso,
+        base_T_detected_object=base_T_detected_object,
+        base_T_object=base_T_object,
+        plane_point=plane_point,
+        down=down,
+    )
+
+    _shortlist, candidates = _load_shortlist(request)
+    selected = [
+        candidate
+        for candidate in candidates
+        if str(candidate.get("candidate_id")) == prior.selected_candidate_id
+    ]
+    if len(selected) != 1:
+        raise ValueError("moving-grasp selected candidate is not uniquely present")
+    selected_candidate = selected[0]
+    reached_pose = (
+        checker.kinematics.compute_kinematics(contact_state)
+        .tool_poses[grasp_frame(arm)]
+        .get_matrix()[0]
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    expected_pose = base_T_object @ np.asarray(prior.object_T_grasp, dtype=np.float64)
+    position_error = float(np.linalg.norm(reached_pose[:3, 3] - expected_pose[:3, 3]))
+    rotation_error = float(
+        Rotation.from_matrix(reached_pose[:3, :3].T @ expected_pose[:3, :3]).magnitude()
+    )
+    if (
+        position_error > PREGRASP_IK_POSITION_TOLERANCE_M
+        or rotation_error > PREGRASP_IK_ORIENTATION_TOLERANCE_RAD
+    ):
+        raise ValueError(
+            "terminal MPC state does not realize the live selected grasp: "
+            f"error={position_error * 1000.0:.3f}mm/"
+            f"{np.degrees(rotation_error):.3f}deg"
+        )
+    _open_profile, close_profile = dex3_execution_profile(arm)
+    close_target = np.asarray(close_profile, dtype=np.float64)
+    fixed_close_validator = _FixedCloseSweepValidator(
+        request=request,
+        base_T_object=base_T_object,
+        base_T_detected_object=base_T_detected_object,
+        plane_point=plane_point,
+        down=down,
+        open_q=np.asarray(active_fingers, dtype=np.float64),
+        close_target_q=close_target,
+    )
+    fixed_close_sweep = fixed_close_validator.validate(contact_model, selected_candidate)
+    report("moving-target terminal fixed-close sweep passed; planning attached lift")
+    started = time.monotonic()
+    lift_plan = _plan_attached_lift(
+        request=request,
+        selected=selected_candidate,
+        close_target_q=close_target,
+        contact_command_q=tuple(terminal_command),
+        contact_model_q=contact_model,
+        base_T_torso=base_T_torso,
+        plane_point=plane_point,
+        down=down,
+        arm=arm,
+        fixed_close_validator=fixed_close_validator,
+        contact_snapshot=contact_snapshot,
+        base_T_object_override=base_T_object,
+        base_T_detected_object_override=base_T_detected_object,
+    )
+    retention_test_lift = lift_plan.retention_test_lift
+    payload_lift = lift_plan.payload_lift
+    payload_lower = _rename_trajectory(
+        _reverse_trajectory(payload_lift),
+        from_pose_id="payload_lift",
+        to_pose_id="payload_lower",
+    )
+    payload_replace = _rename_trajectory(
+        _reverse_trajectory(retention_test_lift),
+        from_pose_id="payload_lower",
+        to_pose_id="payload_replace",
+    )
+    grasp_retreat = _rename_trajectory(
+        _reverse_trajectory(continuation.executed_grasp_approach),
+        from_pose_id="payload_replace",
+        to_pose_id="grasp_retreat",
+    )
+    return_to_clearance = _rename_trajectory(
+        _reverse_trajectory(prior.trajectories[0]),
+        from_pose_id="grasp_retreat",
+        to_pose_id="return_to_clearance",
+    )
+    task = TabletopTaskPlan(
+        request_sha256=request.content_sha256,
+        arm=arm,
+        selected_candidate_id=prior.selected_candidate_id,
+        object_T_grasp=prior.object_T_grasp,
+        open_active_dex3_q_rad=prior.open_active_dex3_q_rad,
+        close_target_active_dex3_q_rad=prior.close_target_active_dex3_q_rad,
+        initial_active_dex3_q_rad=prior.initial_active_dex3_q_rad,
+        trajectories=(
+            prior.trajectories[0],
+            continuation.executed_grasp_approach,
+            retention_test_lift,
+            payload_lift,
+            payload_lower,
+            payload_replace,
+            grasp_retreat,
+            return_to_clearance,
+        ),
+        phase_order=prior.phase_order,
+        planner_provenance={
+            **prior.planner_provenance,
+            "moving_target_continuation": {
+                "request_sha256": continuation.content_sha256,
+                "terminal_mpc_window_sha256": (
+                    continuation.terminal_mpc_window_sha256
+                ),
+                "target_provenance": continuation.target_provenance,
+                "payload_replan_elapsed_s": time.monotonic() - started,
+                "base_T_detected_object": base_T_detected_object.tolist(),
+                "base_T_object": base_T_object.tolist(),
+                "terminal_grasp_position_error_m": position_error,
+                "terminal_grasp_rotation_error_rad": rotation_error,
+                "plane_point": plane_point.tolist(),
+                "down": down.tolist(),
+                "fixed_close_sweep_sample_count": fixed_close_sweep.sample_count,
+                "fixed_close_sweep_minimum_plane_clearance_m": (
+                    fixed_close_sweep.minimum_plane_clearance_m
+                ),
+                "retention_test_lift_actual_m": (
+                    lift_plan.retention_test_lift_actual_m
+                ),
+                "payload_start_plane_clearance_m": (
+                    lift_plan.payload_start_plane_clearance_m
+                ),
+                "return_policy": (
+                    "reverse_new_payload_lift_then_reverse_exact_accepted_mpc_approach_"
+                    "then_reverse_original_clearance_to_pregrasp"
+                ),
+            },
+            "retention_test_lift_actual_m": lift_plan.retention_test_lift_actual_m,
+            "payload_start_plane_clearance_m": lift_plan.payload_start_plane_clearance_m,
+        },
+    )
+    report(
+        "moving-target payload continuation ready; exact accepted MPC approach "
+        "is the open-hand reverse"
+    )
+    return task, geometry
+
+
 class RetentionRouteValidator:
     """Cached FK/collision checker for one frozen task's measured close pose."""
 
-    def __init__(self, tabletop: TabletopTaskRequest, task: TabletopTaskPlan) -> None:
+    def __init__(
+        self,
+        tabletop: TabletopTaskRequest,
+        task: TabletopTaskPlan,
+        *,
+        geometry: _MovingGraspGeometry | None = None,
+    ) -> None:
         import torch
         from curobo.types import DeviceCfg, JointState
 
@@ -3128,14 +3424,21 @@ class RetentionRouteValidator:
         )
         kinematics = self.checker.kinematics.compute_kinematics(reference_state)
         base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
-        self.plane_point, base_T_object, self.down = _table_from_resting_object(
-            tabletop,
-            base_T_torso,
-        )
+        if geometry is None:
+            self.plane_point, base_T_object, self.down = _table_from_resting_object(
+                tabletop,
+                base_T_torso,
+            )
+            base_T_detected_object = _base_T_detected_object(tabletop, base_T_torso)
+        else:
+            self.plane_point = geometry.plane_point
+            base_T_object = geometry.base_T_object
+            self.down = geometry.down
+            base_T_detected_object = geometry.base_T_detected_object
         self.fixture_checker = _fixture_collision_checker(
             tabletop,
             base_T_object,
-            _base_T_detected_object(tabletop, base_T_torso),
+            base_T_detected_object,
             self.down,
             device_cfg=self.device_cfg,
         )

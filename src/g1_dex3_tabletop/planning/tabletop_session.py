@@ -15,12 +15,14 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
     RetentionRouteValidator,
     ReusableOpenPlanner,
+    plan_moving_grasp_continuation,
     plan_supported_escape,
     plan_tabletop_pick_place,
     plan_tabletop_pregrasp,
     plan_tabletop_task,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
+    MovingGraspContinuationRequest,
     PickPlaceRetentionRouteValidationRequest,
     PregraspRemainingPlan,
     RetentionRouteValidationRequest,
@@ -337,11 +339,41 @@ class TabletopPlanningSession:
         )
         return remaining
 
+    def plan_moving_grasp_continuation(
+        self,
+        request: MovingGraspContinuationRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> TabletopTaskPlan:
+        """Replace stale payload routes after MPC intercepts a moved cube."""
+
+        if self._clearance_request is None or self._execution is None:
+            raise RuntimeError("moving-grasp continuation requires a planned lifecycle")
+        if request.tabletop_request.content_sha256 != self._clearance_request.content_sha256:
+            raise ValueError("moving-grasp continuation uses another clearance request")
+        if request.prior_task_plan.content_sha256 != self._execution.task.content_sha256:
+            raise ValueError("moving-grasp continuation uses another prior task")
+        task, geometry = plan_moving_grasp_continuation(request, progress=progress)
+        validator = RetentionRouteValidator(
+            request.tabletop_request,
+            task,
+            geometry=geometry,
+        )
+        controller = self._phase_mpc
+        self._phase_mpc = None
+        self._active_phase_mpc = None
+        if controller is not None:
+            controller.close()
+        self._active_task = task
+        self._retention_validator = validator
+        return task
+
     def prepare_mpc_phase(
         self,
         phase: str,
         *,
         measured_active_dex3_q_rad: np.ndarray | None = None,
+        reference_T_camera0: np.ndarray | None = None,
     ) -> dict:
         """Create or reuse the exact physical MPC model for one motion phase."""
 
@@ -390,12 +422,19 @@ class TabletopPlanningSession:
                 "plan_sha256": self._execution.content_sha256,
             }
         build_started = time.perf_counter()
+        constructor_arguments = {
+            "phase": phase,
+            "loaded_request": self._loaded_request,
+            "measured_active_dex3_q_rad": measured,
+        }
+        if reference_T_camera0 is not None:
+            constructor_arguments["reference_T_camera0"] = np.asarray(
+                reference_T_camera0, dtype=np.float64
+            )
         controller = TabletopPhaseMPC(
             self._clearance_request,
             self._execution,
-            phase=phase,
-            loaded_request=self._loaded_request,
-            measured_active_dex3_q_rad=measured,
+            **constructor_arguments,
         )
         build_s = time.perf_counter() - build_started
         try:
@@ -436,6 +475,39 @@ class TabletopPlanningSession:
         camera_state = payload.get("camera_state_correction")
         if camera_state is not None and not isinstance(camera_state, dict):
             raise TypeError("MPC camera-state correction must be a dictionary")
+        moving_target = payload.get("moving_target")
+        if moving_target is not None:
+            if requested_phase != "grasp_approach":
+                raise ValueError("moving-target MPC is only valid for grasp_approach")
+            if not isinstance(moving_target, dict):
+                raise TypeError("MPC moving target must be a dictionary")
+            return self._active_phase_mpc.next_moving_target_window(
+                handoff_predicted_q_rad=np.asarray(
+                    payload["handoff_predicted_q_rad"], dtype=np.float64
+                ),
+                handoff_predicted_dq_rad_s=np.asarray(
+                    payload["handoff_predicted_dq_rad_s"], dtype=np.float64
+                ),
+                handoff_predicted_ddq_rad_s2=np.asarray(
+                    payload["handoff_predicted_ddq_rad_s2"], dtype=np.float64
+                ),
+                handoff_command_q_rad=np.asarray(
+                    payload["handoff_command_q_rad"], dtype=np.float64
+                ),
+                source_state_monotonic_s=float(payload["source_state_monotonic_s"]),
+                valid_from_monotonic_s=float(payload["valid_from_monotonic_s"]),
+                predecessor_sha256=payload.get("predecessor_sha256"),
+                reference_T_camera=np.asarray(
+                    moving_target.get("reference_T_camera"), dtype=np.float64
+                ),
+                camera_T_object=np.asarray(
+                    moving_target.get("camera_T_object"), dtype=np.float64
+                ),
+                target_provenance=moving_target,
+                committed_route_progress_index=int(
+                    payload["committed_route_progress_index"]
+                ),
+            )
         return self._active_phase_mpc.next_nominal_window(
             handoff_predicted_q_rad=np.asarray(
                 payload["handoff_predicted_q_rad"], dtype=np.float64

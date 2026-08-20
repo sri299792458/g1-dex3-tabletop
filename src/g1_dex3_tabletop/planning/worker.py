@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
+
 from g1_dex3_tabletop.planning.contracts import (
     CalibrationPlanRequest,
     Dex3PreparationRequest,
@@ -29,6 +31,7 @@ from g1_dex3_tabletop.planning.tabletop_session import TabletopPlanningSession
 from g1_dex3_tabletop.planning.waist_yaw_analysis import analyze_waist_yaw_from_paths
 from g1_dex3_tabletop.tabletop_contracts import (
     CharucoSupportedEscapeRequest,
+    MovingGraspContinuationRequest,
     PickPlaceRetentionRouteValidationRequest,
     RetentionRouteValidationRequest,
     TabletopPickPlaceRequest,
@@ -184,6 +187,13 @@ def _serve_tabletop() -> int:
                     payload = session.prepare_mpc_phase(
                         str(request_payload["phase"]),
                         measured_active_dex3_q_rad=measured_fingers,
+                        reference_T_camera0=(
+                            None
+                            if request_payload.get("reference_T_camera0") is None
+                            else np.asarray(
+                                request_payload["reference_T_camera0"], dtype=np.float64
+                            )
+                        ),
                     )
                     event = {
                         "type": "result",
@@ -227,6 +237,12 @@ def _serve_tabletop() -> int:
                     elif command == "replan-tabletop-at-pregrasp":
                         request = TabletopTaskRequest.from_json(request_path)
                         result = session.replan_at_pregrasp(request, progress=progress)
+                    elif command == "plan-moving-grasp-continuation":
+                        request = MovingGraspContinuationRequest.from_json(request_path)
+                        result = session.plan_moving_grasp_continuation(
+                            request,
+                            progress=progress,
+                        )
                     elif command == "plan-charuco-supported-escape":
                         request = CharucoSupportedEscapeRequest.from_json(request_path)
                         result = plan_supported_escape(request, progress=progress)

@@ -31,7 +31,11 @@ from g1_aprilcube_calibration.executor_driver import (
     SynchronizedPoseExecutor,
 )
 from g1_aprilcube_calibration.executor_state_machine import ExecutorState, PoseExecutor
-from g1_aprilcube_calibration.joint_map import arm_indices, validate_arm_side
+from g1_aprilcube_calibration.joint_map import (
+    arm_indices,
+    arm_joint_names,
+    validate_arm_side,
+)
 from g1_aprilcube_calibration.pose_schema import PoseSet
 from g1_aprilcube_calibration.process_lock import CommandOwnerLock
 from g1_aprilcube_calibration.readiness import StateSampleBuffer
@@ -84,6 +88,7 @@ from g1_dex3_tabletop.planning.tabletop_mpc import (
     MPC_KNOT_DT_S,
 )
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
+from g1_dex3_tabletop.seat_compliance import observe_charuco_board
 from g1_dex3_tabletop.state_estimation import (
     AnchoredCameraPoseEstimators,
     AnchoredCameraStateEstimator,
@@ -91,18 +96,21 @@ from g1_dex3_tabletop.state_estimation import (
     pose_error,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
+    MovingGraspContinuationRequest,
     PregraspRemainingPlan,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
     TabletopExecutionPlan,
     TabletopPregraspPlan,
+    TabletopTaskPlan,
     build_pregrasp_remaining_plan,
     pregrasp_to_clearance_return,
 )
 from g1_dex3_tabletop.tabletop_object import load_tabletop_object_profile
 from g1_dex3_tabletop.tabletop_perception import (
     camera_motion_from_fixed_cube,
+    observe_live_cube_frame,
     observe_resting_cube,
 )
 from g1_dex3_tabletop.tabletop_presentation import (
@@ -511,6 +519,74 @@ def _execute_trajectory(
     print(f"completed phase: {trajectory.to_pose_id}", flush=True)
 
 
+def _executed_mpc_approach(
+    windows: list[dict],
+    *,
+    arm: str,
+    joint_position_offsets_rad: dict[str, float],
+) -> PlannedTrajectory:
+    """Stitch exactly the portions of accepted windows exposed to control."""
+
+    accepted = [MPCCommandWindow.from_dict(value) for value in windows]
+    if not accepted or not accepted[-1].terminal:
+        raise ValueError("completed moving-target approach has no terminal MPC window")
+    absolute_times: list[float] = []
+    commands: list[np.ndarray] = []
+    predicted: list[np.ndarray] = []
+    for index, window in enumerate(accepted):
+        end = (
+            accepted[index + 1].valid_from_monotonic_s
+            if index + 1 < len(accepted)
+            else window.expiration_monotonic_s
+        )
+        for relative_time, command, predicted_q in zip(
+            window.sample_time_s,
+            window.command_q_rad,
+            window.predicted_q_rad,
+            strict=True,
+        ):
+            absolute_time = window.valid_from_monotonic_s + relative_time
+            if absolute_time > end + 1.0e-9:
+                continue
+            command_array = np.asarray(command, dtype=np.float64)
+            predicted_array = np.asarray(predicted_q, dtype=np.float64)
+            if absolute_times and np.isclose(
+                absolute_time,
+                absolute_times[-1],
+                atol=1.0e-9,
+                rtol=0.0,
+            ):
+                if float(np.max(np.abs(command_array - commands[-1]))) > 1.0e-8:
+                    raise ValueError("successive MPC windows disagree at their splice")
+                if float(np.max(np.abs(predicted_array - predicted[-1]))) > 1.0e-8:
+                    raise ValueError("successive MPC predictions disagree at their splice")
+                continue
+            if absolute_times and absolute_time < absolute_times[-1]:
+                raise ValueError("accepted MPC windows are not time ordered")
+            absolute_times.append(absolute_time)
+            commands.append(command_array)
+            predicted.append(predicted_array)
+    if len(absolute_times) < 2:
+        raise ValueError("executed MPC approach contains fewer than two samples")
+    times = np.asarray(absolute_times, dtype=np.float64) - absolute_times[0]
+    command_q = np.asarray(commands, dtype=np.float64)
+    predicted_q = np.asarray(predicted, dtype=np.float64)
+    offsets = np.asarray(
+        [joint_position_offsets_rad.get(name, 0.0) for name in arm_joint_names(arm)],
+        dtype=np.float64,
+    )
+    return PlannedTrajectory(
+        from_pose_id="move_to_pregrasp",
+        to_pose_id="grasp_approach",
+        sample_time_s=tuple(times),
+        command_q_rad=tuple(tuple(float(value) for value in row) for row in command_q),
+        model_q_rad=tuple(
+            tuple(float(value) for value in row) for row in predicted_q + offsets[None, :]
+        ),
+        planning_time_s=float(sum(window.solve_time_s for window in accepted)),
+    )
+
+
 def _trajectory_with_endpoints(
     trajectory: PlannedTrajectory,
     *,
@@ -540,11 +616,15 @@ def _execute_mpc_phase(
     control_config,
     measured_active_dex3_q_rad=None,
     phase_record: dict | None = None,
-    camera_state_provider=None,
+    moving_target_provider=None,
+    reference_T_camera0=None,
 ) -> tuple[dict, list[dict]]:
-    """Execute one normal frozen route through phase-aware rolling MPC."""
+    """Execute the local grasp approach through visual Cartesian MPC."""
 
     phase = trajectory.to_pose_id
+    pending_moving_target = (
+        None if moving_target_provider is None else moving_target_provider()
+    )
     try:
         preparation_event = planner.request_payload(
             "prepare-mpc-phase",
@@ -554,6 +634,11 @@ def _execute_mpc_phase(
                     None
                     if measured_active_dex3_q_rad is None
                     else list(measured_active_dex3_q_rad)
+                ),
+                "reference_T_camera0": (
+                    None
+                    if reference_T_camera0 is None
+                    else np.asarray(reference_T_camera0, dtype=np.float64).tolist()
                 ),
             },
             control_check=driver.check,
@@ -587,19 +672,32 @@ def _execute_mpc_phase(
     handoff_lead_s = MPC_HANDOFF_INTERVAL_S
 
     def request_window() -> MPCCommandWindow:
-        camera_state = None
-        if camera_state_provider is not None:
-            synchronized_input, estimate = camera_state_provider()
+        nonlocal pending_moving_target
+        moving_target = None
+        if moving_target_provider is not None:
+            if pending_moving_target is None:
+                synchronized_input, estimate, visual_target = moving_target_provider()
+            else:
+                synchronized_input, estimate, visual_target = pending_moving_target
+                pending_moving_target = None
         state = synchronized.observe_state()
         state_source_monotonic_s = float(state.receipt_monotonic_s)
-        if camera_state_provider is not None:
+        if moving_target_provider is not None:
             camera_state = _mpc_camera_state_record(
                 synchronized_input,
                 estimate,
                 state,
                 maximum_time_difference_s=(control_config.state_freshness_timeout_s),
             )
-            state_source_monotonic_s = camera_state["source_monotonic_s"]
+            moving_target = {
+                **camera_state,
+                **visual_target,
+                "source_monotonic_s": min(
+                    float(camera_state["source_monotonic_s"]),
+                    float(visual_target["source_monotonic_s"]),
+                ),
+            }
+            state_source_monotonic_s = moving_target["source_monotonic_s"]
         # Freeze the splice only after acquiring the observations needed for
         # this solve. The complete handoff lead is then available to the CUDA
         # worker, rather than being consumed by camera/state collection.
@@ -630,19 +728,19 @@ def _execute_mpc_phase(
                 "valid_from_monotonic_s": boundary.valid_from_monotonic_s,
                 "predecessor_sha256": boundary.predecessor_sha256,
                 "committed_route_progress_index": (boundary.committed_route_progress_index),
-                "camera_state_correction": camera_state,
+                "moving_target": moving_target,
             },
             control_check=driver.check,
             timeout_s=request_timeout_s,
         )
         window = MPCCommandWindow.from_dict(event["payload"])
-        if camera_state is not None:
-            if window.diagnostics.get("camera_state_correction") != camera_state:
+        if moving_target is not None:
+            if window.diagnostics.get("moving_target") != moving_target:
                 raise RuntimeError(
-                    "CuRobo MPC window did not preserve its camera-state correction"
+                    "CuRobo MPC window did not preserve its moving-target observation"
                 )
             if phase_record is not None:
-                phase_record["camera_state_corrections"].append(camera_state)
+                phase_record["moving_targets"].append(moving_target)
         return window
 
     windows: list[dict] = []
@@ -929,6 +1027,8 @@ def run_tabletop(args) -> int:
     )
     camera_state_anchor = None
     camera_state_estimate = None
+    table_board_observation = None
+    reference_T_camera0 = None
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
@@ -1251,6 +1351,19 @@ def run_tabletop(args) -> int:
                     minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
                     maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
                 )
+                if args.motion_controller == "mpc":
+                    table_board_observation, table_board_evidence = observe_charuco_board(
+                        [item.image_bgr for item in clearance_frames],
+                        camera_info=expected_camera,
+                        snapshot=_snapshot(boundary_state, boundary_hands),
+                    )
+                    reference_T_camera0 = invert_transform(
+                        np.asarray(table_board_observation.camera_T_board, dtype=np.float64)
+                    )
+                    atomic_write_json(
+                        task_run / "table_board_anchor.json",
+                        table_board_evidence,
+                    )
                 cube_anchor_motion = camera_motion_from_fixed_cube(
                     loaded_observation.camera_T_object,
                     boundary_observation.camera_T_object,
@@ -1277,8 +1390,10 @@ def run_tabletop(args) -> int:
                 )
                 anchor_estimate = camera_estimator.reset(
                     CameraPoseAnchor(
-                        reference_T_camera=invert_transform(
-                            np.asarray(boundary_observation.camera_T_object)
+                        reference_T_camera=(
+                            invert_transform(np.asarray(boundary_observation.camera_T_object))
+                            if reference_T_camera0 is None
+                            else reference_T_camera0
                         ),
                         sample=camera_state_anchor.sample,
                     )
@@ -1288,26 +1403,59 @@ def run_tabletop(args) -> int:
                     {
                         "estimate": anchor_estimate.to_dict(),
                         "input": camera_state_anchor.to_dict(),
-                        "visual_observation_sha256": (
-                            clearance_request.observation.content_sha256
+                        "visual_reference": (
+                            {
+                                "kind": "fixed_charuco_table_board",
+                                "observation": table_board_observation.to_dict(),
+                            }
+                            if table_board_observation is not None
+                            else {
+                                "kind": "stationary_cube",
+                                "observation_sha256": (
+                                    clearance_request.observation.content_sha256
+                                ),
+                            }
                         ),
                     },
                 )
 
-                def current_mpc_camera_state():
-                    current = _wait_for_camera_state_input(
+                def current_moving_grasp_target():
+                    if reference_T_camera0 is None:
+                        raise RuntimeError("moving-target MPC has no fixed table-board anchor")
+                    frame = _collect_frames(
+                        rclpy,
+                        node,
+                        camera,
+                        count=1,
+                        timeout_s=1.0,
+                        control_check=driver.check,
+                    )[0]
+                    target = observe_live_cube_frame(
+                        frame.image_bgr,
+                        camera_info=expected_camera,
+                        detector=detector,
+                        minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
+                        maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
+                    )
+                    synchronized_input = _wait_for_camera_state_input(
                         camera_state_inputs,
-                        target_monotonic_s=None,
+                        target_monotonic_s=frame.timing.receipt_monotonic_s,
                         maximum_age_s=control_config.state_freshness_timeout_s,
                         maximum_gap_s=pairing.maximum_bracket_span_s,
                         control_check=driver.check,
                     )
-                    estimate = camera_estimator.estimate(current.sample)
+                    estimate = camera_estimator.estimate(synchronized_input.sample)
                     if estimate.anchor_timestamp_ns != camera_state_anchor.sample.timestamp_ns:
                         raise RuntimeError(
-                            "live MPC camera estimate belongs to another visual anchor"
+                            "live moving-target estimate belongs to another table anchor"
                         )
-                    return current, estimate
+                    return synchronized_input, estimate, {
+                        **target,
+                        "source_monotonic_s": frame.timing.receipt_monotonic_s,
+                        "source_utc": frame.timing.receipt_utc,
+                        "source_header_stamp_ns": frame.timing.header_stamp_ns,
+                        "camera_profile_sha256": frame.camera_info.profile_sha256,
+                    }
 
                 escape_return = _trajectory_with_endpoints(
                     escape.inbound,
@@ -1441,14 +1589,18 @@ def run_tabletop(args) -> int:
                 *,
                 measured_active_dex3_q_rad=None,
                 use_mpc: bool = True,
-            ) -> None:
-                if args.motion_controller == "mpc" and use_mpc:
+            ) -> dict | None:
+                if (
+                    args.motion_controller == "mpc"
+                    and use_mpc
+                    and name == "grasp_approach"
+                ):
                     phase_record = {
                         "completed": False,
                         "preparation": None,
                         "windows": [],
                         "rejected_windows": [],
-                        "camera_state_corrections": [],
+                        "moving_targets": [],
                     }
                     mpc_phases[name] = phase_record
                     preparation, windows = _execute_mpc_phase(
@@ -1461,11 +1613,12 @@ def run_tabletop(args) -> int:
                         control_config=control_config,
                         measured_active_dex3_q_rad=measured_active_dex3_q_rad,
                         phase_record=phase_record,
-                        camera_state_provider=current_mpc_camera_state,
+                        moving_target_provider=current_moving_grasp_target,
+                        reference_T_camera0=reference_T_camera0,
                     )
                     assert phase_record["preparation"] == preparation
                     assert phase_record["windows"] == windows
-                    return
+                    return phase_record
                 _execute_trajectory(
                     synchronized,
                     driver,
@@ -1473,6 +1626,7 @@ def run_tabletop(args) -> int:
                     plan_sha256=active_plan_sha256,
                     control_config=control_config,
                 )
+                return None
 
             def execute_recovery(source: str, target: str) -> None:
                 _execute_trajectory(
@@ -1695,11 +1849,11 @@ def run_tabletop(args) -> int:
                 execute_phase("estimated_pregrasp", use_mpc=False)
             else:
                 print(
-                    "CONTINUOUS MPC CAMERA-STATE CORRECTION ACTIVE — the fixed cube "
-                    "clearance observation is the 6D reference anchor; every MPC window "
-                    "uses fresh pelvis orientation, three waist joints, and torso IMU "
-                    "orientation to move its task goal and fixed collision scene. No "
-                    "mid-motion image processing or moving-object tracking is implied",
+                    "LOCAL MOVING-TARGET MPC READY — MotionGen remains responsible for "
+                    "clearance-to-pregrasp and every payload/return route. Only the open-hand "
+                    "pregrasp-to-grasp segment uses native CuRobo Cartesian MPC; every window "
+                    "combines one fresh AprilCube image with the fixed ChArUco-board anchor "
+                    "and current pelvis/waist/torso state",
                     flush=True,
                 )
             if task is None:
@@ -1715,29 +1869,288 @@ def run_tabletop(args) -> int:
                 "tau_est remain recorded diagnostics; beginning grasp approach",
                 flush=True,
             )
-            execute_phase("grasp_approach")
-            active_close_target = task.close_target_active_dex3_q_rad
-            try:
-                grasp_close = _command_retention_test_close(
-                    dex_controller,
-                    driver,
-                    guard,
-                    active_side=arm,
-                    left=active_close_target if arm == "left" else initial_left,
-                    right=active_close_target if arm == "right" else initial_right,
-                    empty_close_reference_q_rad=empty_close_reference_q_rad,
-                    minimum_opposed_shortfall_rad=minimum_opposed_shortfall_rad,
-                    label=f"descriptor-defined {arm}-hand cube close",
+            mpc_approach_record = execute_phase("grasp_approach")
+            if args.motion_controller == "mpc":
+                if mpc_approach_record is None:
+                    raise RuntimeError("moving-target MPC approach produced no execution record")
+                executed_approach = _executed_mpc_approach(
+                    mpc_approach_record["windows"],
+                    arm=arm,
+                    joint_position_offsets_rad=clearance_request.joint_position_offsets_rad,
                 )
-            except Dex3GraspNotAcquiredError as error:
-                driver.check()
-                print(f"TASK REJECTED — no stable grasp close: {error}", flush=True)
-                return_after_task_rejection(from_test_lift=False)
-                raise TabletopTaskRejected(f"no stable grasp close: {error}") from error
-            atomic_write_json(
-                task_run / "grasp_close.json",
-                grasp_close.to_dict(),
-            )
+                moving_targets = mpc_approach_record["moving_targets"]
+                if not moving_targets:
+                    raise RuntimeError("moving-target MPC approach recorded no live cube target")
+                terminal_window = MPCCommandWindow.from_dict(
+                    mpc_approach_record["windows"][-1]
+                )
+                terminal_target = terminal_window.diagnostics.get("moving_target")
+                if not isinstance(terminal_target, dict):
+                    raise RuntimeError("terminal MPC window has no bound moving target")
+                terminal_state = synchronized.observe_state()
+                terminal_hands = dex_controller.observer.observe()
+                terminal_active_fingers = (
+                    terminal_hands.left.position
+                    if arm == "left"
+                    else terminal_hands.right.position
+                )
+
+                # Install the exact reverse of what was actually exposed to
+                # control before asking CUDA for any new payload route. A
+                # continuation-planning rejection can therefore return
+                # without using the stale nominal grasp trajectory.
+                # Reversing timestamps requires the same normalization used
+                # by the planner's immutable trajectory helper.
+                duration = executed_approach.sample_time_s[-1]
+                provisional_retreat = PlannedTrajectory(
+                    from_pose_id="grasp_approach",
+                    to_pose_id="grasp_retreat",
+                    sample_time_s=tuple(
+                        duration - value
+                        for value in reversed(executed_approach.sample_time_s)
+                    ),
+                    command_q_rad=tuple(reversed(executed_approach.command_q_rad)),
+                    model_q_rad=tuple(reversed(executed_approach.model_q_rad)),
+                    planning_time_s=0.0,
+                )
+                provisional_return = _trajectory_with_endpoints(
+                    task.trajectories[7],
+                    from_pose_id="grasp_retreat",
+                    to_pose_id="return_to_clearance",
+                )
+                provisional_document = {
+                    "executed_approach": executed_approach.to_dict(),
+                    "terminal_window_sha256": terminal_window.content_sha256,
+                    "terminal_target": terminal_target,
+                }
+                provisional_sha256 = hashlib.sha256(
+                    json.dumps(
+                        provisional_document,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        allow_nan=False,
+                    ).encode()
+                ).hexdigest()
+                provisional_pose_set = pose_set_from_trajectories(
+                    arm=arm,
+                    trajectories=(
+                        provisional_retreat,
+                        provisional_return,
+                        escape_return,
+                    ),
+                    reference_full_q=terminal_state.position,
+                    robot_model=model.name,
+                    urdf_sha256=model.sha256,
+                    source="NVlabs/curobo_exact_accepted_mpc_reverse",
+                    initial_pose_id="grasp_approach",
+                    initial_command_q_rad=executed_approach.command_q_rad[-1],
+                )
+                synchronized.replace_validated_remaining_plan(
+                    pose_set=provisional_pose_set,
+                    approved_validation_report_sha256=provisional_sha256,
+                    validated_reference_state=terminal_state,
+                )
+
+                # The selected grasp's finger sweep is object-relative and
+                # was qualified before ownership. Close as soon as MPC reaches
+                # that live grasp instead of leaving an open hand beside a
+                # moving cube during the payload-planner solve. The actual
+                # contact-stopped fingers are still checked against the newly
+                # planned payload route before any lift.
+                active_close_target = task.close_target_active_dex3_q_rad
+                try:
+                    grasp_close = _command_retention_test_close(
+                        dex_controller,
+                        driver,
+                        guard,
+                        active_side=arm,
+                        left=active_close_target if arm == "left" else initial_left,
+                        right=active_close_target if arm == "right" else initial_right,
+                        empty_close_reference_q_rad=empty_close_reference_q_rad,
+                        minimum_opposed_shortfall_rad=minimum_opposed_shortfall_rad,
+                        label=f"descriptor-defined {arm}-hand moving-cube close",
+                    )
+                except Dex3GraspNotAcquiredError as error:
+                    driver.check()
+                    open_active_hand("open after rejected moving-cube close")
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        provisional_retreat,
+                        plan_sha256=provisional_sha256,
+                        control_config=control_config,
+                    )
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        provisional_return,
+                        plan_sha256=provisional_sha256,
+                        control_config=control_config,
+                    )
+                    _command_fingers(
+                        dex_controller,
+                        driver,
+                        guard,
+                        left=initial_left,
+                        right=initial_right,
+                        label="initial finger posture restoration after rejected moving close",
+                    )
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        escape_return,
+                        plan_sha256=provisional_sha256,
+                        control_config=control_config,
+                    )
+                    rejection_return_completed = True
+                    raise TabletopTaskRejected(
+                        f"no stable moving-cube grasp close: {error}"
+                    ) from error
+                atomic_write_json(task_run / "grasp_close.json", grasp_close.to_dict())
+
+                continuation_request = MovingGraspContinuationRequest(
+                    tabletop_request=clearance_request,
+                    prior_task_plan=task,
+                    terminal_command_q_rad=executed_approach.command_q_rad[-1],
+                    terminal_active_dex3_q_rad=tuple(terminal_active_fingers),
+                    reference_T_camera=tuple(
+                        tuple(float(value) for value in row)
+                        for row in terminal_target["reference_T_camera"]
+                    ),
+                    camera_T_object=tuple(
+                        tuple(float(value) for value in row)
+                        for row in terminal_target["camera_T_object"]
+                    ),
+                    executed_grasp_approach=executed_approach,
+                    terminal_mpc_window_sha256=terminal_window.content_sha256,
+                    target_provenance=terminal_target,
+                )
+                continuation_request_path = task_run / "moving_grasp_continuation_request.json"
+                continuation_plan_path = task_run / "moving_grasp_continuation_plan.json"
+                continuation_request.write_json(continuation_request_path)
+                try:
+                    planner.request(
+                        "plan-moving-grasp-continuation",
+                        request_path=continuation_request_path,
+                        output_path=continuation_plan_path,
+                        control_check=driver.check,
+                    )
+                    corrected_task = TabletopTaskPlan.from_json(continuation_plan_path)
+                except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+                    driver.check()
+                    open_active_hand("release after moving-target continuation rejection")
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        provisional_retreat,
+                        plan_sha256=provisional_sha256,
+                        control_config=control_config,
+                    )
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        provisional_return,
+                        plan_sha256=provisional_sha256,
+                        control_config=control_config,
+                    )
+                    _command_fingers(
+                        dex_controller,
+                        driver,
+                        guard,
+                        left=initial_left,
+                        right=initial_right,
+                        label="initial finger posture restoration after continuation rejection",
+                    )
+                    _execute_trajectory(
+                        synchronized,
+                        driver,
+                        escape_return,
+                        plan_sha256=provisional_sha256,
+                        control_config=control_config,
+                    )
+                    rejection_return_completed = True
+                    raise TabletopTaskRejected(
+                        f"moving-target payload continuation failed: {error}"
+                    ) from error
+                if corrected_task.request_sha256 != clearance_request.content_sha256:
+                    raise RuntimeError("moving-grasp continuation belongs to another request")
+                if corrected_task.selected_candidate_id != selected_candidate_id:
+                    raise RuntimeError("moving-grasp continuation changed the selected grasp")
+                continuation_pose_set = pose_set_from_trajectories(
+                    arm=arm,
+                    trajectories=(*corrected_task.trajectories[2:], escape_return),
+                    reference_full_q=terminal_state.position,
+                    robot_model=model.name,
+                    urdf_sha256=model.sha256,
+                    source="NVlabs/curobo_moving_grasp_payload_continuation",
+                    initial_pose_id="grasp_approach",
+                    initial_command_q_rad=executed_approach.command_q_rad[-1],
+                )
+                continuation_install_state = synchronized.observe_state()
+                synchronized.replace_validated_remaining_plan(
+                    pose_set=continuation_pose_set,
+                    approved_validation_report_sha256=corrected_task.content_sha256,
+                    validated_reference_state=continuation_install_state,
+                )
+                task = corrected_task
+                active_plan_sha256 = corrected_task.content_sha256
+                normal_routes = {
+                    trajectory.to_pose_id: trajectory
+                    for trajectory in (*corrected_task.trajectories, escape_return)
+                }
+                recovery_routes = {
+                    ("grasp_approach", "grasp_retreat"): _trajectory_with_endpoints(
+                        corrected_task.trajectories[6],
+                        from_pose_id="grasp_approach",
+                        to_pose_id="grasp_retreat",
+                    ),
+                    ("retention_test_lift", "payload_replace"): (
+                        _trajectory_with_endpoints(
+                            corrected_task.trajectories[5],
+                            from_pose_id="retention_test_lift",
+                            to_pose_id="payload_replace",
+                        )
+                    ),
+                    ("move_to_pregrasp", "return_to_clearance"): (
+                        _trajectory_with_endpoints(
+                            corrected_task.trajectories[7],
+                            from_pose_id="move_to_pregrasp",
+                            to_pose_id="return_to_clearance",
+                        )
+                    ),
+                }
+                retention_test_lift_mm = 1000.0 * float(
+                    task.planner_provenance["retention_test_lift_actual_m"]
+                )
+                print(
+                    "MOVING-TARGET CONTINUATION INSTALLED — fixed close and attached "
+                    "lift were rebuilt at the reached cube pose; replacement reverses "
+                    "that lift and the exact accepted MPC approach",
+                    flush=True,
+                )
+            if grasp_close is None:
+                active_close_target = task.close_target_active_dex3_q_rad
+                try:
+                    grasp_close = _command_retention_test_close(
+                        dex_controller,
+                        driver,
+                        guard,
+                        active_side=arm,
+                        left=active_close_target if arm == "left" else initial_left,
+                        right=active_close_target if arm == "right" else initial_right,
+                        empty_close_reference_q_rad=empty_close_reference_q_rad,
+                        minimum_opposed_shortfall_rad=minimum_opposed_shortfall_rad,
+                        label=f"descriptor-defined {arm}-hand cube close",
+                    )
+                except Dex3GraspNotAcquiredError as error:
+                    driver.check()
+                    print(f"TASK REJECTED — no stable grasp close: {error}", flush=True)
+                    return_after_task_rejection(from_test_lift=False)
+                    raise TabletopTaskRejected(f"no stable grasp close: {error}") from error
+                atomic_write_json(
+                    task_run / "grasp_close.json",
+                    grasp_close.to_dict(),
+                )
             dex_controller.begin_retention_test()
             retention_request = RetentionRouteValidationRequest(
                 tabletop_request=clearance_request,
@@ -1858,8 +2271,12 @@ def run_tabletop(args) -> int:
                 "presentation_id": presentation.presentation_id,
                 "selected_candidate_id": task.selected_candidate_id,
                 "supported_escape_plan_sha256": escape.content_sha256,
-                "active_plan_sha256": execution.content_sha256,
-                "active_plan_kind": execution.kind,
+                "active_plan_sha256": active_plan_sha256,
+                "active_plan_kind": (
+                    task.kind
+                    if args.motion_controller == "mpc"
+                    else execution.kind
+                ),
                 "pregrasp_plan_sha256": (
                     pregrasp_plan.content_sha256
                     if args.motion_controller == "trajectory"

@@ -10,7 +10,12 @@ from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
 from g1_aprilcube_calibration.timestamp_pairing import ImageTiming
-from g1_dex3_tabletop.hardware_tabletop import _return_to_clearance_phases, _save_frames
+from g1_dex3_tabletop.hardware_tabletop import (
+    _executed_mpc_approach,
+    _return_to_clearance_phases,
+    _save_frames,
+)
+from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
 from g1_dex3_tabletop.planning import tabletop_planner
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
 from g1_dex3_tabletop.planning.curobo_backend import sample_linear_joint_sweep
@@ -48,6 +53,7 @@ from g1_dex3_tabletop.tabletop_contracts import (
 from g1_dex3_tabletop.tabletop_object import load_tabletop_object_profile
 from g1_dex3_tabletop.tabletop_perception import (
     camera_motion_from_fixed_cube,
+    observe_live_cube_frame,
     observe_resting_cube,
 )
 from g1_dex3_tabletop.tabletop_workflow import (
@@ -71,6 +77,103 @@ def _observation() -> TabletopObservation:
         0.1,
         0.1,
     )
+
+
+def test_live_cube_target_is_one_exact_frame_not_a_lagging_burst(monkeypatch) -> None:
+    image = np.zeros((12, 16, 3), dtype=np.uint8)
+    transform = np.eye(4)
+    transform[0, 3] = 0.42
+    estimate = SimpleNamespace(
+        camera_T_target=transform,
+        to_dict=lambda: {
+            "camera_T_target": transform.tolist(),
+            "reprojection_error_px": 0.2,
+            "point_count": 8,
+            "marker_ids": [1],
+            "visible_faces": ["top"],
+            "second_solution_error_px": None,
+        },
+    )
+    received = {}
+
+    def detect(value, camera_info, detector, **kwargs):
+        received.update(kwargs)
+        assert value is image
+        assert camera_info == "camera"
+        assert detector == "detector"
+        return estimate
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose",
+        detect,
+    )
+    observation = observe_live_cube_frame(
+        image,
+        camera_info="camera",
+        detector="detector",
+        minimum_tag_short_side_px=26.0,
+        maximum_reprojection_error_px=2.5,
+    )
+
+    np.testing.assert_allclose(observation["camera_T_object"], transform)
+    assert len(observation["source_frame_sha256"]) == 64
+    assert observation["pose_evidence"]["reprojection_error_px"] == pytest.approx(0.2)
+    assert received["single_best_face"]
+    assert received["minimum_tag_short_side_px"] == pytest.approx(26.0)
+
+
+def test_executed_mpc_approach_stitches_only_committed_window_segments() -> None:
+    def window(
+        generation: int,
+        valid_from: float,
+        rows: tuple[tuple[float, ...], ...],
+        *,
+        terminal: bool,
+        predecessor: str | None,
+        predicted_rows: tuple[tuple[float, ...], ...] | None = None,
+    ) -> MPCCommandWindow:
+        return MPCCommandWindow(
+            generation=generation,
+            plan_sha256="a" * 64,
+            source_state_monotonic_s=valid_from - 0.1,
+            valid_from_monotonic_s=valid_from,
+            sample_time_s=(0.0, 0.1, 0.2),
+            command_q_rad=rows,
+            predicted_q_rad=rows if predicted_rows is None else predicted_rows,
+            predicted_dq_rad_s=((0.0,) * 7,) * 3,
+            predicted_ddq_rad_s2=((0.0,) * 7,) * 3,
+            predecessor_sha256=predecessor,
+            feasible=True,
+            terminal=terminal,
+            solve_time_s=0.02,
+            diagnostics={"moving_target": {}},
+        )
+
+    q0 = (0.0,) * 7
+    q1 = (0.01,) * 7
+    q2 = (0.02,) * 7
+    q3 = (0.03,) * 7
+    first = window(0, 10.0, (q0, q1, q2), terminal=False, predecessor=None)
+    second = window(
+        1,
+        10.2,
+        (q2, q3, (0.04,) * 7),
+        terminal=True,
+        predecessor=first.content_sha256,
+        predicted_rows=(q2, (0.025,) * 7, (0.035,) * 7),
+    )
+
+    approach = _executed_mpc_approach(
+        [first.to_dict(), second.to_dict()],
+        arm="left",
+        joint_position_offsets_rad={"left_shoulder_pitch_joint": 0.1},
+    )
+
+    assert approach.sample_time_s == pytest.approx((0.0, 0.1, 0.2, 0.3, 0.4))
+    assert approach.command_q_rad == (q0, q1, q2, q3, (0.04,) * 7)
+    assert approach.model_q_rad[0][0] == pytest.approx(0.1)
+    assert approach.model_q_rad[-1][0] == pytest.approx(0.135)
+    assert approach.planning_time_s == pytest.approx(0.04)
 
 
 def test_supported_escape_accepts_only_strict_collision_free_samples() -> None:
@@ -105,8 +208,12 @@ def test_cube_contact_links_are_disabled_only_during_final_grasp_approach(
 
     assert calls[0]["disabled_cube_links"] == set()
     assert calls[1]["disabled_cube_links"] == {
+        "left_hand_thumb_0_link",
+        "left_hand_thumb_1_link",
         "left_hand_thumb_2_link",
+        "left_hand_middle_0_link",
         "left_hand_middle_1_link",
+        "left_hand_index_0_link",
         "left_hand_index_1_link",
     }
     assert result == (0.020, "grasp_link", 4)
