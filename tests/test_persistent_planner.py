@@ -76,3 +76,42 @@ def test_persistent_planner_reuses_one_process_and_reports_rejection(
     log_lines = (tmp_path / "planner.log").read_text(encoding="utf-8").splitlines()
     assert all(line.startswith(EVENT_PREFIX) for line in log_lines)
     assert sum(json.loads(line[len(EVENT_PREFIX) :])["type"] == "ready" for line in log_lines) == 1
+
+
+def test_persistent_planner_can_launch_before_waiting_for_cuda_ready(tmp_path: Path) -> None:
+    worker = tmp_path / "worker"
+    _fake_worker(worker)
+    planner = PersistentTabletopPlanner(
+        executable=worker,
+        log_path=tmp_path / "planner.log",
+    )
+
+    planner.launch()
+    assert planner.is_alive
+    with pytest.raises(RuntimeError, match="not ready"):
+        planner.request_payload("step", payload={"generation": 1})
+
+    planner.wait_until_ready()
+    assert planner.request_payload("step", payload={"generation": 2})["payload"] == {
+        "generation": 2
+    }
+    planner.close()
+
+
+def test_persistent_planner_request_can_run_before_parent_waits(tmp_path: Path) -> None:
+    worker = tmp_path / "worker"
+    _fake_worker(worker)
+    planner = PersistentTabletopPlanner(
+        executable=worker,
+        log_path=tmp_path / "planner.log",
+    )
+    planner.launch()
+
+    pending = planner.begin_payload_request("step", payload={"generation": 3})
+    with pytest.raises(RuntimeError, match="still pending"):
+        planner.request_payload("step", payload={"generation": 4})
+    event = planner.finish_request(pending)
+
+    assert event["payload"] == {"generation": 3}
+    assert planner._ready
+    planner.close()

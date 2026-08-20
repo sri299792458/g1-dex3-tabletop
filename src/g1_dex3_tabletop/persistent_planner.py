@@ -7,6 +7,7 @@ import queue
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from typing_extensions import Self
@@ -16,6 +17,14 @@ EVENT_PREFIX = "G1_PLANNER_EVENT "
 
 class PlannerRequestRejected(RuntimeError):
     """A planner request failed while the robot controller remained healthy."""
+
+
+@dataclass(frozen=True, slots=True)
+class PendingPlannerRequest:
+    """One request already executing inside the isolated worker."""
+
+    request_id: int
+    command: str
 
 
 class PersistentTabletopPlanner:
@@ -29,12 +38,21 @@ class PersistentTabletopPlanner:
         self._lines: queue.Queue[str] = queue.Queue()
         self._reader: threading.Thread | None = None
         self._next_request_id = 1
+        self._ready = False
+        self._pending: PendingPlannerRequest | None = None
 
     @property
     def is_alive(self) -> bool:
         return self._process is not None and self._process.poll() is None
 
-    def start(self, *, timeout_s: float = 60.0) -> None:
+    def launch(self) -> None:
+        """Launch the worker without waiting for CUDA initialization.
+
+        The planner owns no robot transport.  Keeping process launch separate
+        from readiness lets CUDA initialization overlap ROS, camera, and
+        operator preflight instead of serializing those independent tasks.
+        """
+
         if self._process is not None:
             raise RuntimeError("persistent planner was already started")
         if not self.executable.is_file():
@@ -57,6 +75,15 @@ class PersistentTabletopPlanner:
             daemon=True,
         )
         self._reader.start()
+
+    def wait_until_ready(self, *, timeout_s: float = 60.0) -> None:
+        """Wait for the already-launched worker's CUDA readiness event."""
+
+        if self._ready:
+            self._require_alive()
+            return
+        if self._process is None:
+            raise RuntimeError("persistent planner has not been launched")
         event = self._wait_for_event(
             expected_type="ready",
             request_id=None,
@@ -65,6 +92,13 @@ class PersistentTabletopPlanner:
         )
         if not event.get("cuda_available", False):
             raise RuntimeError("persistent planner started without a CUDA device")
+        self._ready = True
+
+    def start(self, *, timeout_s: float = 60.0) -> None:
+        """Launch and synchronously wait; retained for non-overlapped callers."""
+
+        self.launch()
+        self.wait_until_ready(timeout_s=timeout_s)
 
     def request(
         self,
@@ -108,6 +142,68 @@ class PersistentTabletopPlanner:
             timeout_s=timeout_s,
         )
 
+    def begin_payload_request(
+        self,
+        command: str,
+        *,
+        payload: dict,
+    ) -> PendingPlannerRequest:
+        """Queue one worker request while the parent continues read-only work.
+
+        A launched worker may still be initializing CUDA. Its stdin is already
+        available, so the request can wait there and start immediately after
+        the worker emits readiness instead of delaying the parent preview.
+        """
+
+        if not isinstance(payload, dict):
+            raise TypeError("persistent planner payload must be a dictionary")
+        if self._pending is not None:
+            raise RuntimeError(
+                f"persistent planner already has pending request {self._pending.command}"
+            )
+        process = self._require_alive()
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        pending = PendingPlannerRequest(request_id=request_id, command=command)
+        message = {
+            "id": request_id,
+            "command": command,
+            "payload": payload,
+        }
+        assert process.stdin is not None
+        process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+        self._pending = pending
+        return pending
+
+    def finish_request(
+        self,
+        pending: PendingPlannerRequest,
+        *,
+        control_check=None,
+        timeout_s: float = 180.0,
+    ) -> dict:
+        """Collect the result of the sole outstanding asynchronous request."""
+
+        if pending != self._pending:
+            raise RuntimeError("planner request is not the active pending request")
+        try:
+            event = self._wait_for_event(
+                expected_type="result",
+                request_id=pending.request_id,
+                timeout_s=timeout_s,
+                control_check=control_check,
+            )
+        finally:
+            self._pending = None
+        if not event.get("ok", False):
+            raise PlannerRequestRejected(
+                f"CuRobo {pending.command} rejected the request: "
+                f"{event.get('error_type', 'RuntimeError')}: "
+                f"{event.get('error', 'no diagnostic')}; full planner log: {self.log_path}"
+            )
+        return event
+
     def _request_message(
         self,
         message: dict,
@@ -116,6 +212,12 @@ class PersistentTabletopPlanner:
         control_check,
         timeout_s: float,
     ) -> dict:
+        if self._pending is not None:
+            raise RuntimeError(
+                f"persistent planner request {self._pending.command} is still pending"
+            )
+        if not self._ready:
+            raise RuntimeError("persistent planner is not ready")
         process = self._require_alive()
         request_id = self._next_request_id
         self._next_request_id += 1
@@ -165,6 +267,8 @@ class PersistentTabletopPlanner:
         self._process = None
         self._log = None
         self._reader = None
+        self._ready = False
+        self._pending = None
 
     def _read_output(self) -> None:
         process = self._process
@@ -214,6 +318,12 @@ class PersistentTabletopPlanner:
                 if event.get("type") == "progress":
                     print(str(event.get("message", "")), flush=True)
                     continue
+                if event.get("type") == "ready":
+                    if not event.get("cuda_available", False):
+                        raise RuntimeError(
+                            "persistent planner started without a CUDA device"
+                        )
+                    self._ready = True
                 if event.get("type") == expected_type and (
                     request_id is None or event.get("id") == request_id
                 ):

@@ -116,12 +116,21 @@ windows with no rejected window or collision. Simulated approach duration was
 and 0.05 rad contracts. It then preserved the same grasp, rebuilt the payload
 continuation in 2.01 s, and produced the exact accepted-approach reverse.
 
-The heavy strict checker, fixed-close validator, and attached optimizer were
-all reused without a topology rebuild. Their 13.68 s construction cost was paid
-at the stationary clearance boundary before the clearance-to-pregrasp motion.
-The MPC model itself took 2.50 s to prepare and is now also prepared at that
-boundary. A fresh cube frame is deliberately collected only after preparation,
-so cold CUDA setup cannot make the first target stale.
+The worker now launches when the hardware command starts. As soon as read-only
+preflight has supplied the selected arm and object topology, it constructs the
+persistent MotionGen models and a provisional moving-grasp MPC while the live
+preview and SPACE prompt remain active. No robot publisher exists during that
+work. A retained 60 mm replay measured 17.84 s for this command-free startup.
+After the live clearance plan was known, rebinding that same MPC to the exact
+route and current scene took 1.50 s instead of constructing another roughly
+6--11 s MPC instance. The exact live supported escape and global pregrasp route
+still require planning after ownership; their retained replay times were 3.55 s
+and 10.63 s respectively. Those are state-dependent searches, not startup
+construction, and have not been hidden or replaced with stale preflight plans.
+
+The production worker exposes only this moving-grasp MPC. The obsolete
+multi-phase route-tracking benchmark was removed: payload, replacement,
+retreat, and supported return remain frozen MotionGen trajectories.
 
 This is an offline retained-run result, not a physical moving-cube
 commissioning result. The remaining approximately 2 s after closing is genuine

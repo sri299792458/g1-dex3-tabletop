@@ -215,7 +215,7 @@ def test_mpc_observes_first_moving_target_after_cold_setup() -> None:
             reference_T_camera0=np.eye(4),
         )
 
-    assert events == ["prepare-mpc-phase", "moving-target"]
+    assert events == ["prepare-moving-grasp-mpc", "moving-target"]
 
 
 def test_mpc_uses_clearance_preparation_without_rebuilding() -> None:

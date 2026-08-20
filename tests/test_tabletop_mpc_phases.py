@@ -4,19 +4,14 @@ import numpy as np
 import pytest
 
 from g1_aprilcube_calibration.transforms import invert_transform
-from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
 from g1_dex3_tabletop.planning.curobo_backend import _clearance_from_activation_cost
 from g1_dex3_tabletop.planning.tabletop_mpc import (
-    MPC_ATTACHED_PHASES,
-    MPC_PHASE_ORDER,
-    MPCBenchmarkConfig,
-    TabletopPhaseMPC,
+    MovingGraspMPC,
     _bounded_route_goal,
     _fixture_excluded_links,
     _nominal_base_T_live_base,
     _payload_link_spheres,
     _reserved_velocity_constraint_is_safe,
-    _simulate_phase,
     _world_collision_buffer_deltas,
     mpc_phase_spec,
 )
@@ -36,147 +31,6 @@ class _ArrayValue:
 
     def numpy(self):
         return self._value
-
-
-def test_lifecycle_benchmark_preserves_configured_tracking_offset() -> None:
-    offset = np.asarray([0.005, -0.002, 0.001, -0.008, 0.004, 0.0, 0.001])
-    terminal = np.full(7, 0.01)
-
-    class Controller:
-        names = tuple(f"joint_{index}" for index in range(7))
-        request = SimpleNamespace(joint_position_offsets_rad={})
-        spec = SimpleNamespace(
-            phase="move_to_pregrasp",
-            mode="open_free",
-            reference_fixed_goal=False,
-        )
-        path_model_q = np.stack((np.zeros(7), terminal))
-
-        def next_nominal_window(
-            self,
-            *,
-            handoff_predicted_q_rad,
-            handoff_predicted_dq_rad_s,
-            handoff_predicted_ddq_rad_s2,
-            handoff_command_q_rad,
-            source_state_monotonic_s,
-            valid_from_monotonic_s,
-            predecessor_sha256,
-            committed_route_progress_index,
-            reference_T_camera,
-        ):
-            del (
-                handoff_predicted_dq_rad_s,
-                handoff_predicted_ddq_rad_s2,
-                reference_T_camera,
-            )
-            np.testing.assert_allclose(
-                np.asarray(handoff_command_q_rad) - np.asarray(handoff_predicted_q_rad),
-                offset,
-            )
-            return MPCCommandWindow(
-                generation=0,
-                plan_sha256="a" * 64,
-                source_state_monotonic_s=source_state_monotonic_s,
-                valid_from_monotonic_s=valid_from_monotonic_s,
-                sample_time_s=(0.0, 0.2),
-                command_q_rad=(
-                    tuple(handoff_command_q_rad),
-                    tuple(terminal + offset),
-                ),
-                predicted_q_rad=(tuple(handoff_predicted_q_rad), tuple(terminal)),
-                predicted_dq_rad_s=(tuple(np.full(7, 0.05)), (0.0,) * 7),
-                predicted_ddq_rad_s2=((0.0,) * 7,) * 2,
-                predecessor_sha256=predecessor_sha256,
-                feasible=True,
-                terminal=True,
-                solve_time_s=0.01,
-                diagnostics={"proposed_route_progress_index": committed_route_progress_index + 1},
-            )
-
-    phase, measured, velocity = _simulate_phase(
-        Controller(),
-        command_q_rad=np.zeros(7),
-        model_dq_rad_s=np.zeros(7),
-        config=MPCBenchmarkConfig(
-            maximum_steps=2,
-            simulated_tracking_offset_rad=tuple(offset),
-        ),
-    )
-
-    assert phase["reached_terminal"]
-    assert phase["accepted_windows"] == 1
-    np.testing.assert_allclose(measured, terminal)
-    np.testing.assert_allclose(velocity, np.zeros(7), atol=1.0e-12)
-
-
-def test_lifecycle_benchmark_retries_without_committing_a_rejected_window() -> None:
-    terminal = np.full(7, 0.03)
-
-    class Controller:
-        names = tuple(f"joint_{index}" for index in range(7))
-        request = SimpleNamespace(joint_position_offsets_rad={})
-        spec = SimpleNamespace(
-            phase="move_to_pregrasp",
-            mode="open_free",
-            reference_fixed_goal=False,
-        )
-        path_model_q = np.stack((np.zeros(7), terminal))
-
-        def __init__(self) -> None:
-            self.calls = 0
-            self.committed_progress: list[int] = []
-
-        def next_nominal_window(
-            self,
-            *,
-            handoff_predicted_q_rad,
-            handoff_predicted_dq_rad_s,
-            handoff_predicted_ddq_rad_s2,
-            handoff_command_q_rad,
-            source_state_monotonic_s,
-            valid_from_monotonic_s,
-            predecessor_sha256,
-            committed_route_progress_index,
-            reference_T_camera,
-        ):
-            del handoff_predicted_ddq_rad_s2, reference_T_camera
-            generation = self.calls
-            self.calls += 1
-            self.committed_progress.append(committed_route_progress_index)
-            feasible = generation != 1
-            is_terminal = generation == 2
-            end = terminal if is_terminal else np.full(7, 0.02 + 0.005 * generation)
-            return MPCCommandWindow(
-                generation=generation,
-                plan_sha256="a" * 64,
-                source_state_monotonic_s=source_state_monotonic_s,
-                valid_from_monotonic_s=valid_from_monotonic_s,
-                sample_time_s=(0.0, 0.8),
-                command_q_rad=(tuple(handoff_command_q_rad), tuple(end)),
-                predicted_q_rad=(tuple(handoff_predicted_q_rad), tuple(end)),
-                predicted_dq_rad_s=(tuple(handoff_predicted_dq_rad_s), (0.0,) * 7),
-                predicted_ddq_rad_s2=((0.0,) * 7,) * 2,
-                predecessor_sha256=predecessor_sha256,
-                feasible=feasible,
-                terminal=is_terminal,
-                solve_time_s=0.01,
-                diagnostics={"proposed_route_progress_index": committed_route_progress_index + 1},
-            )
-
-    controller = Controller()
-    phase, measured, _velocity = _simulate_phase(
-        controller,
-        command_q_rad=np.zeros(7),
-        model_dq_rad_s=np.zeros(7),
-        config=MPCBenchmarkConfig(maximum_steps=4),
-    )
-
-    assert phase["reached_terminal"]
-    assert phase["accepted_windows"] == 2
-    assert phase["rejected_windows"] == 1
-    assert controller.committed_progress == [0, 1, 1]
-    np.testing.assert_allclose(measured, terminal)
 
 
 def test_curobo_activation_cost_is_inverted_to_signed_clearance() -> None:
@@ -257,7 +111,7 @@ def test_strict_mpc_check_rejects_translated_command_outside_hard_limits() -> No
             get_joint_limits=lambda: SimpleNamespace(position=limits),
         )
     )
-    controller = object.__new__(TabletopPhaseMPC)
+    controller = object.__new__(MovingGraspMPC)
     controller._strict_checker = checker
     controller._active_world_correction = {}
     controller.names = tuple(f"joint_{index}" for index in range(7))
@@ -275,25 +129,12 @@ def test_strict_mpc_check_rejects_translated_command_outside_hard_limits() -> No
 
 
 def test_every_normal_tabletop_motion_has_one_physical_mpc_state() -> None:
-    specs = {phase: mpc_phase_spec(phase) for phase in MPC_PHASE_ORDER}
+    spec = mpc_phase_spec("grasp_approach")
 
-    assert "clearance" not in specs
-    assert "__handoff__" not in specs
-    assert specs["move_to_pregrasp"].mode == "open_free"
-    assert specs["return_to_clearance"].mode == "open_free"
-    assert specs["grasp_approach"].mode == "open_contact"
-    assert specs["grasp_retreat"].mode == "open_contact"
-    assert {phase for phase, spec in specs.items() if spec.attached_payload} == MPC_ATTACHED_PHASES
-    assert all(
-        spec.finger_state == "measured_contact" for spec in specs.values() if spec.attached_payload
-    )
-    assert all(not spec.include_fixture_in_optimizer for spec in specs.values())
-    assert not specs["return_to_clearance"].reference_fixed_goal
-    assert all(
-        spec.reference_fixed_goal
-        for phase, spec in specs.items()
-        if phase != "return_to_clearance"
-    )
+    assert spec.mode == "open_contact"
+    assert not spec.attached_payload
+    assert not spec.include_fixture_in_optimizer
+    assert spec.reference_fixed_goal
 
 
 def test_live_body_frame_maps_into_the_frozen_strict_scene() -> None:
@@ -328,46 +169,12 @@ def test_live_body_frame_maps_into_the_frozen_strict_scene() -> None:
     )
 
 
-def test_planning_session_forwards_hash_bound_camera_state_correction() -> None:
-    received = {}
-    result = object()
-
-    class FakeMPC:
-        spec = SimpleNamespace(phase="move_to_pregrasp")
-
-        def next_nominal_window(self, **kwargs):
-            received.update(kwargs)
-            return result
-
-    correction = {
-        "reference_T_camera": np.eye(4).tolist(),
-        "timestamp_ns": 12,
-        "anchor_timestamp_ns": 10,
-        "source_monotonic_s": 1.0,
-    }
+def test_planning_session_rejects_a_window_without_a_live_target() -> None:
     session = TabletopPlanningSession()
-    session._active_phase_mpc = FakeMPC()
+    session._active_phase_mpc = object()
 
-    actual = session.step_mpc_phase(
-        {
-            "phase": "move_to_pregrasp",
-            "handoff_predicted_q_rad": [0.0] * 7,
-            "handoff_predicted_dq_rad_s": [0.0] * 7,
-            "handoff_predicted_ddq_rad_s2": [0.0] * 7,
-            "handoff_command_q_rad": [0.0] * 7,
-            "source_state_monotonic_s": 1.0,
-            "valid_from_monotonic_s": 1.2,
-            "predecessor_sha256": None,
-            "committed_route_progress_index": 4,
-            "camera_state_correction": correction,
-        }
-    )
-
-    assert actual is result
-    np.testing.assert_allclose(received["reference_T_camera"], np.eye(4))
-    assert received["camera_state_provenance"] == correction
-    assert received["valid_from_monotonic_s"] == pytest.approx(1.2)
-    assert received["committed_route_progress_index"] == 4
+    with pytest.raises(TypeError, match="requires one live target"):
+        session.step_moving_grasp_mpc({})
 
 
 def test_planning_session_forwards_live_cartesian_target_and_route_progress() -> None:
@@ -390,7 +197,7 @@ def test_planning_session_forwards_live_cartesian_target_and_route_progress() ->
     session = TabletopPlanningSession()
     session._active_phase_mpc = FakeMPC()
 
-    actual = session.step_mpc_phase(
+    actual = session.step_moving_grasp_mpc(
         {
             "phase": "grasp_approach",
             "handoff_predicted_q_rad": [0.0] * 7,
@@ -414,171 +221,85 @@ def test_planning_session_forwards_live_cartesian_target_and_route_progress() ->
 
 def test_supported_routes_remain_frozen_instead_of_entering_mpc() -> None:
     for phase in ("clearance", "__handoff__"):
-        with pytest.raises(ValueError, match="unsupported tabletop MPC phase"):
+        with pytest.raises(ValueError, match="unsupported moving-grasp MPC phase"):
             mpc_phase_spec(phase)
 
 
 def test_fixture_exclusions_match_contact_and_attached_payload_policies() -> None:
     contact = _fixture_excluded_links(mpc_phase_spec("grasp_approach"), arm="left")
-    attached = _fixture_excluded_links(mpc_phase_spec("retention_test_lift"), arm="left")
 
     assert contact == (
         "left_hand_thumb_2_link",
         "left_hand_middle_1_link",
         "left_hand_index_1_link",
     )
-    assert attached == ("left_attached_object",)
 
 
 def test_contact_routes_keep_cube_for_noncontact_links_without_attaching_it() -> None:
-    for phase in ("grasp_approach", "grasp_retreat"):
-        spec = mpc_phase_spec(phase)
-        assert spec.allow_fingertip_cube_contact
-        assert spec.include_cube_in_optimizer
-        assert not spec.attached_payload
-        assert spec.include_table_patch
+    spec = mpc_phase_spec("grasp_approach")
+    assert spec.allow_fingertip_cube_contact
+    assert spec.include_cube_in_optimizer
+    assert not spec.attached_payload
+    assert spec.include_table_patch
 
 
 def test_unknown_mpc_phase_is_rejected() -> None:
-    with pytest.raises(ValueError, match="unsupported tabletop MPC phase"):
+    with pytest.raises(ValueError, match="unsupported moving-grasp MPC phase"):
         mpc_phase_spec("invented_transition")
 
 
-def test_planning_session_reuses_one_warmed_solver_across_every_mode(monkeypatch) -> None:
-    built = []
+def test_planning_session_binds_the_warmed_moving_grasp_solver() -> None:
+    class WarmedMPC:
+        def __init__(self) -> None:
+            self.spec = mpc_phase_spec("grasp_approach")
+            self.binding = None
 
-    class FakePhaseMPC:
-        def __init__(
+        def bind_moving_grasp_execution(
             self,
             clearance_request,
             execution,
             *,
-            phase,
             loaded_request,
-            measured_active_dex3_q_rad,
-        ) -> None:
-            del clearance_request, execution, loaded_request
-            self.spec = mpc_phase_spec(phase)
-            self.measured = (
-                None
-                if measured_active_dex3_q_rad is None
-                else np.asarray(measured_active_dex3_q_rad).copy()
+            reference_T_camera0,
+        ) -> dict:
+            self.binding = (
+                clearance_request,
+                execution,
+                loaded_request,
+                np.asarray(reference_T_camera0),
             )
-            self.closed = False
-            built.append(self)
-
-        def setup_at_frozen_route_start(self) -> float:
-            return 1.0
-
-        def can_select_phase(self, phase, *, measured_active_dex3_q_rad) -> bool:
-            return not mpc_phase_spec(phase).attached_payload or (
-                measured_active_dex3_q_rad is not None
-            )
-
-        def select_phase(self, phase, *, measured_active_dex3_q_rad) -> dict:
-            self.spec = mpc_phase_spec(phase)
-            self.measured = measured_active_dex3_q_rad
             return {
-                "kinematics_cache_hit": True,
-                "kinematics_resolve_time_s": 0.0,
-                "optimizer_prewarm_time_s": 0.0,
-                "reconfiguration_time_s": 0.01,
+                "rebind_time_s": 0.2,
+                "setup_time_s": 0.3,
+                "total_time_s": 0.5,
             }
 
-        def close(self) -> None:
-            self.closed = True
-
-    monkeypatch.setattr(
-        "g1_dex3_tabletop.planning.tabletop_session.TabletopPhaseMPC",
-        FakePhaseMPC,
-    )
     session = TabletopPlanningSession()
-    session._loaded_request = object()
-    session._clearance_request = object()
-    session._execution = SimpleNamespace(content_sha256="plan")
-
-    phases = MPC_PHASE_ORDER
-    contact = np.zeros(7)
-    for index, phase in enumerate(phases):
-        result = session.prepare_mpc_phase(
-            phase,
-            measured_active_dex3_q_rad=(
-                contact if mpc_phase_spec(phase).attached_payload else None
-            ),
-        )
-        assert result["reused_warm_model"] == (index > 0)
-        if index == 0:
-            assert result["preparation_time_s"] == pytest.approx(
-                result["build_time_s"] + result["setup_time_s"]
-            )
-        else:
-            assert result["build_time_s"] == 0.0
-            assert result["setup_time_s"] == 0.0
-            assert result["preparation_time_s"] == pytest.approx(0.01)
-
-    assert len(built) == 1
-    assert session._phase_mpc is built[0]
-    assert not built[0].closed
-
-    session.close()
-    assert all(controller.closed for controller in built)
-
-
-def test_planning_session_updates_measured_contact_without_rebuilding_solver(monkeypatch) -> None:
-    built = []
-
-    class FakeAttachedMPC:
-        def __init__(self, *args, phase, measured_active_dex3_q_rad, **kwargs) -> None:
-            del args, kwargs
-            self.spec = mpc_phase_spec(phase)
-            self.measured = np.asarray(measured_active_dex3_q_rad).copy()
-            self.closed = False
-            built.append(self)
-
-        def setup_at_frozen_route_start(self) -> float:
-            return 1.0
-
-        def can_select_phase(self, phase, *, measured_active_dex3_q_rad) -> bool:
-            return measured_active_dex3_q_rad is not None
-
-        def select_phase(self, phase, *, measured_active_dex3_q_rad) -> dict:
-            self.spec = mpc_phase_spec(phase)
-            cache_hit = np.array_equal(measured_active_dex3_q_rad, self.measured)
-            self.measured = np.asarray(measured_active_dex3_q_rad).copy()
-            return {
-                "kinematics_cache_hit": cache_hit,
-                "kinematics_resolve_time_s": 0.0 if cache_hit else 1.0,
-                "optimizer_prewarm_time_s": 0.0,
-                "reconfiguration_time_s": 0.01 if cache_hit else 1.01,
-            }
-
-        def close(self) -> None:
-            self.closed = True
-
-    monkeypatch.setattr(
-        "g1_dex3_tabletop.planning.tabletop_session.TabletopPhaseMPC",
-        FakeAttachedMPC,
+    loaded = object()
+    clearance = object()
+    execution = SimpleNamespace(
+        content_sha256="plan",
+        task=SimpleNamespace(content_sha256="task"),
     )
-    session = TabletopPlanningSession()
-    session._loaded_request = object()
-    session._clearance_request = object()
-    session._execution = SimpleNamespace(content_sha256="plan")
+    controller = WarmedMPC()
+    session._loaded_request = loaded
+    session._clearance_request = clearance
+    session._execution = execution
+    session._phase_mpc = controller
+    reference = np.eye(4)
 
-    first = np.zeros(7)
-    second = np.ones(7)
-    session.prepare_mpc_phase("retention_test_lift", measured_active_dex3_q_rad=first)
-    reused = session.prepare_mpc_phase("payload_lift", measured_active_dex3_q_rad=first)
-    replaced = session.prepare_mpc_phase("payload_lower", measured_active_dex3_q_rad=second)
+    result = session.prepare_moving_grasp_mpc(
+        reference_T_camera0=reference,
+    )
 
-    assert reused["reused_warm_model"]
-    assert reused["kinematics_cache_hit"]
-    assert replaced["reused_warm_model"]
-    assert not replaced["kinematics_cache_hit"]
-    assert len(built) == 1
-    assert not built[0].closed
+    assert result["reused_warm_model"]
+    assert result["preparation_time_s"] == pytest.approx(0.5)
+    assert controller.binding[:3] == (clearance, execution, loaded)
+    assert np.array_equal(controller.binding[3], reference)
+    assert session._active_phase_mpc is controller
 
 
-def test_clearance_replan_atomically_replaces_task_and_resets_old_mpc(monkeypatch) -> None:
+def test_clearance_replan_retains_warmed_mpc_for_live_binding(monkeypatch) -> None:
     events = []
     request = SimpleNamespace(content_sha256="fresh", observation=object())
     task = object()
@@ -626,9 +347,9 @@ def test_clearance_replan_atomically_replaces_task_and_resets_old_mpc(monkeypatc
     assert session._clearance_request is request
     assert session._execution is replacement
     assert isinstance(session._retention_validator, Validator)
-    assert session._phase_mpc is None
+    assert session._phase_mpc is not None
     assert session._active_phase_mpc is None
-    assert "closed" in events
+    assert "closed" not in events
 
 
 def test_clearance_pregrasp_stage_does_not_create_a_complete_task(monkeypatch) -> None:
@@ -699,16 +420,12 @@ def test_escape_only_session_retains_exact_reverse_for_later_boundary_replan(
     assert session._retention_validator is None
 
 
-def test_pre_motion_warmup_populates_pool_without_installing_nominal_task(
+def test_runtime_warmup_populates_pool_without_installing_nominal_task(
     monkeypatch,
 ) -> None:
-    request = SimpleNamespace(content_sha256="predicted")
+    request = object()
     result = {"planning_performed": False}
     events = []
-    monkeypatch.setattr(
-        "g1_dex3_tabletop.planning.tabletop_session.request_at_clearance",
-        lambda loaded, escape: request,
-    )
 
     def prewarm(received, *, planner_pool):
         assert received is request
@@ -716,24 +433,48 @@ def test_pre_motion_warmup_populates_pool_without_installing_nominal_task(
         return result
 
     monkeypatch.setattr(
-        "g1_dex3_tabletop.planning.tabletop_session.prewarm_tabletop_task_models",
+        "g1_dex3_tabletop.planning.tabletop_session.prewarm_tabletop_runtime_models",
         prewarm,
     )
-    session = TabletopPlanningSession()
-    session._loaded_request = object()
-    session._supported_escape = object()
 
-    assert session.prewarm_task_at_clearance(request, progress=events.append) is result
+    class WarmedMPC:
+        def __init__(self, received, execution, *, phase) -> None:
+            assert received is request
+            assert execution is None
+            assert phase == "grasp_approach"
+            self.closed = False
+
+        def setup_at_frozen_route_start(self, *, validate_strict_start) -> float:
+            assert not validate_strict_start
+            return 0.4
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.MovingGraspMPC",
+        WarmedMPC,
+    )
+    session = TabletopPlanningSession()
+
+    warmed = session.prewarm_runtime(
+        request,
+        moving_grasp_mpc=True,
+        progress=events.append,
+    )
+    assert warmed["planning_performed"] is False
+    assert warmed["moving_grasp_mpc"]["retained_for_live_binding"] is True
+    assert session._phase_mpc is not None
     assert session._active_task is None
     assert session._execution is None
     assert events == [
         (
-            "constructing open-hand, fixed-close, and attached-payload CUDA models before "
-            "the first changing arm target; no task solve is being used as a gate"
+            "constructing persistent open-hand and attached-payload MotionGen models; "
+            "no task solve or robot command is being used as a gate"
         ),
         (
-            "pre-motion model warmup complete; fresh boundary observations remain the only "
-            "source of executable task feasibility"
+            "command-free runtime warmup complete; fresh loaded and clearance "
+            "observations remain the only source of executable task feasibility"
         ),
     ]
 

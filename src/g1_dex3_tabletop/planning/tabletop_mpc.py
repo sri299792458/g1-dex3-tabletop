@@ -16,30 +16,29 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from g1_aprilcube_calibration.joint_map import arm_joint_names
+from g1_aprilcube_calibration.joint_map import arm_indices, arm_joint_names
 from g1_aprilcube_calibration.transforms import invert_transform, validate_transform
 from g1_aprilcube_calibration.transports.unitree_dex3 import DEX3_MOTOR_JOINT_SUFFIXES
 from g1_dex3_tabletop.mpc_command_buffer import (
     MPCCommandWindow,
     command_sequence_from_measured_plan,
 )
+from g1_dex3_tabletop.planning.contracts import PlannedTrajectory
 from g1_dex3_tabletop.planning.curobo_backend import (
     COLLISION_ACTIVATION_DISTANCE_M,
     OPEN_TRANSIT_OBJECT_CLEARANCE_M,
 )
+from g1_dex3_tabletop.planning.dex3_handedness import dex3_execution_profile
 from g1_dex3_tabletop.planning.g1_model import (
-    CUROBO_COMMIT,
     attachment_link,
     build_tabletop_robot_config,
     command_from_model_q,
     grasp_frame,
-    model_source_hashes,
 )
 from g1_dex3_tabletop.planning.tabletop_planner import (
     WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M,
@@ -79,20 +78,6 @@ MPC_COLD_START_ITERATIONS = 200
 # The pinned CuRobo optimizer advances in 25-iteration inner blocks. Retained
 # replay keeps the 100-iteration warm solve within the 100 ms worker allowance.
 MPC_WARM_START_ITERATIONS = 100
-MPC_PHASE_ORDER = (
-    "move_to_pregrasp",
-    "grasp_approach",
-    "retention_test_lift",
-    "payload_lift",
-    "payload_lower",
-    "payload_replace",
-    "grasp_retreat",
-    "return_to_clearance",
-)
-MPC_ATTACHED_PHASES = frozenset(
-    ("retention_test_lift", "payload_lift", "payload_lower", "payload_replace")
-)
-
 
 @dataclass(frozen=True, slots=True)
 class MPCPhaseSpec:
@@ -111,72 +96,23 @@ class MPCPhaseSpec:
 
 
 def mpc_phase_spec(phase: str) -> MPCPhaseSpec:
-    """Map a motion endpoint to its already-commissioned physical state."""
+    """Return the sole physical state owned by production MPC."""
 
-    if phase not in MPC_PHASE_ORDER:
-        raise ValueError(f"unsupported tabletop MPC phase: {phase}")
-    if phase == "move_to_pregrasp":
-        return MPCPhaseSpec(
-            phase=phase,
-            mode="open_free",
-            request_state="clearance",
-            finger_state="open",
-            include_cube_in_optimizer=True,
-            include_table_patch=True,
-            # Exact fixture-mesh distance dominates rolling optimization even
-            # though this controller follows an already fixture-validated
-            # route. Keep the mesh in the independent strict window check.
-            include_fixture_in_optimizer=False,
-            allow_fingertip_cube_contact=False,
-            attached_payload=False,
-            reference_fixed_goal=True,
-        )
-    if phase == "return_to_clearance":
-        return MPCPhaseSpec(
-            phase=phase,
-            mode="open_free",
-            request_state="clearance",
-            finger_state="open",
-            include_cube_in_optimizer=True,
-            include_table_patch=True,
-            include_fixture_in_optimizer=False,
-            allow_fingertip_cube_contact=False,
-            attached_payload=False,
-            # Clearance is the exact joint-space junction with the frozen
-            # supported return.  Keep this endpoint body-relative while the
-            # live table/cube/fixture scene remains state-corrected.
-            reference_fixed_goal=False,
-        )
-    if phase in ("grasp_approach", "grasp_retreat"):
-        return MPCPhaseSpec(
-            phase=phase,
-            mode="open_contact",
-            request_state="clearance",
-            finger_state="open",
-            # Contact links are disabled only against world geometry. The
-            # cube therefore remains active for every non-contact link, and
-            # the strict post-check independently enforces the same policy.
-            include_cube_in_optimizer=True,
-            include_table_patch=True,
-            include_fixture_in_optimizer=False,
-            allow_fingertip_cube_contact=True,
-            attached_payload=False,
-            reference_fixed_goal=True,
-        )
+    if phase != "grasp_approach":
+        raise ValueError(f"unsupported moving-grasp MPC phase: {phase}")
     return MPCPhaseSpec(
         phase=phase,
-        mode="attached",
+        mode="open_contact",
         request_state="clearance",
-        finger_state="measured_contact",
-        include_cube_in_optimizer=False,
-        include_table_patch=False,
-        # The attached cube starts and ends in deliberate contact with its
-        # presenter. The frozen payload planner therefore omits the fixture
-        # from optimization and independently checks every robot sphere (but
-        # not the attached-object proxy) against its exact mesh.
+        finger_state="open",
+        # Contact links are disabled only against world geometry. The cube
+        # remains active for every non-contact link, and the independent
+        # strict check enforces the same policy on every returned window.
+        include_cube_in_optimizer=True,
+        include_table_patch=True,
         include_fixture_in_optimizer=False,
-        allow_fingertip_cube_contact=False,
-        attached_payload=True,
+        allow_fingertip_cube_contact=True,
+        attached_payload=False,
         reference_fixed_goal=True,
     )
 
@@ -400,6 +336,26 @@ def _pose_list_from_matrix(value: Any) -> list[float]:
     ]
 
 
+def _scene_topology_key(scene: dict[str, Any]) -> str:
+    """Hash obstacle identity and shape while deliberately ignoring live poses."""
+
+    topology: dict[str, dict[str, Any]] = {}
+    for group in ("cuboid", "mesh"):
+        topology[group] = {}
+        for name, obstacle in scene.get(group, {}).items():
+            topology[group][name] = {
+                key: value for key, value in obstacle.items() if key != "pose"
+            }
+    return hashlib.sha256(
+        json.dumps(
+            topology,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode()
+    ).hexdigest()
+
+
 def _rigid_transform(value: Any) -> np.ndarray:
     """Project accumulated float32 transform arithmetic back onto SE(3)."""
 
@@ -611,42 +567,13 @@ def _world_collision_buffer_deltas(
     }
 
 
-@dataclass(frozen=True, slots=True)
-class MPCBenchmarkConfig:
-    maximum_steps: int = 300
-    waypoint_tolerance_rad: float = 0.005
-    handoff_interval_s: float = MPC_HANDOFF_INTERVAL_S
-    simulated_tracking_offset_rad: tuple[float, ...] | None = None
-
-    def __post_init__(self) -> None:
-        if self.maximum_steps <= 0:
-            raise ValueError("MPC benchmark step count must be positive")
-        if not np.isfinite(self.waypoint_tolerance_rad) or self.waypoint_tolerance_rad <= 0.0:
-            raise ValueError("MPC waypoint tolerance must be positive and finite")
-        if (
-            not np.isfinite(self.handoff_interval_s)
-            or self.handoff_interval_s <= 0.0
-            or not np.isclose(
-                self.handoff_interval_s / MPC_KNOT_DT_S,
-                round(self.handoff_interval_s / MPC_KNOT_DT_S),
-                atol=1.0e-9,
-                rtol=0.0,
-            )
-        ):
-            raise ValueError("MPC handoff interval must be a positive whole knot period")
-        if self.simulated_tracking_offset_rad is not None:
-            offset = np.asarray(self.simulated_tracking_offset_rad, dtype=np.float64)
-            if offset.shape != (7,) or not np.all(np.isfinite(offset)):
-                raise ValueError("simulated MPC tracking offset must contain seven finite values")
-
-
-class TabletopPhaseMPC:
-    """Warm-start MPC bound to one physical mode of a frozen lifecycle."""
+class MovingGraspMPC:
+    """Persistent CuRobo MPC for the visually updated grasp approach."""
 
     def __init__(
         self,
         clearance_request: TabletopTaskRequest,
-        execution: TabletopExecutionPlan,
+        execution: TabletopExecutionPlan | None,
         *,
         phase: str,
         loaded_request: TabletopTaskRequest | None = None,
@@ -660,26 +587,81 @@ class TabletopPhaseMPC:
         )
         from curobo.types import DeviceCfg
 
-        if clearance_request.content_sha256 != execution.clearance_request_sha256:
-            raise ValueError("MPC request differs from the frozen clearance request")
-        if clearance_request.arm != execution.task.arm:
-            raise ValueError("MPC request and execution plan select different arms")
-        if loaded_request is not None:
-            if loaded_request.content_sha256 != execution.loaded_request_sha256:
-                raise ValueError("MPC loaded request differs from the frozen execution plan")
-            if loaded_request.arm != clearance_request.arm:
-                raise ValueError("loaded and clearance MPC requests select different arms")
+        if execution is not None:
+            if clearance_request.content_sha256 != execution.clearance_request_sha256:
+                raise ValueError("MPC request differs from the frozen clearance request")
+            if clearance_request.arm != execution.task.arm:
+                raise ValueError("MPC request and execution plan select different arms")
+            if loaded_request is not None:
+                if loaded_request.content_sha256 != execution.loaded_request_sha256:
+                    raise ValueError("MPC loaded request differs from the frozen execution plan")
+                if loaded_request.arm != clearance_request.arm:
+                    raise ValueError("loaded and clearance MPC requests select different arms")
+            initial_fingers = _validated_finger_q(
+                execution.task.initial_active_dex3_q_rad,
+                label="initial active Dex3 posture",
+            )
+            initial_route = next(
+                trajectory
+                for trajectory in execution.trajectories
+                if trajectory.to_pose_id == phase
+            )
+            object_T_grasp = np.asarray(execution.task.object_T_grasp, dtype=np.float64)
+            plan_sha256 = execution.content_sha256
+            payload_start_plane_clearance_m = float(
+                execution.task.planner_provenance.get(
+                    "payload_start_plane_clearance_m",
+                    clearance_request.minimum_hand_plane_clearance_m,
+                )
+            )
+        else:
+            if phase != "grasp_approach" or loaded_request is not None:
+                raise ValueError(
+                    "provisional MPC construction supports only unloaded grasp_approach"
+                )
+            initial_fingers = _validated_finger_q(
+                dex3_execution_profile(clearance_request.arm)[0],
+                label="provisional empty-open active Dex3 posture",
+            )
+            command_q = np.asarray(clearance_request.planning_snapshot.measured_q29_rad)[
+                np.asarray(arm_indices(clearance_request.arm))
+            ]
+            model_q = np.asarray(
+                [
+                    value + clearance_request.joint_position_offsets_rad.get(name, 0.0)
+                    for name, value in zip(
+                        arm_joint_names(clearance_request.arm),
+                        command_q,
+                        strict=True,
+                    )
+                ],
+                dtype=np.float64,
+            )
+            initial_route = PlannedTrajectory(
+                from_pose_id="move_to_pregrasp",
+                to_pose_id="grasp_approach",
+                sample_time_s=(0.0, MPC_EXECUTOR_DT_S),
+                command_q_rad=(tuple(command_q), tuple(command_q)),
+                model_q_rad=(tuple(model_q), tuple(model_q)),
+                planning_time_s=0.0,
+            )
+            object_T_grasp = np.eye(4, dtype=np.float64)
+            plan_sha256 = clearance_request.content_sha256
+            payload_start_plane_clearance_m = (
+                clearance_request.minimum_hand_plane_clearance_m
+            )
         self.loaded_request = loaded_request
         self.clearance_request = clearance_request
         self.execution = execution
+        self._provisional_route = initial_route if execution is None else None
+        self._initial_active_dex3_q_rad = initial_fingers.copy()
+        self._object_T_grasp = _rigid_transform(object_T_grasp)
+        self._plan_sha256 = plan_sha256
+        self._payload_start_plane_clearance_m = payload_start_plane_clearance_m
         self.arm = clearance_request.arm
         self.names = arm_joint_names(self.arm)
         self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
 
-        initial_fingers = _validated_finger_q(
-            execution.task.initial_active_dex3_q_rad,
-            label="initial active Dex3 posture",
-        )
         strict_robot, _reference = build_tabletop_robot_config(
             arm=self.arm,
             snapshot=clearance_request.planning_snapshot,
@@ -697,7 +679,6 @@ class TabletopPhaseMPC:
             robot=strict_robot,
             device_cfg=self.device_cfg,
         )
-        initial_route = self._route_for_phase(phase)
         torso_state = _joint_state(
             self.device_cfg,
             np.asarray(initial_route.model_q_rad[0], dtype=np.float64),
@@ -744,11 +725,13 @@ class TabletopPhaseMPC:
             include_cube=True,
             include_open_transit_table_patch=True,
         )
+        self._scene_topology_key = _scene_topology_key(scene)
         self._strict_robot = strict_robot
         self._plane_point, base_T_object, self._down = _table_from_resting_object(
             clearance_request,
             base_T_torso,
         )
+        base_T_object = _rigid_transform(base_T_object)
         self._base_T_object0 = _rigid_transform(base_T_object)
         self._fixture_checker = _fixture_collision_checker(
             clearance_request,
@@ -837,23 +820,22 @@ class TabletopPhaseMPC:
             initial_fingers.tobytes(): initial_kinematics,
         }
         open_fingers = _validated_finger_q(
-            execution.task.initial_active_dex3_q_rad,
+            self._initial_active_dex3_q_rad,
             label="measured empty-open active Dex3 posture",
         )
         self._resolved_finger_kinematics[open_fingers.tobytes()] = self._resolve_finger_kinematics(
             open_fingers
         )
         self._world_collision_deltas = {
-            mode: _world_collision_buffer_deltas(
+            "open_contact": _world_collision_buffer_deltas(
                 strict_robot,
                 arm=self.arm,
-                mode=mode,
+                mode="open_contact",
             )
-            for mode in ("supported", "open_free", "open_contact", "attached")
         }
         self._payload_spheres = _payload_link_spheres(
             clearance_request.object_dimensions_m,
-            object_T_grasp=execution.task.object_T_grasp,
+            object_T_grasp=self._object_T_grasp,
         )
         self._payload_sphere_count = 0
         effective = _numpy(self.mpc.kinematics.get_joint_limits().velocity[1])
@@ -900,6 +882,235 @@ class TabletopPhaseMPC:
             measured_active_dex3_q_rad=measured_active_dex3_q_rad,
             reset_optimizer=False,
         )
+
+    def bind_moving_grasp_execution(
+        self,
+        clearance_request: TabletopTaskRequest,
+        execution: TabletopExecutionPlan,
+        *,
+        loaded_request: TabletopTaskRequest | None,
+        reference_T_camera0: np.ndarray,
+    ) -> dict[str, Any]:
+        """Bind fresh route and scene values into an already-warm MPC topology."""
+
+        import torch
+        from curobo.types import Pose
+
+        started = time.perf_counter()
+        if clearance_request.content_sha256 != execution.clearance_request_sha256:
+            raise ValueError("MPC request differs from the frozen clearance request")
+        if clearance_request.arm != self.arm or execution.task.arm != self.arm:
+            raise ValueError("warmed MPC belongs to another arm")
+        if loaded_request is not None:
+            if loaded_request.content_sha256 != execution.loaded_request_sha256:
+                raise ValueError("MPC loaded request differs from the frozen execution plan")
+            if loaded_request.arm != self.arm:
+                raise ValueError("loaded MPC request belongs to another arm")
+        route = next(
+            (
+                trajectory
+                for trajectory in execution.trajectories
+                if trajectory.to_pose_id == "grasp_approach"
+            ),
+            None,
+        )
+        if route is None:
+            raise ValueError("frozen execution has no grasp_approach route")
+        initial_fingers = _validated_finger_q(
+            execution.task.initial_active_dex3_q_rad,
+            label="measured empty-open active Dex3 posture",
+        )
+        strict_robot, _reference = build_tabletop_robot_config(
+            arm=self.arm,
+            snapshot=clearance_request.planning_snapshot,
+            joint_position_offsets_rad=clearance_request.joint_position_offsets_rad,
+            active_finger_q_rad=tuple(float(value) for value in initial_fingers),
+        )
+        robot = copy.deepcopy(strict_robot)
+        _use_moving_grasp_frame_only(robot, arm=self.arm)
+        resolved_robot = _resolved_robot_with_velocity_limit(
+            robot,
+            device_cfg=self.device_cfg,
+            maximum_velocity_rad_s=(
+                clearance_request.maximum_arm_velocity_rad_s
+                * MPC_OPTIMIZER_VELOCITY_SCALE
+            ),
+        )
+        kinematics = _ResolvedPhaseKinematics(
+            params=resolved_robot.kinematics.kinematics_config.clone(),
+            self_collision_padding=(
+                resolved_robot.kinematics.self_collision_config.sphere_padding.clone()
+            ),
+            self_collision_pairs=(
+                resolved_robot.kinematics.self_collision_config.collision_pairs.clone()
+            ),
+        )
+        self._assert_compatible_kinematics(kinematics)
+        for config in self._solver_kinematics_cfgs:
+            config.kinematics_config.copy_(kinematics.params)
+            config.self_collision_config.sphere_padding.copy_(
+                kinematics.self_collision_padding
+            )
+        self._apply_strict_checker_kinematics(kinematics)
+
+        route_start = np.asarray(route.model_q_rad[0], dtype=np.float64)
+        torso_state = _joint_state(
+            self.device_cfg,
+            route_start,
+            np.zeros(7, dtype=np.float64),
+            np.zeros(7, dtype=np.float64),
+            self.names,
+        )
+        base_T_torso = (
+            self._strict_checker.kinematics.compute_kinematics(torso_state)
+            .tool_poses["torso_link"]
+            .get_matrix()[0]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        base_T_torso[:3, :3] = Rotation.from_matrix(base_T_torso[:3, :3]).as_matrix()
+        scene = _base_scene(
+            clearance_request,
+            base_T_torso,
+            include_cube=True,
+            include_open_transit_table_patch=True,
+        )
+        if _scene_topology_key(scene) != self._scene_topology_key:
+            raise RuntimeError("live tabletop scene changes the warmed MPC obstacle topology")
+        for group in ("cuboid", "mesh"):
+            for name, obstacle in scene.get(group, {}).items():
+                self.mpc.scene_collision_checker.update_obstacle_pose(
+                    name,
+                    Pose.from_matrix(
+                        self.device_cfg.to_device(
+                            _matrix_from_pose_list(obstacle["pose"])[None]
+                        )
+                    ),
+                )
+
+        self.loaded_request = loaded_request
+        self.clearance_request = clearance_request
+        self.execution = execution
+        self._provisional_route = None
+        self._initial_active_dex3_q_rad = initial_fingers.copy()
+        self._object_T_grasp = _rigid_transform(execution.task.object_T_grasp)
+        self._plan_sha256 = execution.content_sha256
+        self._payload_start_plane_clearance_m = float(
+            execution.task.planner_provenance.get(
+                "payload_start_plane_clearance_m",
+                clearance_request.minimum_hand_plane_clearance_m,
+            )
+        )
+        self.request = clearance_request
+        self.route = route
+        self.path_model_q = np.asarray(route.model_q_rad, dtype=np.float64)
+        self.active_finger_q_rad = initial_fingers
+        self._strict_robot = strict_robot
+        self._plane_point, base_T_object, self._down = _table_from_resting_object(
+            clearance_request,
+            base_T_torso,
+        )
+        base_T_object = _rigid_transform(base_T_object)
+        self._base_T_object0 = _rigid_transform(base_T_object)
+        self._fixture_checker = _fixture_collision_checker(
+            clearance_request,
+            base_T_object,
+            _base_T_detected_object(clearance_request, base_T_torso),
+            self._down,
+            device_cfg=self.device_cfg,
+        )
+        self._cube_scene = _base_scene(
+            clearance_request,
+            base_T_torso,
+            include_cube=True,
+            include_open_transit_table_patch=False,
+        )
+        self._object0_T_table_patch = None
+        table_patch = scene.get("cuboid", {}).get("open_transit_table_patch")
+        if table_patch is not None:
+            self._object0_T_table_patch = _rigid_transform(
+                invert_transform(base_T_object)
+                @ _matrix_from_pose_list(table_patch["pose"])
+            )
+        self._base_T_torso0 = _rigid_transform(base_T_torso)
+        self._reference_T_camera0 = _rigid_transform(reference_T_camera0)
+        self._reference_T_torso0 = _rigid_transform(
+            self._reference_T_camera0
+            @ invert_transform(np.asarray(clearance_request.torso_T_camera, dtype=np.float64))
+        )
+        nominal_base_T_reference = _rigid_transform(
+            self._base_T_torso0 @ invert_transform(self._reference_T_torso0)
+        )
+        self._reference_T_object0 = _rigid_transform(
+            invert_transform(nominal_base_T_reference) @ base_T_object
+        )
+        torso0_T_base = invert_transform(self._base_T_torso0)
+        self._reference_T_obstacles = {}
+        for group in ("cuboid", "mesh"):
+            for name, obstacle in scene.get(group, {}).items():
+                if name in ("cube", "open_transit_table_patch"):
+                    continue
+                self._reference_T_obstacles[name] = _rigid_transform(
+                    self._reference_T_torso0
+                    @ torso0_T_base
+                    @ _matrix_from_pose_list(obstacle["pose"])
+                )
+        self._strict_nominal_base_T_live_base = np.eye(4, dtype=np.float64)
+        self._active_world_correction = {
+            "camera_translation_from_anchor_m": 0.0,
+            "camera_rotation_from_anchor_deg": 0.0,
+            "strict_scene_frame_translation_m": 0.0,
+            "strict_scene_frame_rotation_deg": 0.0,
+        }
+        self._resolved_finger_kinematics = {
+            initial_fingers.tobytes(): kinematics,
+        }
+        self._world_collision_deltas = {
+            "open_contact": _world_collision_buffer_deltas(
+                strict_robot,
+                arm=self.arm,
+                mode="open_contact",
+            )
+        }
+        self._payload_spheres = _payload_link_spheres(
+            clearance_request.object_dimensions_m,
+            object_T_grasp=self._object_T_grasp,
+        )
+        self._payload_sphere_count = 0
+        self.spec = mpc_phase_spec("grasp_approach")
+        self._apply_world_collision_scope(self.spec.mode)
+        self._set_optimizer_obstacles(self.spec)
+        self._update_live_world(self._reference_T_camera0)
+        self._geometry_action_seed_cache.clear()
+        self._state_correction_warmed_geometry.clear()
+        self._last_state_correction_prewarm_s = 0.0
+        self._generation = 0
+        self._last_window_valid_from_s = None
+        self._last_window_content_sha256 = None
+        self._committed_action_seed = None
+        self._active_goal_pose = None
+        self._active_goal_model_q = None
+        self._active_goal_is_corrected = False
+        self._active_reference_T_object = None
+        self._lookahead_rad = (
+            clearance_request.maximum_arm_velocity_rad_s
+            * MPC_OPTIMIZER_VELOCITY_SCALE
+            * self.mpc.action_horizon
+            * MPC_KNOT_DT_S
+            * 0.5
+        )
+        self._setup = False
+        setup_started = time.perf_counter()
+        setup_s = self.setup_at_frozen_route_start()
+        torch.cuda.synchronize()
+        return {
+            "rebind_time_s": setup_started - started,
+            "setup_time_s": setup_s,
+            "total_time_s": time.perf_counter() - started,
+            "plan_sha256": self._plan_sha256,
+            "reused_warm_model": True,
+        }
 
     def _collect_solver_kinematics_cfgs(self) -> tuple[Any, ...]:
         """Return every distinct MPC/IK kinematics buffer owner.
@@ -1009,12 +1220,12 @@ class TabletopPhaseMPC:
     ) -> np.ndarray:
         if spec.finger_state == "initial":
             return _validated_finger_q(
-                self.execution.task.initial_active_dex3_q_rad,
+                self._initial_active_dex3_q_rad,
                 label="initial active Dex3 posture",
             )
         if spec.finger_state == "open":
             return _validated_finger_q(
-                self.execution.task.initial_active_dex3_q_rad,
+                self._initial_active_dex3_q_rad,
                 label="measured empty-open active Dex3 posture",
             )
         if measured_active_dex3_q_rad is None:
@@ -1226,6 +1437,10 @@ class TabletopPhaseMPC:
         return elapsed
 
     def _route_for_phase(self, phase: str):
+        if self.execution is None:
+            if phase != "grasp_approach" or self._provisional_route is None:
+                raise ValueError("provisional MPC exposes only grasp_approach")
+            return self._provisional_route
         matches = tuple(
             trajectory
             for trajectory in self.execution.trajectories
@@ -1234,38 +1449,6 @@ class TabletopPhaseMPC:
         if len(matches) != 1:
             raise ValueError(f"frozen plan has {len(matches)} routes ending at {phase}")
         return matches[0]
-
-    def can_select_phase(
-        self,
-        phase: str,
-        *,
-        measured_active_dex3_q_rad: np.ndarray | None,
-    ) -> bool:
-        """Return whether the warmed fixed-shape solver can represent a phase."""
-
-        candidate = mpc_phase_spec(phase)
-        if candidate.request_state == "loaded" and self.loaded_request is None:
-            return False
-        if candidate.attached_payload:
-            if measured_active_dex3_q_rad is None:
-                return False
-            measured = np.asarray(measured_active_dex3_q_rad, dtype=np.float64).reshape(-1)
-            return measured.shape == (7,) and np.all(np.isfinite(measured))
-        return True
-
-    def select_phase(
-        self,
-        phase: str,
-        *,
-        measured_active_dex3_q_rad: np.ndarray | None = None,
-    ) -> dict[str, Any]:
-        """Switch the one warmed solver to the next physical phase in place."""
-
-        return self._activate_phase_geometry(
-            phase,
-            measured_active_dex3_q_rad=measured_active_dex3_q_rad,
-            reset_optimizer=True,
-        )
 
     def _strict_world_spheres(self, sphere_tensor):
         """Express live-body robot spheres in the nominal strict-scene frame."""
@@ -1381,7 +1564,7 @@ class TabletopPhaseMPC:
                 include_payload=True,
             )
             payload_floor = (
-                float(self.execution.task.planner_provenance["payload_start_plane_clearance_m"])
+                self._payload_start_plane_clearance_m
                 - COLLISION_ACTIVATION_DISTANCE_M
             )
             diagnostics.update(
@@ -1480,7 +1663,13 @@ class TabletopPhaseMPC:
                 )
         return diagnostics
 
-    def setup(self, *, model_q_rad: np.ndarray, model_dq_rad_s: np.ndarray) -> float:
+    def setup(
+        self,
+        *,
+        model_q_rad: np.ndarray,
+        model_dq_rad_s: np.ndarray,
+        validate_strict_start: bool = True,
+    ) -> float:
         state = _joint_state(
             self.device_cfg,
             model_q_rad,
@@ -1505,12 +1694,13 @@ class TabletopPhaseMPC:
             2,
             axis=0,
         )
-        strict = self._strict_window_diagnostics(warm_route)
-        if not bool(strict["strict_valid"]):
-            raise RuntimeError(
-                f"frozen {self.spec.phase} start fails strict MPC validation: "
-                f"{strict['strict_failure']}"
-            )
+        if validate_strict_start:
+            strict = self._strict_window_diagnostics(warm_route)
+            if not bool(strict["strict_valid"]):
+                raise RuntimeError(
+                    f"frozen {self.spec.phase} start fails strict MPC validation: "
+                    f"{strict['strict_failure']}"
+                )
         torch.cuda.synchronize()
         self._committed_action_seed = (
             self.mpc.trajectory_execution_manager.get_action_buffer().clone()
@@ -1518,12 +1708,13 @@ class TabletopPhaseMPC:
         self._setup = True
         return time.perf_counter() - started
 
-    def setup_at_frozen_route_start(self) -> float:
+    def setup_at_frozen_route_start(self, *, validate_strict_start: bool = True) -> float:
         """Build CUDA graphs before any live state freshness clock starts."""
 
         return self.setup(
             model_q_rad=self.path_model_q[0],
             model_dq_rad_s=np.zeros(7, dtype=np.float64),
+            validate_strict_start=validate_strict_start,
         )
 
     def tool_pose(self, model_q_rad: np.ndarray) -> np.ndarray:
@@ -1780,7 +1971,7 @@ class TabletopPhaseMPC:
             raise ValueError("moving-target nominal goal must contain seven finite values")
         if terminal_goal:
             object0_T_goal = _rigid_transform(
-                np.asarray(self.execution.task.object_T_grasp, dtype=np.float64)
+                self._object_T_grasp
             )
         else:
             object0_T_goal = _rigid_transform(
@@ -2029,178 +2220,6 @@ class TabletopPhaseMPC:
                 self.mpc.trajectory_execution_manager.get_action_buffer().clone()
             )
         elif self._committed_action_seed is not None:
-            self.mpc.update_seed_trajectory(self._committed_action_seed)
-        return window
-
-    def next_nominal_window(
-        self,
-        *,
-        handoff_predicted_q_rad: np.ndarray,
-        handoff_predicted_dq_rad_s: np.ndarray,
-        handoff_predicted_ddq_rad_s2: np.ndarray,
-        handoff_command_q_rad: np.ndarray,
-        source_state_monotonic_s: float,
-        valid_from_monotonic_s: float,
-        predecessor_sha256: str | None,
-        committed_route_progress_index: int,
-        reference_T_camera: np.ndarray | None = None,
-        camera_state_provenance: dict[str, Any] | None = None,
-    ) -> MPCCommandWindow:
-        """Plan from one immutable future handoff on the frozen phase route."""
-
-        window_started = time.perf_counter()
-        predicted_command = np.asarray(handoff_predicted_q_rad, dtype=np.float64).reshape(-1)
-        if predicted_command.shape != (7,) or not np.all(np.isfinite(predicted_command)):
-            raise ValueError("predicted MPC handoff position must contain seven finite values")
-        if committed_route_progress_index < 0 or committed_route_progress_index >= len(
-            self.path_model_q
-        ):
-            raise ValueError("committed MPC route progress is outside the frozen route")
-        model_q = np.asarray(
-            [
-                value + self.request.joint_position_offsets_rad.get(name, 0.0)
-                for name, value in zip(self.names, predicted_command, strict=True)
-            ],
-            dtype=np.float64,
-        )
-        # Follow the collision-validated route monotonically.  The measured
-        # state selects the nearest remaining sample, and the MPC goal is one
-        # action horizon farther along that same route.  This preserves the
-        # commissioned IK branch while still replanning every rolling window.
-        route_progress_index = committed_route_progress_index
-        remaining = self.path_model_q[route_progress_index:]
-        route_progress_index += int(
-            np.argmin(np.max(np.abs(remaining - model_q[None, :]), axis=1))
-        )
-        goal_q, waypoint_index, requested_terminal = _bounded_route_goal(
-            self.path_model_q,
-            current_q=model_q,
-            route_progress_index=route_progress_index,
-            maximum_distance_rad=self._lookahead_rad,
-        )
-        if camera_state_provenance is not None:
-            if reference_T_camera is None:
-                raise ValueError("camera-state provenance requires a reference camera pose")
-            recorded_pose = _rigid_transform(camera_state_provenance.get("reference_T_camera"))
-            if not np.allclose(
-                recorded_pose,
-                _rigid_transform(reference_T_camera),
-                atol=1.0e-12,
-                rtol=0.0,
-            ):
-                raise ValueError("camera-state provenance and correction pose differ")
-
-        goal_update_started = time.perf_counter()
-        state_correction: dict[str, Any] = {}
-        if reference_T_camera is None:
-            self._update_live_world(self._reference_T_camera0)
-            self.update_nominal_goal(goal_q)
-        elif self.spec.reference_fixed_goal:
-            state_correction = self.update_anchored_goal(
-                goal_q,
-                reference_T_camera=reference_T_camera,
-            )
-        else:
-            # The final clearance target must remain the exact joint-space
-            # junction with the frozen supported return.  Only its surrounding
-            # fixed world is moved from the live camera/body estimate.
-            state_correction = self._update_live_world(reference_T_camera)
-            self.update_nominal_goal(goal_q)
-            state_correction.update(
-                {
-                    "goal_translation_correction_m": 0.0,
-                    "goal_rotation_correction_deg": 0.0,
-                }
-            )
-        goal_update_time_s = time.perf_counter() - goal_update_started
-        window = self.solve_window(
-            model_q_rad=model_q,
-            model_dq_rad_s=np.asarray(handoff_predicted_dq_rad_s, dtype=np.float64),
-            model_ddq_rad_s2=np.asarray(handoff_predicted_ddq_rad_s2, dtype=np.float64),
-            active_command_q_rad=np.asarray(handoff_command_q_rad, dtype=np.float64),
-            source_state_monotonic_s=source_state_monotonic_s,
-            valid_from_monotonic_s=valid_from_monotonic_s,
-            predecessor_sha256=predecessor_sha256,
-            terminal=requested_terminal,
-        )
-        if requested_terminal:
-            terminal_model = np.asarray(
-                window.diagnostics["predicted_terminal_model_q_rad"],
-                dtype=np.float64,
-            )
-            if terminal_model.shape != (7,) or not np.all(np.isfinite(terminal_model)):
-                raise RuntimeError("MPC window has no valid predicted terminal model state")
-            if self._active_goal_is_corrected:
-                if self._active_goal_pose is None or self._active_goal_model_q is None:
-                    raise RuntimeError("MPC terminal check has no active corrected goal")
-                terminal_pose = self.tool_pose(terminal_model)
-                translation_error = float(
-                    np.linalg.norm(terminal_pose[:3, 3] - self._active_goal_pose[:3, 3])
-                )
-                rotation_error = float(
-                    Rotation.from_matrix(
-                        terminal_pose[:3, :3].T @ self._active_goal_pose[:3, :3]
-                    ).magnitude()
-                )
-                terminal_joint_error = float(
-                    np.max(np.abs(terminal_model - self._active_goal_model_q))
-                )
-                terminal = (
-                    translation_error <= 0.005
-                    and rotation_error <= 0.05
-                    and terminal_joint_error <= 0.005
-                )
-            else:
-                terminal = float(np.max(np.abs(terminal_model - self.path_model_q[-1]))) <= 0.005
-                translation_error = None
-                rotation_error = None
-                terminal_joint_error = None
-            if terminal != window.terminal:
-                values = window.to_dict(include_hash=False)
-                values["terminal"] = terminal and window.feasible
-                values["diagnostics"] = {
-                    **window.diagnostics,
-                    "terminal_translation_error_m": translation_error,
-                    "terminal_rotation_error_rad": rotation_error,
-                    "terminal_corrected_joint_error_rad": terminal_joint_error,
-                }
-                window = MPCCommandWindow.from_dict(values)
-        if state_correction:
-            values = window.to_dict(include_hash=False)
-            diagnostics = {**window.diagnostics, **state_correction}
-            if camera_state_provenance is not None:
-                diagnostics["camera_state_correction"] = dict(camera_state_provenance)
-            values["diagnostics"] = diagnostics
-            window = MPCCommandWindow.from_dict(values)
-        values = window.to_dict(include_hash=False)
-        diagnostics = dict(window.diagnostics)
-        diagnostics.update(
-            {
-                "committed_route_progress_index": committed_route_progress_index,
-                "proposed_route_progress_index": route_progress_index,
-                "route_progress_index": route_progress_index,
-                "route_waypoint_index": waypoint_index,
-                "route_waypoint_model_q_rad": goal_q.tolist(),
-            }
-        )
-        diagnostics["goal_update_time_s"] = goal_update_time_s
-        diagnostics["mpc_core_window_time_s"] = window.solve_time_s
-        total_window_time_s = time.perf_counter() - window_started
-        diagnostics["worker_total_window_time_s"] = total_window_time_s
-        values["diagnostics"] = diagnostics
-        values["solve_time_s"] = total_window_time_s
-        window = MPCCommandWindow.from_dict(values)
-        if window.feasible:
-            self._last_window_valid_from_s = window.valid_from_monotonic_s
-            self._last_window_content_sha256 = window.content_sha256
-            self._committed_action_seed = (
-                self.mpc.trajectory_execution_manager.get_action_buffer().clone()
-            )
-        elif self._committed_action_seed is not None:
-            # CuRobo installs every optimizer result in its execution manager,
-            # including an infeasible one.  Keep the warm start tied to the
-            # last trajectory that the controller actually accepted so a
-            # retry cannot be seeded from a rejected path.
             self.mpc.update_seed_trajectory(self._committed_action_seed)
         return window
 
@@ -2543,7 +2562,7 @@ class TabletopPhaseMPC:
         diagnostics["worker_wall_time_s"] = wall_s
         window = MPCCommandWindow(
             generation=self._generation,
-            plan_sha256=self.execution.content_sha256,
+            plan_sha256=self._plan_sha256,
             source_state_monotonic_s=source_state_monotonic_s,
             valid_from_monotonic_s=valid_from_monotonic_s,
             sample_time_s=tuple(times),
@@ -2567,673 +2586,3 @@ class TabletopPhaseMPC:
     def close(self) -> None:
         self.mpc.destroy()
         gc.collect()
-
-
-def benchmark_open_approach_mpc(
-    request: TabletopTaskRequest,
-    execution: TabletopExecutionPlan,
-    *,
-    config: MPCBenchmarkConfig | None = None,
-) -> dict[str, Any]:
-    """Run a deterministic, command-free MPC replay of the retained approach."""
-
-    import torch
-
-    config = config or MPCBenchmarkConfig()
-    started = time.perf_counter()
-    controller = TabletopPhaseMPC(
-        request,
-        execution,
-        phase="move_to_pregrasp",
-    )
-    route_q = controller.path_model_q
-    q = route_q[0].copy()
-    dq = np.zeros(7, dtype=np.float64)
-    ddq = np.zeros(7, dtype=np.float64)
-    command_q = command_from_model_q(
-        q,
-        arm=request.arm,
-        joint_position_offsets_rad=request.joint_position_offsets_rad,
-    )
-    setup_s = controller.setup(model_q_rad=q, model_dq_rad_s=dq)
-    accepted = 0
-    rejected = 0
-    latencies: list[float] = []
-    peak_velocities: list[float] = []
-    first_rejection: dict[str, Any] | None = None
-    simulated_time_s = 0.0
-    predecessor_sha256: str | None = None
-    committed_route_progress_index = 0
-    benchmark_origin_s = time.monotonic()
-    try:
-        for _step in range(config.maximum_steps):
-            source_time = benchmark_origin_s + simulated_time_s
-            window = controller.next_nominal_window(
-                handoff_predicted_q_rad=command_q,
-                handoff_predicted_dq_rad_s=dq,
-                handoff_predicted_ddq_rad_s2=ddq,
-                handoff_command_q_rad=command_q,
-                source_state_monotonic_s=source_time,
-                valid_from_monotonic_s=(source_time + config.handoff_interval_s),
-                predecessor_sha256=predecessor_sha256,
-                committed_route_progress_index=committed_route_progress_index,
-            )
-            latencies.append(window.solve_time_s)
-            peak_velocities.append(window.peak_velocity_rad_s())
-            if not window.feasible:
-                rejected += 1
-                if first_rejection is None:
-                    first_rejection = window.to_dict()
-                break
-            accepted += 1
-            predecessor_sha256 = window.content_sha256
-            committed_route_progress_index = int(
-                window.diagnostics["proposed_route_progress_index"]
-            )
-            execution_time_s = window.duration_s if window.terminal else config.handoff_interval_s
-            window_times = np.asarray(window.sample_time_s, dtype=np.float64)
-            window_commands = np.asarray(window.command_q_rad, dtype=np.float64)
-            window_predicted = np.asarray(window.predicted_q_rad, dtype=np.float64)
-            window_predicted_dq = np.asarray(window.predicted_dq_rad_s, dtype=np.float64)
-            window_predicted_ddq = np.asarray(window.predicted_ddq_rad_s2, dtype=np.float64)
-            command_q = np.asarray(
-                [
-                    np.interp(execution_time_s, window_times, window_commands[:, index])
-                    for index in range(7)
-                ],
-                dtype=np.float64,
-            )
-            predicted_q = np.asarray(
-                [
-                    np.interp(execution_time_s, window_times, window_predicted[:, index])
-                    for index in range(7)
-                ],
-                dtype=np.float64,
-            )
-            q = np.asarray(
-                [
-                    value + request.joint_position_offsets_rad.get(name, 0.0)
-                    for name, value in zip(controller.names, predicted_q, strict=True)
-                ],
-                dtype=np.float64,
-            )
-            dq = np.asarray(
-                [
-                    np.interp(
-                        execution_time_s,
-                        window_times,
-                        window_predicted_dq[:, index],
-                    )
-                    for index in range(7)
-                ],
-                dtype=np.float64,
-            )
-            ddq = np.asarray(
-                [
-                    np.interp(
-                        execution_time_s,
-                        window_times,
-                        window_predicted_ddq[:, index],
-                    )
-                    for index in range(7)
-                ],
-                dtype=np.float64,
-            )
-            simulated_time_s += execution_time_s
-            if window.terminal:
-                break
-    finally:
-        controller.close()
-        torch.cuda.empty_cache()
-    reached = float(np.max(np.abs(q - route_q[-1]))) <= config.waypoint_tolerance_rad
-    latency = np.asarray(latencies, dtype=np.float64)
-    return {
-        "schema_version": 1,
-        "kind": "g1_tabletop_open_approach_mpc_benchmark",
-        "commands_robot": False,
-        "request_sha256": request.content_sha256,
-        "execution_plan_sha256": execution.content_sha256,
-        "arm": request.arm,
-        "phase": "move_to_pregrasp",
-        "reached_terminal": reached,
-        "accepted_windows": accepted,
-        "rejected_windows": rejected,
-        "first_rejection": first_rejection,
-        "maximum_joint_error_to_terminal_rad": float(np.max(np.abs(q - route_q[-1]))),
-        "simulated_time_s": simulated_time_s,
-        "setup_time_s": setup_s,
-        "benchmark_wall_time_s": time.perf_counter() - started,
-        "solve_latency_s": {
-            "count": len(latencies),
-            "mean": float(np.mean(latency)) if len(latency) else None,
-            "p95": float(np.percentile(latency, 95)) if len(latency) else None,
-            "maximum": float(np.max(latency)) if len(latency) else None,
-        },
-        "maximum_window_velocity_rad_s": (
-            float(np.max(peak_velocities)) if peak_velocities else None
-        ),
-        "configuration": {
-            "command_dt_s": MPC_COMMAND_DT_S,
-            "knot_dt_s": MPC_KNOT_DT_S,
-            "interpolation_steps": MPC_INTERPOLATION_STEPS,
-            "certified_horizon_source": "complete_curobo_robot_state_sequence",
-            "executor_validation_dt_s": MPC_EXECUTOR_DT_S,
-            "cold_start_iterations": MPC_COLD_START_ITERATIONS,
-            "warm_start_iterations": MPC_WARM_START_ITERATIONS,
-            "maximum_steps": config.maximum_steps,
-            "waypoint_tolerance_rad": config.waypoint_tolerance_rad,
-            "handoff_interval_s": config.handoff_interval_s,
-            "maximum_arm_velocity_rad_s": request.maximum_arm_velocity_rad_s,
-            "route_tracking": "monotonic_frozen_route_lookahead",
-            "route_lookahead_rad": controller._lookahead_rad,
-            "collision_activation_distance_m": COLLISION_ACTIVATION_DISTANCE_M,
-            "open_transit_object_clearance_m": OPEN_TRANSIT_OBJECT_CLEARANCE_M,
-        },
-        "provenance": {**model_source_hashes(), "curobo_commit": CUROBO_COMMIT},
-    }
-
-
-def _simulate_phase(
-    controller: TabletopPhaseMPC,
-    *,
-    command_q_rad: np.ndarray,
-    model_dq_rad_s: np.ndarray,
-    config: MPCBenchmarkConfig,
-    reference_T_camera: np.ndarray | None = None,
-) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
-    """Replay one phase without ROS or a robot and return its terminal state."""
-
-    measured_q = np.asarray(command_q_rad, dtype=np.float64).copy()
-    dq = np.asarray(model_dq_rad_s, dtype=np.float64).copy()
-    ddq = np.zeros(7, dtype=np.float64)
-    tracking_offset = (
-        np.zeros(7, dtype=np.float64)
-        if config.simulated_tracking_offset_rad is None
-        else np.asarray(config.simulated_tracking_offset_rad, dtype=np.float64)
-    )
-    route_q = controller.path_model_q
-    start_model = np.asarray(
-        [
-            value + controller.request.joint_position_offsets_rad.get(name, 0.0)
-            for name, value in zip(controller.names, measured_q, strict=True)
-        ],
-        dtype=np.float64,
-    )
-    accepted = 0
-    rejected = 0
-    windows: list[dict[str, Any]] = []
-    simulated_time_s = 0.0
-    terminal_received = False
-    stopped_at_certified_horizon = False
-    install_rejection: str | None = None
-    predecessor_sha256: str | None = None
-    committed_route_progress_index = 0
-    benchmark_origin_s = time.monotonic()
-    now_s = benchmark_origin_s
-    active_window: MPCCommandWindow | None = None
-
-    def sample_active(at_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        assert active_window is not None
-        return (
-            active_window.sample_command(monotonic_s=at_s),
-            active_window.sample_predicted_q(monotonic_s=at_s),
-            active_window.sample_predicted_dq(monotonic_s=at_s),
-            active_window.sample_predicted_ddq(monotonic_s=at_s),
-        )
-
-    for _step in range(config.maximum_steps):
-        if active_window is None:
-            valid_from_s = now_s + config.handoff_interval_s
-            boundary_command = measured_q + tracking_offset
-            boundary_q = measured_q
-            boundary_dq = dq
-            boundary_ddq = ddq
-        else:
-            relative_s = max(
-                now_s + config.handoff_interval_s - active_window.valid_from_monotonic_s,
-                0.0,
-            )
-            handoff_knots = int(np.ceil((relative_s - 1.0e-12) / MPC_KNOT_DT_S))
-            valid_from_s = active_window.valid_from_monotonic_s + handoff_knots * MPC_KNOT_DT_S
-            if valid_from_s > active_window.expiration_monotonic_s + 1.0e-12:
-                stop_s = active_window.expiration_monotonic_s
-                command_q, measured_q, dq, ddq = sample_active(stop_s)
-                simulated_time_s += max(stop_s - now_s, 0.0)
-                now_s = stop_s
-                stopped_at_certified_horizon = True
-                break
-            boundary_command, boundary_q, boundary_dq, boundary_ddq = sample_active(valid_from_s)
-        window = controller.next_nominal_window(
-            handoff_predicted_q_rad=boundary_q,
-            handoff_predicted_dq_rad_s=boundary_dq,
-            handoff_predicted_ddq_rad_s2=boundary_ddq,
-            handoff_command_q_rad=boundary_command,
-            source_state_monotonic_s=now_s,
-            valid_from_monotonic_s=valid_from_s,
-            predecessor_sha256=predecessor_sha256,
-            committed_route_progress_index=committed_route_progress_index,
-            reference_T_camera=reference_T_camera,
-        )
-        windows.append(window.to_dict())
-        if not window.feasible:
-            rejected += 1
-            if active_window is None:
-                break
-            solve_end_s = min(
-                now_s + window.solve_time_s,
-                active_window.expiration_monotonic_s,
-            )
-            command_q, measured_q, dq, ddq = sample_active(solve_end_s)
-            simulated_time_s += max(solve_end_s - now_s, 0.0)
-            now_s = solve_end_s
-            if now_s >= active_window.expiration_monotonic_s - 1.0e-12:
-                stopped_at_certified_horizon = True
-                break
-            continue
-        if now_s + window.solve_time_s >= valid_from_s:
-            rejected += 1
-            install_rejection = "future handoff deadline missed"
-            if active_window is not None:
-                stop_s = active_window.expiration_monotonic_s
-                command_q, measured_q, dq, ddq = sample_active(stop_s)
-                simulated_time_s += max(stop_s - now_s, 0.0)
-                now_s = stop_s
-                stopped_at_certified_horizon = True
-            break
-        accepted += 1
-        if active_window is not None:
-            simulated_time_s += max(valid_from_s - now_s, 0.0)
-        now_s = valid_from_s
-        active_window = window
-        command_q, measured_q, dq, ddq = sample_active(now_s)
-        predecessor_sha256 = active_window.content_sha256
-        committed_route_progress_index = int(
-            active_window.diagnostics["proposed_route_progress_index"]
-        )
-        if not np.allclose(
-            command_q - measured_q,
-            tracking_offset,
-            atol=1.0e-7,
-            rtol=0.0,
-        ):
-            raise RuntimeError("simulated MPC command/model offset changed inside a window")
-        if active_window.terminal:
-            stop_s = active_window.expiration_monotonic_s
-            command_q, measured_q, dq, ddq = sample_active(stop_s)
-            simulated_time_s += stop_s - now_s
-            now_s = stop_s
-            terminal_received = True
-            break
-    else:
-        if active_window is not None:
-            stop_s = active_window.expiration_monotonic_s
-            command_q, measured_q, dq, ddq = sample_active(stop_s)
-            simulated_time_s += max(stop_s - now_s, 0.0)
-            stopped_at_certified_horizon = True
-    terminal_model = np.asarray(
-        [
-            value + controller.request.joint_position_offsets_rad.get(name, 0.0)
-            for name, value in zip(controller.names, measured_q, strict=True)
-        ],
-        dtype=np.float64,
-    )
-    terminal_joint_error = float(np.max(np.abs(terminal_model - route_q[-1])))
-    if reference_T_camera is not None and controller.spec.reference_fixed_goal:
-        reached = terminal_received
-        terminal_pose = controller.tool_pose(terminal_model)
-        if controller._active_goal_pose is None:
-            raise RuntimeError("corrected MPC replay ended without an active pose goal")
-        terminal_translation_error_m = float(
-            np.linalg.norm(terminal_pose[:3, 3] - controller._active_goal_pose[:3, 3])
-        )
-        terminal_rotation_error_rad = float(
-            Rotation.from_matrix(
-                terminal_pose[:3, :3].T @ controller._active_goal_pose[:3, :3]
-            ).magnitude()
-        )
-    else:
-        reached = terminal_joint_error <= config.waypoint_tolerance_rad
-        terminal_translation_error_m = None
-        terminal_rotation_error_rad = None
-    solve_times = np.asarray([item["solve_time_s"] for item in windows], dtype=np.float64)
-    slowest_window = (
-        max(windows, key=lambda item: float(item["solve_time_s"])) if windows else None
-    )
-    fixture_windows = [
-        item
-        for item in windows
-        if item["diagnostics"].get("minimum_fixture_clearance_m") is not None
-    ]
-    closest_fixture_window = (
-        min(
-            fixture_windows,
-            key=lambda item: float(item["diagnostics"]["minimum_fixture_clearance_m"]),
-        )
-        if fixture_windows
-        else None
-    )
-
-    def latency_summary(diagnostic_key: str) -> dict[str, float | int] | None:
-        samples = [
-            (int(item["generation"]), float(item["diagnostics"][diagnostic_key]))
-            for item in windows
-            if item["diagnostics"].get(diagnostic_key) is not None
-        ]
-        if not samples:
-            return None
-        values = np.asarray([value for _generation, value in samples], dtype=np.float64)
-        maximum_index = int(np.argmax(values))
-        return {
-            "mean": float(np.mean(values)),
-            "p95": float(np.percentile(values, 95)),
-            "maximum": float(values[maximum_index]),
-            "maximum_generation": samples[maximum_index][0],
-        }
-
-    return (
-        {
-            "phase": controller.spec.phase,
-            "physical_mode": controller.spec.mode,
-            "reached_terminal": reached,
-            "accepted_windows": accepted,
-            "rejected_windows": rejected,
-            "stopped_at_certified_horizon": stopped_at_certified_horizon,
-            "install_rejection": install_rejection,
-            "first_rejection": next(
-                (item for item in windows if not bool(item["feasible"])),
-                None,
-            ),
-            "maximum_start_error_from_frozen_route_rad": float(
-                np.max(np.abs(start_model - route_q[0]))
-            ),
-            "simulated_tracking_offset_rad": tracking_offset.tolist(),
-            "maximum_terminal_error_rad": terminal_joint_error,
-            "terminal_translation_error_m": terminal_translation_error_m,
-            "terminal_rotation_error_rad": terminal_rotation_error_rad,
-            "simulated_time_s": simulated_time_s,
-            "window_count": len(windows),
-            "last_window_route_state": (
-                None
-                if not windows
-                else {
-                    key: windows[-1]["diagnostics"].get(key)
-                    for key in (
-                        "route_progress_index",
-                        "route_waypoint_index",
-                        "route_waypoint_model_q_rad",
-                        "predicted_terminal_model_q_rad",
-                    )
-                }
-            ),
-            "solve_latency_s": {
-                "mean": float(np.mean(solve_times)) if len(solve_times) else None,
-                "p95": (float(np.percentile(solve_times, 95)) if len(solve_times) else None),
-                "maximum": float(np.max(solve_times)) if len(solve_times) else None,
-            },
-            "slowest_window": (
-                None
-                if slowest_window is None
-                else {
-                    "generation": slowest_window["generation"],
-                    "total_s": slowest_window["solve_time_s"],
-                    "goal_update_s": slowest_window["diagnostics"].get("goal_update_time_s"),
-                    "mpc_core_s": slowest_window["diagnostics"].get("mpc_core_window_time_s"),
-                    "optimizer_s": slowest_window["diagnostics"].get("optimizer_wall_time_s"),
-                    "strict_validation_s": slowest_window["diagnostics"].get(
-                        "strict_validation_time_s"
-                    ),
-                }
-            ),
-            "latency_components_s": {
-                key: latency_summary(key)
-                for key in (
-                    "goal_update_time_s",
-                    "optimizer_wall_time_s",
-                    "strict_validation_time_s",
-                    "mpc_core_window_time_s",
-                    "worker_total_window_time_s",
-                )
-            },
-            "fixture_clearance": (
-                None
-                if closest_fixture_window is None
-                else {
-                    "minimum_m": closest_fixture_window["diagnostics"][
-                        "minimum_fixture_clearance_m"
-                    ],
-                    "link": closest_fixture_window["diagnostics"][
-                        "minimum_fixture_clearance_link"
-                    ],
-                    "generation": closest_fixture_window["generation"],
-                    "search_distance_m": closest_fixture_window["diagnostics"][
-                        "fixture_clearance_search_distance_m"
-                    ],
-                }
-            ),
-            "maximum_window_velocity_rad_s": (
-                max(MPCCommandWindow.from_dict(item).peak_velocity_rad_s() for item in windows)
-                if windows
-                else None
-            ),
-        },
-        measured_q,
-        dq,
-    )
-
-
-def benchmark_tabletop_lifecycle_mpc(
-    loaded_request: TabletopTaskRequest,
-    clearance_request: TabletopTaskRequest,
-    execution: TabletopExecutionPlan,
-    *,
-    config: MPCBenchmarkConfig | None = None,
-    measured_active_dex3_q_rad: np.ndarray | None = None,
-    reference_T_camera: np.ndarray | None = None,
-) -> dict[str, Any]:
-    """Replay every normal phase with its exact physical MPC model, command-free."""
-
-    import torch
-
-    config = config or MPCBenchmarkConfig()
-    if loaded_request.content_sha256 != execution.loaded_request_sha256:
-        raise ValueError("lifecycle benchmark loaded request differs from the plan")
-    if clearance_request.content_sha256 != execution.clearance_request_sha256:
-        raise ValueError("lifecycle benchmark clearance request differs from the plan")
-    started = time.perf_counter()
-    if reference_T_camera is not None:
-        reference_T_camera = _rigid_transform(reference_T_camera)
-    controller: TabletopPhaseMPC | None = None
-    phase_results: list[dict[str, Any]] = []
-    setup_events: list[dict[str, Any]] = []
-    first_phase = MPC_PHASE_ORDER[0]
-    first_route = next(
-        trajectory for trajectory in execution.trajectories if trajectory.to_pose_id == first_phase
-    )
-    command_q = np.asarray(first_route.command_q_rad[0], dtype=np.float64)
-    dq = np.zeros(7, dtype=np.float64)
-    if measured_active_dex3_q_rad is None:
-        contact_fingers = np.asarray(
-            execution.task.close_target_active_dex3_q_rad,
-            dtype=np.float64,
-        )
-        measured_close_source = "descriptor_target"
-    else:
-        contact_fingers = np.asarray(measured_active_dex3_q_rad, dtype=np.float64).reshape(-1)
-        if contact_fingers.shape != (7,) or not np.all(np.isfinite(contact_fingers)):
-            raise ValueError("measured MPC close posture must contain seven finite values")
-        measured_close_source = "retained_hardware_grasp_close"
-    try:
-        for phase in MPC_PHASE_ORDER:
-            measured = contact_fingers if phase in MPC_ATTACHED_PHASES else None
-            reused = controller is not None
-            switch = None
-            if controller is None:
-                build_started = time.perf_counter()
-                controller = TabletopPhaseMPC(
-                    clearance_request,
-                    execution,
-                    phase=phase,
-                    loaded_request=loaded_request,
-                    measured_active_dex3_q_rad=measured,
-                )
-                build_s = time.perf_counter() - build_started
-                setup_s = controller.setup_at_frozen_route_start()
-                preparation_s = build_s + setup_s
-            else:
-                switch = controller.select_phase(
-                    phase,
-                    measured_active_dex3_q_rad=measured,
-                )
-                build_s = 0.0
-                setup_s = 0.0
-                preparation_s = switch["reconfiguration_time_s"]
-            setup_events.append(
-                {
-                    "phase": phase,
-                    "physical_mode": controller.spec.mode,
-                    "reused_warm_model": reused,
-                    "build_time_s": build_s,
-                    "preparation_time_s": preparation_s,
-                    "setup_time_s": setup_s,
-                    "kinematics_cache_hit": (
-                        True if switch is None else switch["kinematics_cache_hit"]
-                    ),
-                    "kinematics_resolve_time_s": (
-                        0.0 if switch is None else switch["kinematics_resolve_time_s"]
-                    ),
-                    "optimizer_prewarm_time_s": (
-                        0.0 if switch is None else switch["optimizer_prewarm_time_s"]
-                    ),
-                    "state_correction_prewarm_time_s": (
-                        controller._last_state_correction_prewarm_s
-                        if switch is None
-                        else switch["state_correction_prewarm_time_s"]
-                    ),
-                    "reconfiguration_time_s": (
-                        0.0 if switch is None else switch["reconfiguration_time_s"]
-                    ),
-                }
-            )
-            phase_result, command_q, dq = _simulate_phase(
-                controller,
-                command_q_rad=command_q,
-                model_dq_rad_s=dq,
-                config=config,
-                reference_T_camera=reference_T_camera,
-            )
-            phase_results.append(phase_result)
-            if not phase_result["reached_terminal"]:
-                break
-    finally:
-        if controller is not None:
-            controller.close()
-        torch.cuda.empty_cache()
-    return {
-        "schema_version": 1,
-        "kind": "g1_tabletop_phase_aware_mpc_lifecycle_benchmark",
-        "commands_robot": False,
-        "loaded_request_sha256": loaded_request.content_sha256,
-        "clearance_request_sha256": clearance_request.content_sha256,
-        "execution_plan_sha256": execution.content_sha256,
-        "arm": execution.task.arm,
-        "measured_close_source": measured_close_source,
-        "active_dex3_close_q_rad": contact_fingers.tolist(),
-        "camera_state_correction": {
-            "enabled": reference_T_camera is not None,
-            "reference_T_camera": (
-                None if reference_T_camera is None else reference_T_camera.tolist()
-            ),
-        },
-        "complete": (
-            len(phase_results) == len(MPC_PHASE_ORDER)
-            and all(bool(item["reached_terminal"]) for item in phase_results)
-        ),
-        "completed_phase_count": sum(bool(item["reached_terminal"]) for item in phase_results),
-        "phase_count": len(MPC_PHASE_ORDER),
-        "setup_events": setup_events,
-        "phases": phase_results,
-        "total_accepted_windows": sum(item["accepted_windows"] for item in phase_results),
-        "total_rejected_windows": sum(item["rejected_windows"] for item in phase_results),
-        "benchmark_wall_time_s": time.perf_counter() - started,
-        "configuration": {
-            "command_dt_s": MPC_COMMAND_DT_S,
-            "knot_dt_s": MPC_KNOT_DT_S,
-            "interpolation_steps": MPC_INTERPOLATION_STEPS,
-            "certified_horizon_source": "complete_curobo_robot_state_sequence",
-            "cold_start_iterations": MPC_COLD_START_ITERATIONS,
-            "warm_start_iterations": MPC_WARM_START_ITERATIONS,
-            "maximum_steps_per_phase": config.maximum_steps,
-            "waypoint_tolerance_rad": config.waypoint_tolerance_rad,
-            "handoff_interval_s": config.handoff_interval_s,
-            "simulated_tracking_offset_rad": (
-                None
-                if config.simulated_tracking_offset_rad is None
-                else list(config.simulated_tracking_offset_rad)
-            ),
-            "maximum_arm_velocity_rad_s": clearance_request.maximum_arm_velocity_rad_s,
-            "route_tracking": "monotonic_frozen_route_lookahead",
-            "route_lookahead_rad": controller._lookahead_rad,
-            "collision_activation_distance_m": COLLISION_ACTIVATION_DISTANCE_M,
-            "open_transit_object_clearance_m": OPEN_TRANSIT_OBJECT_CLEARANCE_M,
-        },
-        "provenance": {**model_source_hashes(), "curobo_commit": CUROBO_COMMIT},
-    }
-
-
-def benchmark_from_paths(
-    loaded_request_path: Path,
-    clearance_request_path: Path,
-    execution_path: Path,
-    output_path: Path,
-    *,
-    maximum_steps: int,
-    grasp_close_path: Path | None = None,
-    camera_state_estimate_path: Path | None = None,
-) -> dict[str, Any]:
-    from g1_dex3_tabletop.planning.contracts import atomic_write_json
-
-    loaded_request = TabletopTaskRequest.from_json(loaded_request_path)
-    clearance_request = TabletopTaskRequest.from_json(clearance_request_path)
-    execution = TabletopExecutionPlan.from_json(execution_path)
-    measured_close = None
-    grasp_close_provenance = None
-    if grasp_close_path is not None:
-        raw = grasp_close_path.read_bytes()
-        document = json.loads(raw)
-        if document.get("active_side") != execution.task.arm:
-            raise ValueError("retained grasp close selects a different arm")
-        measured_close = np.asarray(document.get("close_q_rad"), dtype=np.float64)
-        grasp_close_provenance = {
-            "path": str(grasp_close_path.resolve()),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        }
-    reference_T_camera = None
-    camera_state_provenance = None
-    if camera_state_estimate_path is not None:
-        raw = camera_state_estimate_path.read_bytes()
-        document = json.loads(raw)
-        estimate = document.get(
-            "installation_estimate",
-            document.get("estimate", document),
-        )
-        if not isinstance(estimate, dict):
-            raise ValueError("camera-state estimate JSON has no estimate object")
-        reference_T_camera = _rigid_transform(estimate.get("reference_T_camera"))
-        camera_state_provenance = {
-            "path": str(camera_state_estimate_path.resolve()),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-            "timestamp_ns": estimate.get("timestamp_ns"),
-            "anchor_timestamp_ns": estimate.get("anchor_timestamp_ns"),
-        }
-    result = benchmark_tabletop_lifecycle_mpc(
-        loaded_request,
-        clearance_request,
-        execution,
-        config=MPCBenchmarkConfig(maximum_steps=maximum_steps),
-        measured_active_dex3_q_rad=measured_close,
-        reference_T_camera=reference_T_camera,
-    )
-    result["grasp_close_provenance"] = grasp_close_provenance
-    result["camera_state_estimate_provenance"] = camera_state_provenance
-    atomic_write_json(output_path, result)
-    return result

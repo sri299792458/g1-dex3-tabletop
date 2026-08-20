@@ -10,7 +10,7 @@ import numpy as np
 
 from g1_aprilcube_calibration.joint_map import arm_indices
 from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
-from g1_dex3_tabletop.planning.tabletop_mpc import TabletopPhaseMPC, mpc_phase_spec
+from g1_dex3_tabletop.planning.tabletop_mpc import MovingGraspMPC, mpc_phase_spec
 from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
     RetentionRouteValidator,
@@ -20,7 +20,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     plan_tabletop_pick_place,
     plan_tabletop_pregrasp,
     plan_tabletop_task,
-    prewarm_tabletop_task_models,
+    prewarm_tabletop_runtime_models,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
     MovingGraspContinuationRequest,
@@ -59,8 +59,8 @@ class TabletopPlanningSession:
         self._pick_place_request: TabletopPickPlaceRequest | None = None
         self._pick_place_plan: TabletopPickPlacePlan | None = None
         self._pick_place_retention_validator: PickPlaceRetentionRouteValidator | None = None
-        self._phase_mpc: TabletopPhaseMPC | None = None
-        self._active_phase_mpc: TabletopPhaseMPC | None = None
+        self._phase_mpc: MovingGraspMPC | None = None
+        self._active_phase_mpc: MovingGraspMPC | None = None
         self._planner_pool = TabletopPlannerPool()
 
     def plan_lifecycle(
@@ -109,10 +109,8 @@ class TabletopPlanningSession:
 
         report = progress or (lambda _message: None)
         escape = plan_supported_escape(request, progress=report)
-        controller = self._phase_mpc
-        if controller is not None:
-            controller.close()
-        self._phase_mpc = None
+        # The provisional moving-grasp MPC owns no executable route. Keep its
+        # CUDA graph alive while the fresh loaded-state escape is planned.
         self._active_phase_mpc = None
         self._loaded_request = request
         self._clearance_request = request_at_clearance(request, escape)
@@ -126,31 +124,57 @@ class TabletopPlanningSession:
         self._pick_place_retention_validator = None
         return escape
 
-    def prewarm_task_at_clearance(
+    def prewarm_runtime(
         self,
         request: TabletopTaskRequest,
         *,
+        moving_grasp_mpc: bool,
         progress: Callable[[str], None] | None = None,
     ) -> dict:
-        """Populate every task planner slot before the first arm trajectory."""
+        """Warm command-free planner topology from the read-only preflight state."""
 
-        if self._loaded_request is None or self._supported_escape is None:
-            raise RuntimeError("task prewarm requires a supported escape in this worker")
-        expected = request_at_clearance(self._loaded_request, self._supported_escape)
-        if request.content_sha256 != expected.content_sha256:
-            raise ValueError("task prewarm request must be the exact predicted clearance request")
         report = progress or (lambda _message: None)
         report(
-            "constructing open-hand, fixed-close, and attached-payload CUDA models "
-            "before the first changing arm target; no task solve is being used as a gate"
+            "constructing persistent open-hand and attached-payload MotionGen models; "
+            "no task solve or robot command is being used as a gate"
         )
-        result = prewarm_tabletop_task_models(
+        result = prewarm_tabletop_runtime_models(
             request,
             planner_pool=self._planner_pool,
         )
+        mpc_result = None
+        if moving_grasp_mpc:
+            controller = self._phase_mpc
+            if controller is not None:
+                controller.close()
+            mpc_started = time.perf_counter()
+            controller = MovingGraspMPC(
+                request,
+                None,
+                phase="grasp_approach",
+            )
+            try:
+                mpc_setup_s = controller.setup_at_frozen_route_start(
+                    validate_strict_start=False
+                )
+            except BaseException:
+                controller.close()
+                raise
+            self._phase_mpc = controller
+            self._active_phase_mpc = None
+            mpc_result = {
+                "build_and_setup_time_s": time.perf_counter() - mpc_started,
+                "setup_time_s": mpc_setup_s,
+                "retained_for_live_binding": True,
+                "strict_start_validation_deferred_to_live_route": True,
+            }
+        result = {
+            **result,
+            "moving_grasp_mpc": mpc_result,
+        }
         report(
-            "pre-motion model warmup complete; fresh boundary observations remain the "
-            "only source of executable task feasibility"
+            "command-free runtime warmup complete; fresh loaded and clearance "
+            "observations remain the only source of executable task feasibility"
         )
         return result
 
@@ -303,10 +327,6 @@ class TabletopPlanningSession:
         )
         report("rebuilding measured-contact checker for the boundary-corrected task")
         retention_validator = self._planner_pool.retention_validator(request, task)
-        controller = self._phase_mpc
-        if controller is not None:
-            controller.close()
-        self._phase_mpc = None
         self._active_phase_mpc = None
         self._clearance_request = request
         self._pregrasp_plan = None
@@ -408,14 +428,12 @@ class TabletopPlanningSession:
         self._retention_validator = validator
         return task
 
-    def prepare_mpc_phase(
+    def prepare_moving_grasp_mpc(
         self,
-        phase: str,
         *,
-        measured_active_dex3_q_rad: np.ndarray | None = None,
-        reference_T_camera0: np.ndarray | None = None,
+        reference_T_camera0: np.ndarray,
     ) -> dict:
-        """Create or reuse the exact physical MPC model for one motion phase."""
+        """Bind the frozen grasp approach into the prewarmed MPC model."""
 
         if (
             self._loaded_request is None
@@ -427,51 +445,43 @@ class TabletopPlanningSession:
             self._active_task.content_sha256 != self._execution.task.content_sha256
         ):
             raise RuntimeError("MPC preparation is unavailable after the pregrasp boundary replan")
+        phase = "grasp_approach"
         spec = mpc_phase_spec(phase)
-        measured = (
-            None
-            if measured_active_dex3_q_rad is None
-            else np.asarray(measured_active_dex3_q_rad, dtype=np.float64)
-        )
         controller = self._phase_mpc
         if controller is not None:
-            if not controller.can_select_phase(
-                phase,
-                measured_active_dex3_q_rad=measured,
-            ):
-                raise ValueError(f"warmed MPC cannot represent physical phase {phase}")
-            switch = controller.select_phase(
-                phase,
-                measured_active_dex3_q_rad=measured,
+            binding = controller.bind_moving_grasp_execution(
+                self._clearance_request,
+                self._execution,
+                loaded_request=self._loaded_request,
+                reference_T_camera0=np.asarray(reference_T_camera0, dtype=np.float64),
             )
             self._active_phase_mpc = controller
             return {
                 "build_time_s": 0.0,
-                "preparation_time_s": switch["reconfiguration_time_s"],
-                "setup_time_s": 0.0,
+                "preparation_time_s": binding["total_time_s"],
+                "setup_time_s": binding["setup_time_s"],
                 "phase": phase,
                 "physical_mode": spec.mode,
                 "reused_warm_model": True,
-                "kinematics_cache_hit": switch["kinematics_cache_hit"],
-                "kinematics_resolve_time_s": switch["kinematics_resolve_time_s"],
-                "optimizer_prewarm_time_s": switch["optimizer_prewarm_time_s"],
-                "state_correction_prewarm_time_s": switch.get(
-                    "state_correction_prewarm_time_s", 0.0
+                "kinematics_cache_hit": False,
+                "kinematics_resolve_time_s": binding["rebind_time_s"],
+                "optimizer_prewarm_time_s": binding["setup_time_s"],
+                "state_correction_prewarm_time_s": getattr(
+                    controller, "_last_state_correction_prewarm_s", 0.0
                 ),
-                "reconfiguration_time_s": switch["reconfiguration_time_s"],
+                "reconfiguration_time_s": binding["total_time_s"],
                 "plan_sha256": self._execution.content_sha256,
             }
         build_started = time.perf_counter()
         constructor_arguments = {
             "phase": phase,
             "loaded_request": self._loaded_request,
-            "measured_active_dex3_q_rad": measured,
+            "measured_active_dex3_q_rad": None,
         }
-        if reference_T_camera0 is not None:
-            constructor_arguments["reference_T_camera0"] = np.asarray(
-                reference_T_camera0, dtype=np.float64
-            )
-        controller = TabletopPhaseMPC(
+        constructor_arguments["reference_T_camera0"] = np.asarray(
+            reference_T_camera0, dtype=np.float64
+        )
+        controller = MovingGraspMPC(
             self._clearance_request,
             self._execution,
             **constructor_arguments,
@@ -501,50 +511,15 @@ class TabletopPlanningSession:
             "plan_sha256": self._execution.content_sha256,
         }
 
-    def step_mpc_phase(self, payload: dict) -> MPCCommandWindow:
-        """Optimize one window from an immutable future handoff boundary."""
+    def step_moving_grasp_mpc(self, payload: dict) -> MPCCommandWindow:
+        """Optimize one moving-grasp window from an immutable future handoff."""
 
         if self._active_phase_mpc is None:
             raise RuntimeError("tabletop phase MPC has not been prepared")
-        requested_phase = str(payload["phase"])
-        if requested_phase != self._active_phase_mpc.spec.phase:
-            raise ValueError(
-                f"MPC step requests {requested_phase} while "
-                f"{self._active_phase_mpc.spec.phase} is prepared"
-            )
-        camera_state = payload.get("camera_state_correction")
-        if camera_state is not None and not isinstance(camera_state, dict):
-            raise TypeError("MPC camera-state correction must be a dictionary")
         moving_target = payload.get("moving_target")
-        if moving_target is not None:
-            if requested_phase != "grasp_approach":
-                raise ValueError("moving-target MPC is only valid for grasp_approach")
-            if not isinstance(moving_target, dict):
-                raise TypeError("MPC moving target must be a dictionary")
-            return self._active_phase_mpc.next_moving_target_window(
-                handoff_predicted_q_rad=np.asarray(
-                    payload["handoff_predicted_q_rad"], dtype=np.float64
-                ),
-                handoff_predicted_dq_rad_s=np.asarray(
-                    payload["handoff_predicted_dq_rad_s"], dtype=np.float64
-                ),
-                handoff_predicted_ddq_rad_s2=np.asarray(
-                    payload["handoff_predicted_ddq_rad_s2"], dtype=np.float64
-                ),
-                handoff_command_q_rad=np.asarray(
-                    payload["handoff_command_q_rad"], dtype=np.float64
-                ),
-                source_state_monotonic_s=float(payload["source_state_monotonic_s"]),
-                valid_from_monotonic_s=float(payload["valid_from_monotonic_s"]),
-                predecessor_sha256=payload.get("predecessor_sha256"),
-                reference_T_camera=np.asarray(
-                    moving_target.get("reference_T_camera"), dtype=np.float64
-                ),
-                camera_T_object=np.asarray(moving_target.get("camera_T_object"), dtype=np.float64),
-                target_provenance=moving_target,
-                committed_route_progress_index=int(payload["committed_route_progress_index"]),
-            )
-        return self._active_phase_mpc.next_nominal_window(
+        if not isinstance(moving_target, dict):
+            raise TypeError("moving-grasp MPC requires one live target dictionary")
+        return self._active_phase_mpc.next_moving_target_window(
             handoff_predicted_q_rad=np.asarray(
                 payload["handoff_predicted_q_rad"], dtype=np.float64
             ),
@@ -558,13 +533,14 @@ class TabletopPlanningSession:
             source_state_monotonic_s=float(payload["source_state_monotonic_s"]),
             valid_from_monotonic_s=float(payload["valid_from_monotonic_s"]),
             predecessor_sha256=payload.get("predecessor_sha256"),
-            committed_route_progress_index=int(payload["committed_route_progress_index"]),
-            reference_T_camera=(
-                None
-                if camera_state is None
-                else np.asarray(camera_state.get("reference_T_camera"), dtype=np.float64)
+            reference_T_camera=np.asarray(
+                moving_target.get("reference_T_camera"), dtype=np.float64
             ),
-            camera_state_provenance=camera_state,
+            camera_T_object=np.asarray(
+                moving_target.get("camera_T_object"), dtype=np.float64
+            ),
+            target_provenance=moving_target,
+            committed_route_progress_index=int(payload["committed_route_progress_index"]),
         )
 
     def close(self) -> None:

@@ -18,18 +18,22 @@ rejected approaches, and remaining physical limits.
 - Inspection, candidate generation, Ferguson solving, and CuRobo planning do
   not create robot command publishers.
 - CUDA planning runs in one persistent separate Python 3.11 process per task.
-  It is started and warmed before SPACE, never imports Unitree transport code,
+  It is launched as soon as the hardware command starts, never imports Unitree
+  transport code,
   and remains alive for the reversible supported escape, clearance-boundary
   pregrasp selection, corrected remaining-task plan, MPC, and measured-contact
   validation. The default trajectory path retains a small lazy per-arm pool of
   fixed-shape open-hand and attached-payload optimizers plus their strict and
   fixed-close checkers. Compatible locked-joint values, scenes, and attachments
   are updated in place; left/right or open/payload topologies never share a
-  slot. After the supported escape is solved but before its first changing
-  target is published, the worker constructs and exercises the selected arm's
-  open and payload optimizer graphs. This is construction-only warmup: it does
-  not create a nominal task or replace fresh boundary feasibility. ROS/control
-  runs in Python 3.10 and keeps publishing through the
+  slot. As soon as the read-only preflight supplies the selected arm and object
+  topology, the worker constructs and exercises the selected arm's open and
+  payload optimizer graphs while the preview and SPACE prompt remain active.
+  MPC mode also constructs its one retained moving-grasp solver there. This is
+  command-free topology warmup: it does not create a nominal task or replace
+  fresh boundary feasibility. After SPACE, the retained objects are rebound to
+  the fresh loaded and clearance states without rebuilding their CUDA graphs.
+  ROS/control runs in Python 3.10 and keeps publishing through the
   commissioned fixed-rate Unitree controller while planning is in progress.
 - Hardware commands require the exact harness/workspace acknowledgement and a
   second interactive SPACE after a read-only live preflight.

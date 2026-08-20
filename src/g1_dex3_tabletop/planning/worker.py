@@ -18,7 +18,6 @@ from g1_dex3_tabletop.planning.curobo_backend import (
     plan_calibration,
     plan_dex3_preparation,
 )
-from g1_dex3_tabletop.planning.tabletop_mpc import benchmark_from_paths
 from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
     plan_supported_escape,
@@ -100,28 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
         "serve-tabletop",
         help="serve lifecycle planning and retention validation over stdin/stdout",
     )
-    benchmark = subparsers.add_parser(
-        "benchmark-tabletop-mpc",
-        help="offline legacy full-lifecycle MPC regression for retained plans",
-    )
-    benchmark.add_argument("--loaded-request", type=Path, required=True)
-    benchmark.add_argument("--clearance-request", type=Path, required=True)
-    benchmark.add_argument("--plan", type=Path, required=True)
-    benchmark.add_argument("--output", type=Path, required=True)
-    benchmark.add_argument(
-        "--grasp-close",
-        type=Path,
-        help="retained hardware grasp_close.json used for attached-payload replay",
-    )
-    benchmark.add_argument(
-        "--camera-state-estimate",
-        type=Path,
-        help=(
-            "retained CameraStateEstimate or estimator installation-check JSON used "
-            "for command-free state-corrected replay"
-        ),
-    )
-    benchmark.add_argument("--maximum-steps", type=int, default=300)
     waist = subparsers.add_parser(
         "analyze-waist-yaw",
         help=("compare locked-waist and bounded waist-yaw pregrasp IK on a retained request"),
@@ -181,18 +158,11 @@ def _serve_tabletop() -> int:
                 def progress(text: str, *, event_id: int = request_id) -> None:
                     _emit({"type": "progress", "id": event_id, "message": text})
 
-                if command == "prepare-mpc-phase":
+                if command == "prepare-moving-grasp-mpc":
                     request_payload = message["payload"]
-                    measured_fingers = request_payload.get("measured_active_dex3_q_rad")
-                    payload = session.prepare_mpc_phase(
-                        str(request_payload["phase"]),
-                        measured_active_dex3_q_rad=measured_fingers,
-                        reference_T_camera0=(
-                            None
-                            if request_payload.get("reference_T_camera0") is None
-                            else np.asarray(
-                                request_payload["reference_T_camera0"], dtype=np.float64
-                            )
+                    payload = session.prepare_moving_grasp_mpc(
+                        reference_T_camera0=np.asarray(
+                            request_payload["reference_T_camera0"], dtype=np.float64
                         ),
                     )
                     event = {
@@ -202,10 +172,13 @@ def _serve_tabletop() -> int:
                         "operation": command,
                         "payload": payload,
                     }
-                elif command == "prewarm-tabletop-at-clearance":
+                elif command == "prewarm-tabletop-runtime":
                     request = TabletopTaskRequest.from_json(Path(message["payload"]["request"]))
-                    payload = session.prewarm_task_at_clearance(
+                    payload = session.prewarm_runtime(
                         request,
+                        moving_grasp_mpc=bool(
+                            message["payload"].get("moving_grasp_mpc", False)
+                        ),
                         progress=progress,
                     )
                     event = {
@@ -215,8 +188,8 @@ def _serve_tabletop() -> int:
                         "operation": command,
                         "payload": payload,
                     }
-                elif command == "step-mpc-phase":
-                    window = session.step_mpc_phase(message["payload"])
+                elif command == "step-moving-grasp-mpc":
+                    window = session.step_moving_grasp_mpc(message["payload"])
                     event = {
                         "type": "result",
                         "id": request_id,
@@ -307,20 +280,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "serve-tabletop":
             return _serve_tabletop()
-        if args.command == "benchmark-tabletop-mpc":
-            if args.output.exists():
-                raise FileExistsError(f"planner output already exists: {args.output}")
-            result = benchmark_from_paths(
-                args.loaded_request,
-                args.clearance_request,
-                args.plan,
-                args.output,
-                maximum_steps=args.maximum_steps,
-                grasp_close_path=args.grasp_close,
-                camera_state_estimate_path=args.camera_state_estimate,
-            )
-            print(json.dumps(result, indent=2, sort_keys=True))
-            return 0
         if args.command == "analyze-waist-yaw":
             if args.output.exists():
                 raise FileExistsError(f"planner output already exists: {args.output}")

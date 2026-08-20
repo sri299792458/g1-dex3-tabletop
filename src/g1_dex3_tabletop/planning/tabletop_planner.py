@@ -4950,12 +4950,19 @@ def _plan_tabletop(
             _cleanup(planner)
 
 
-def prewarm_tabletop_task_models(
+def prewarm_tabletop_runtime_models(
     request: TabletopTaskRequest,
     *,
     planner_pool: TabletopPlannerPool,
 ) -> dict[str, Any]:
-    """Construct every topology needed after motion starts, without solving a task."""
+    """Warm persistent MotionGen topologies before robot ownership.
+
+    The strict checker is an implementation dependency of the resolved open
+    planner, not a separate warmup target.  The state-dependent 14-DOF
+    fixed-close validator is intentionally omitted: retained timings showed
+    that resolving it here did not avoid resolving it again at the live
+    clearance boundary.
+    """
 
     import torch
     from curobo.types import DeviceCfg
@@ -5001,19 +5008,7 @@ def prewarm_tabletop_task_models(
         .cpu()
         .numpy()
     )
-    plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
-    fixed_close_validator, fixed_close_event = planner_pool.acquire_fixed_close_validator(
-        configuration_key=_fixed_close_configuration_key(request),
-        request=request,
-        base_T_object=base_T_object,
-        base_T_detected_object=_base_T_detected_object(request, base_T_torso),
-        plane_point=plane_point,
-        down=down,
-        open_q=open_q,
-        close_target_q=close_target_q,
-    )
-    if fixed_close_validator.arm != arm:
-        raise RuntimeError("fixed-close prewarm returned another arm's checker")
+    _plane_point, _base_T_object, down = _table_from_resting_object(request, base_T_torso)
 
     _use_moving_grasp_frame_only(query_robot, arm=arm)
     open_robot = _resolved_motion_robot(
@@ -5068,13 +5063,13 @@ def prewarm_tabletop_task_models(
         down=down,
     )
     return {
-        "operation": "prewarm_tabletop_task_models",
+        "operation": "prewarm_tabletop_runtime_models",
         "arm": arm,
         "elapsed_s": time.monotonic() - started,
-        "strict_checker": strict_event,
-        "fixed_close_validator": fixed_close_event,
+        "strict_checker_dependency": strict_event,
         "open_optimizer": {**open_event, "probe": open_probe},
         "attached_optimizer": {**attached_event, "probe": attached_probe},
+        "fixed_close_validator_deferred_to_live_boundary": True,
         "task_feasibility_planning_performed": False,
         "robot_command_authorized": False,
     }

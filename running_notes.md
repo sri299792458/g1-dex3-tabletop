@@ -4705,3 +4705,43 @@ Primary references:
 - `--maximum-arm-velocity-rad-s` remains available for deliberately slower
   runs. The independent hardware ceiling remains `0.200 rad/s`; Dex3 posture
   timing is unchanged.
+
+## 2026-08-20 — Planner lifecycle begins with the hardware command
+
+- The isolated CUDA worker is now spawned immediately after the hardware run
+  lock is acquired, before ROS initialization, camera startup, or the read-only
+  preview. No Unitree command publisher is created by this worker.
+- Once read-only preflight supplies the selected arm, object profile, and
+  presentation topology, command-free warmup runs asynchronously while the
+  preview and SPACE prompt remain active. It retains the open-hand and
+  attached-payload MotionGen models. MPC mode additionally retains one
+  provisional moving-grasp solver; trajectory mode does not pay that cost.
+- SPACE still gates every robot command. If it is pressed before warmup has
+  completed, the command path waits for the worker and surfaces any warmup
+  failure before creating the recorder or command publisher. Preflight
+  observations are never accepted as executable feasibility evidence.
+- The retained moving-grasp solver is rebound after the fresh loaded and
+  clearance observations to the exact selected route, live scene, locked
+  joints, object pose, and state-estimator reference. Scene topology must match
+  exactly. A mismatch fails instead of silently rebuilding or using stale
+  geometry.
+- A command-free retained 60 mm left-arm replay measured `17.842 s` of
+  MotionGen plus MPC construction/warmup before motion. Exact live planning
+  then measured `3.547 s` for supported escape and `10.633 s` for the complete
+  clearance task. Binding the retained MPC to
+  `cube_head__seed_0000000039__sample_205` took `1.499 s`
+  (`1.377 s` live kinematic/scene rebind and `0.114 s` route setup), versus the
+  previous approximately `6--11 s` disposable MPC construction path. All ten
+  execution edges and the selected grasp were preserved.
+- The fixed-close validator is intentionally not constructed from the
+  preflight state. Measurements showed its locked-state model still had to be
+  resolved again at clearance, so doing both added work without reducing the
+  live-boundary latency.
+- Production MPC is now limited in code as well as policy to the visually
+  updated pregrasp-to-grasp segment. The obsolete multi-phase lifecycle
+  benchmark, phase switching API, and nominal route-tracking window path were
+  removed. MotionGen continues to own global, payload, placement, and return
+  motion.
+- Final verification passed Ruff, `414 passed, 7 skipped` in the control
+  environment, and `414 passed, 1 skipped` in the CUDA planner environment. No
+  robot command was sent during implementation or replay.

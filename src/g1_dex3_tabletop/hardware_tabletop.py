@@ -614,7 +614,6 @@ def _execute_mpc_phase(
     trajectory,
     plan_sha256: str,
     control_config,
-    measured_active_dex3_q_rad=None,
     phase_record: dict | None = None,
     moving_target_provider=None,
     reference_T_camera0=None,
@@ -626,19 +625,11 @@ def _execute_mpc_phase(
     if prepared_mpc is None:
         try:
             preparation_event = planner.request_payload(
-                "prepare-mpc-phase",
+                "prepare-moving-grasp-mpc",
                 payload={
-                    "phase": phase,
-                    "measured_active_dex3_q_rad": (
-                        None
-                        if measured_active_dex3_q_rad is None
-                        else list(measured_active_dex3_q_rad)
-                    ),
-                    "reference_T_camera0": (
-                        None
-                        if reference_T_camera0 is None
-                        else np.asarray(reference_T_camera0, dtype=np.float64).tolist()
-                    ),
+                    "reference_T_camera0": np.asarray(
+                        reference_T_camera0, dtype=np.float64
+                    ).tolist(),
                 },
                 control_check=driver.check,
                 timeout_s=30.0,
@@ -724,7 +715,7 @@ def _execute_mpc_phase(
         if request_timeout_s <= 0.0:
             raise RuntimeError("CuRobo MPC handoff deadline passed before the solve was submitted")
         event = planner.request_payload(
-            "step-mpc-phase",
+            "step-moving-grasp-mpc",
             payload={
                 "phase": phase,
                 "handoff_predicted_q_rad": list(boundary.predicted_q_rad),
@@ -1026,6 +1017,7 @@ def run_tabletop(args) -> int:
     node = rclpy_module = None
     raw_recorder = None
     guard = synchronized = driver = planner = None
+    runtime_warmup = None
     mpc_phases: dict[str, dict] = {}
     cube_anchor_motion = None
     camera_state_inputs = CameraStateInputBuffer()
@@ -1039,6 +1031,16 @@ def run_tabletop(args) -> int:
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
+        planner = PersistentTabletopPlanner(
+            executable=ROOT / ".venv-planner/bin/g1-curobo-worker",
+            log_path=task_run / "planner.log",
+        )
+        planner.launch()
+        print(
+            "PLANNER STARTED — isolated CUDA initialization is running concurrently "
+            "with read-only robot and camera preflight; no command publisher exists",
+            flush=True,
+        )
         try:
             import rclpy
         except ImportError as error:
@@ -1089,7 +1091,7 @@ def run_tabletop(args) -> int:
             )
             if preflight_frames[-1].camera_info.profile_sha256 != expected_camera.profile_sha256:
                 raise ValueError("live camera profile differs from hardware.yaml")
-            observe_resting_cube(
+            preflight_observation = observe_resting_cube(
                 [item.image_bgr for item in preflight_frames],
                 camera_info=expected_camera,
                 detector=detector,
@@ -1111,15 +1113,32 @@ def run_tabletop(args) -> int:
                     "CuRobo obstacle",
                     flush=True,
                 )
-            planner = PersistentTabletopPlanner(
-                executable=ROOT / ".venv-planner/bin/g1-curobo-worker",
-                log_path=task_run / "planner.log",
+            preflight_request = build_tabletop_request(
+                arm=arm,
+                observation=preflight_observation,
+                calibration_bundle=bundle,
+                calibration_bundle_path=args.calibration_bundle,
+                grasp_shortlist_path=grasp_shortlist_path,
+                task_config_path=args.task_config,
+                object_dimensions_m=object_profile.dimensions_m,
+                maximum_arm_velocity_rad_s=task_velocity,
+                presentation_id=presentation.presentation_id,
+                fixture=presentation.fixture,
             )
-            planner.start()
+            preflight_warmup_request_path = task_run / "preflight_warmup_request.json"
+            preflight_request.write_json(preflight_warmup_request_path)
+            runtime_warmup = planner.begin_payload_request(
+                "prewarm-tabletop-runtime",
+                payload={
+                    "request": str(preflight_warmup_request_path.resolve()),
+                    "moving_grasp_mpc": args.motion_controller == "mpc",
+                },
+            )
             print(
-                "PLANNER READY — one isolated CUDA worker is warm and will remain alive "
-                "for lifecycle planning and measured-contact validation; no robot command "
-                "publisher exists",
+                "RUNTIME WARMUP QUEUED — generic CUDA initialization, MotionGen"
+                f"{' and moving-grasp MPC' if args.motion_controller == 'mpc' else ''} "
+                "warmup will run continuously while the read-only preview remains active; "
+                "SPACE still authorizes only later command-publisher creation",
                 flush=True,
             )
             _wait_for_space_with_preview(
@@ -1128,6 +1147,18 @@ def run_tabletop(args) -> int:
                 camera,
                 arm=arm,
                 no_window=args.no_window,
+            )
+            warmup_event = planner.finish_request(runtime_warmup, timeout_s=180.0)
+            runtime_warmup = None
+            atomic_write_json(
+                task_run / "runtime_warmup.json",
+                warmup_event["payload"],
+            )
+            print(
+                "RUNTIME WARMUP READY — persistent MotionGen"
+                f"{' and moving-grasp MPC' if args.motion_controller == 'mpc' else ''} "
+                "models completed before robot ownership",
+                flush=True,
             )
             if args.hardware_config.read_bytes() != hardware_bytes:
                 raise RuntimeError("hardware configuration changed after preflight")
@@ -1261,22 +1292,6 @@ def run_tabletop(args) -> int:
                 raise TabletopTaskRejected(f"supported escape planning failed: {error}") from error
             escape = SupportedEscapePlan.from_json(escape_path)
             clearance_request = request_at_clearance(loaded_request, escape)
-            initial_clearance_request_path = task_run / "initial_clearance_request.json"
-            clearance_request.write_json(initial_clearance_request_path)
-            try:
-                prewarm_event = planner.request_payload(
-                    "prewarm-tabletop-at-clearance",
-                    payload={"request": str(initial_clearance_request_path.resolve())},
-                    control_check=driver.check,
-                    timeout_s=180.0,
-                )
-            except (PlannerRequestRejected, RuntimeError) as error:
-                driver.check()
-                raise TabletopTaskRejected(f"pre-motion planner warmup failed: {error}") from error
-            atomic_write_json(
-                task_run / "pre_motion_planner_warmup.json",
-                prewarm_event["payload"],
-            )
             pose_set = pose_set_from_trajectories(
                 arm=arm,
                 trajectories=(escape.outbound, escape.inbound),
@@ -1292,10 +1307,9 @@ def run_tabletop(args) -> int:
             )
             print(
                 "PRE-MOTION PLANNING READY — the reversible supported escape is frozen; "
-                "open-hand, fixed-close, and attached-payload CUDA models were constructed "
-                "against the predicted clearance state without solving a nominal task. "
-                "The real task will still be planned from a fresh fixed-cube observation at "
-                "clearance",
+                "persistent MotionGen CUDA models were already warmed before ownership. "
+                "The real task will still be planned from a fresh fixed-cube observation "
+                "at clearance",
                 flush=True,
             )
             initial_left = held_hands.left.position
@@ -1537,10 +1551,8 @@ def run_tabletop(args) -> int:
                     )
                     stage_plan_sha256 = replanned_execution.content_sha256
                     preparation_event = planner.request_payload(
-                        "prepare-mpc-phase",
+                        "prepare-moving-grasp-mpc",
                         payload={
-                            "phase": "grasp_approach",
-                            "measured_active_dex3_q_rad": None,
                             "reference_T_camera0": np.asarray(
                                 reference_T_camera0,
                                 dtype=np.float64,
@@ -1630,7 +1642,6 @@ def run_tabletop(args) -> int:
             def execute_phase(
                 name: str,
                 *,
-                measured_active_dex3_q_rad=None,
                 use_mpc: bool = True,
             ) -> dict | None:
                 if args.motion_controller == "mpc" and use_mpc and name == "grasp_approach":
@@ -1650,7 +1661,6 @@ def run_tabletop(args) -> int:
                         trajectory=normal_routes[name],
                         plan_sha256=active_plan_sha256,
                         control_config=control_config,
-                        measured_active_dex3_q_rad=measured_active_dex3_q_rad,
                         phase_record=phase_record,
                         moving_target_provider=current_moving_grasp_target,
                         reference_T_camera0=reference_T_camera0,
@@ -2238,10 +2248,7 @@ def run_tabletop(args) -> int:
                 f"{retention_test_lift_mm:.1f} mm retention checkpoint within the payload lift",
                 flush=True,
             )
-            execute_phase(
-                "retention_test_lift",
-                measured_active_dex3_q_rad=grasp_close.close_q_rad,
-            )
+            execute_phase("retention_test_lift")
             try:
                 retention_evidence = dex_controller.verify_retention_at_lifted_checkpoint(
                     safety_heartbeat=lambda: (driver.check(), guard.pulse()),
@@ -2268,18 +2275,9 @@ def run_tabletop(args) -> int:
                 "the support; continuing the payload lift",
                 flush=True,
             )
-            execute_phase(
-                "payload_lift",
-                measured_active_dex3_q_rad=grasp_close.close_q_rad,
-            )
-            execute_phase(
-                "payload_lower",
-                measured_active_dex3_q_rad=grasp_close.close_q_rad,
-            )
-            execute_phase(
-                "payload_replace",
-                measured_active_dex3_q_rad=grasp_close.close_q_rad,
-            )
+            execute_phase("payload_lift")
+            execute_phase("payload_lower")
+            execute_phase("payload_replace")
             open_active_hand("cube release after exact replacement")
             execute_phase("grasp_retreat")
             execute_return_to_clearance(use_mpc=True)
