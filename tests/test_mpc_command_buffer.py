@@ -50,7 +50,6 @@ def _buffer() -> RollingMPCCommandBuffer:
     return RollingMPCCommandBuffer(
         plan_sha256=PLAN_HASH,
         maximum_velocity_rad_s=0.2,
-        maximum_window_gap_s=0.05,
         maximum_handoff_position_error_rad=0.08,
         maximum_handoff_velocity_error_rad_s=0.2,
         activation_lateness_s=0.01,
@@ -145,7 +144,7 @@ def test_measured_state_plan_translation_validates_inputs() -> None:
         )
 
 
-def test_buffer_uses_absolute_time_instead_of_receipt_time() -> None:
+def test_buffer_uses_absolute_time_and_holds_the_certified_endpoint() -> None:
     buffer = _buffer()
     window = _window()
     buffer.install(window, now_s=10.05, active_command_q_rad=np.zeros(7))
@@ -165,10 +164,62 @@ def test_buffer_uses_absolute_time_instead_of_receipt_time() -> None:
         0.005,
     )
     assert buffer.remaining_s(now_s=10.17) == pytest.approx(0.15)
-    with pytest.raises(RuntimeError, match="expired"):
+    assert np.allclose(
         buffer.command(
             now_s=10.371, measured_q_rad=np.full(7, 0.02), measured_dq_rad_s=np.zeros(7)
-        )
+        ),
+        0.02,
+    )
+
+
+def test_next_window_can_restart_from_a_held_certified_endpoint() -> None:
+    buffer = _buffer()
+    first = _window(route_progress=6, predicted_dq_rad_s=0.0)
+    buffer.install(first, now_s=10.05, active_command_q_rad=np.zeros(7))
+    buffer.command(now_s=10.12, measured_q_rad=np.zeros(7), measured_dq_rad_s=np.zeros(7))
+    buffer.command(now_s=10.40, measured_q_rad=np.full(7, 0.02), measured_dq_rad_s=np.zeros(7))
+
+    boundary = buffer.handoff_boundary(
+        now_s=10.40,
+        minimum_lead_s=0.12,
+        handoff_quantum_s=0.04,
+    )
+    assert boundary.valid_from_monotonic_s == pytest.approx(10.52)
+    assert boundary.command_q_rad == pytest.approx((0.02,) * 7)
+    assert boundary.predicted_q_rad == pytest.approx((0.02,) * 7)
+    assert boundary.predicted_dq_rad_s == pytest.approx((0.0,) * 7)
+    assert boundary.predecessor_sha256 == first.content_sha256
+    assert boundary.committed_route_progress_index == 6
+
+    second = _window(
+        generation=1,
+        source_s=10.41,
+        valid_from_s=boundary.valid_from_monotonic_s,
+        start_q=0.02,
+        end_q=0.024,
+        predecessor_sha256=boundary.predecessor_sha256,
+        terminal=True,
+        route_progress=10,
+        predicted_dq_rad_s=0.0,
+    )
+    buffer.install(second, now_s=10.45, active_command_q_rad=np.full(7, 0.02))
+    assert np.allclose(
+        buffer.command(
+            now_s=10.50,
+            measured_q_rad=np.full(7, 0.02),
+            measured_dq_rad_s=np.zeros(7),
+        ),
+        0.02,
+    )
+    assert np.allclose(
+        buffer.command(
+            now_s=10.52,
+            measured_q_rad=np.full(7, 0.02),
+            measured_dq_rad_s=np.zeros(7),
+        ),
+        0.02,
+    )
+    assert buffer.terminal
 
 
 def test_next_window_starts_at_exact_certified_future_boundary() -> None:

@@ -412,7 +412,7 @@ def test_executor_streams_exact_future_handoff_then_settles_terminal_window() ->
     np.testing.assert_allclose(executor.calibration_command_q, 0.02)
 
 
-def test_executor_faults_when_nonterminal_mpc_window_is_not_replenished() -> None:
+def test_executor_holds_nonterminal_mpc_endpoint_while_waiting_for_replan() -> None:
     clock, transport, executor = subject()
     executor.acquire(operator_confirmed=True)
     advance_until(transport, executor, ExecutorState.READY)
@@ -433,11 +433,14 @@ def test_executor_faults_when_nonterminal_mpc_window_is_not_replenished() -> Non
     for _ in range(26):
         transport.step(0.02)
         executor.tick()
-        if executor.state is ExecutorState.FAULT:
-            break
+    assert executor.state is ExecutorState.MOVING
+    assert executor.fault_reason is None
+    assert executor.streaming_trajectory_status()["remaining_s"] == pytest.approx(0.0)
+    np.testing.assert_allclose(executor.calibration_command_q, 0.01)
 
-    assert executor.state is ExecutorState.FAULT
-    assert "MPC command trajectory expired" in (executor.fault_reason or "")
+    executor.finish_streaming_trajectory()
+    advance_until(transport, executor, ExecutorState.READY)
+    assert executor.current_pose_id is None
 
 
 def test_executor_can_finish_a_nonterminal_certified_window_and_settle() -> None:

@@ -814,20 +814,11 @@ def _execute_mpc_phase(
     if phase_record is not None:
         phase_record["windows"].append(accepted.to_dict())
 
-    def finish_active_after_failure(error: BaseException) -> None:
-        """Finish the untouched active horizon before surfacing a planner fault."""
-
-        synchronized.finish_streaming_trajectory()
-        _wait_ready(
-            synchronized,
-            driver,
-            timeout_s=control_config.motion_timeout_s,
-            label=f"{phase} certified MPC fallback settle",
-        )
-        raise RuntimeError(
-            f"CuRobo MPC stopped {phase} at the endpoint of its last certified "
-            f"horizon after planning failed: {error}"
-        ) from error
+    def horizon_state() -> str:
+        remaining_s = float(synchronized.streaming_trajectory_status()["remaining_s"])
+        if remaining_s > 0.0:
+            return f"the active certified horizon has {remaining_s:.3f}s remaining"
+        return "the controller is holding its certified stationary endpoint"
 
     while synchronized.state is ExecutorState.MOVING:
         driver.check()
@@ -844,22 +835,46 @@ def _execute_mpc_phase(
         try:
             window = request_window()
         except (PlannerRequestRejected, RuntimeError, ValueError) as error:
-            finish_active_after_failure(error)
+            # Confirm this was not a controller/transport failure before
+            # treating it as an unavailable planner update.
+            driver.check()
+            if phase_record is not None:
+                phase_record.setdefault("rejected_attempts", []).append(
+                    {"error_type": type(error).__name__, "error": str(error)}
+                )
+            print(
+                "CuRobo MPC update produced no certifiable replacement: "
+                f"{error}; {horizon_state()}; retrying from a fresh "
+                "cube/body observation",
+                flush=True,
+            )
+            continue
         if not window.feasible:
             if phase_record is not None:
                 phase_record.setdefault("rejected_windows", []).append(window.to_dict())
             print(
-                "CuRobo MPC rejected one replacement window; continuing the "
-                "unchanged active certified horizon and retrying",
+                "CuRobo MPC rejected replacement window "
+                f"{window.generation}: {_mpc_window_rejection_reason(window)}; "
+                f"{horizon_state()}; retrying from a fresh cube/body observation",
                 flush=True,
             )
             continue
         try:
             accepted = synchronized.update_streaming_trajectory(window=window)
         except (TypeError, ValueError, RuntimeError) as error:
+            driver.check()
             if phase_record is not None:
                 phase_record.setdefault("rejected_windows", []).append(window.to_dict())
-            finish_active_after_failure(error)
+                phase_record.setdefault("rejected_attempts", []).append(
+                    {"error_type": type(error).__name__, "error": str(error)}
+                )
+            print(
+                "CuRobo MPC replacement missed executor certification: "
+                f"{error}; {horizon_state()}; retrying from a fresh "
+                "cube/body observation",
+                flush=True,
+            )
+            continue
         windows.append(accepted.to_dict())
         if phase_record is not None:
             phase_record["windows"].append(accepted.to_dict())

@@ -4797,3 +4797,41 @@ Primary references:
 - Verification passed Ruff, `416 passed, 7 skipped` in the control environment,
   and `416 passed, 1 skipped` in the CUDA planner environment. No robot command
   was sent while diagnosing or implementing the change.
+
+## 2026-08-20 — Replacement-window rejection no longer expires robot control
+
+- Physical run `tabletop_20260820T232437Z` accepted its second initial MPC
+  solve, then rejected generations 2--4 because the translated command path put
+  `left_hand_middle_1_link` only `3.736--3.885 mm` above the table against the
+  unchanged `5.000 mm` requirement. Those collision rejections were correct.
+  The cube moved only `0.42--0.48 mm`, the camera/body correction was only
+  `1.15--1.37 mm`, and each complete CUDA solve plus validation took
+  `88--91 ms`.
+- The actual failure was a wrapper lifecycle error. Its certified generation-1
+  window ended after `0.800 s`; a subsequent one-frame camera wait was allowed
+  to outlive the remaining horizon, and the command buffer treated being
+  `0.2521 s` past that horizon as a controller fault. This conflated planner
+  availability with the health of the independent 250 Hz robot controller.
+- Production feasible MPC windows already require a decelerated endpoint; the
+  retained accepted window ended at exactly zero predicted velocity and
+  acceleration. The fixed-rate controller now continues publishing that exact
+  endpoint for as long as a replacement is unavailable. A later feasible
+  window can splice from the held endpoint on the same hash-bound predecessor
+  and warm-start chain, even when its handoff is later than the prior horizon.
+- The obsolete `maximum_window_gap_s` path was removed. It had incorrectly
+  reused the executor's real control-loop scheduling-gap threshold as a
+  high-level planning deadline. Control-loop timing, source freshness, live
+  handoff error, collision, velocity, DDS/transport, and PC2 heartbeat checks
+  are unchanged and still fail closed.
+- Rejection logging now includes the generation, concrete collision or bound
+  reason, and whether the prior certified horizon is still running or its
+  endpoint is being held. This is a narrow correction to the existing rolling
+  controller, not a second restart state machine.
+- Reference correction: NVIDIA STORM has public MPPI MPC and Franka controller
+  code, but it is not NVIDIA's newer Grasp-MPC system. Grasp-MPC uses an
+  ordinary planner to reach pregrasp and closed-loop vision MPC for the final
+  grasp; its project page still lists code as forthcoming. Therefore no public
+  Grasp-MPC hardware wrapper was available to copy for this failure policy.
+- Verification passed Ruff and `418 passed, 7 skipped` in the control
+  environment; the CUDA planner environment passed `418 passed, 1 skipped`.
+  No robot command was sent.

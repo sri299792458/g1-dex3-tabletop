@@ -495,7 +495,6 @@ class PoseExecutor:
         buffer = RollingMPCCommandBuffer(
             plan_sha256=plan_sha256,
             maximum_velocity_rad_s=self.config.maximum_joint_velocity_rad_s,
-            maximum_window_gap_s=self.config.control_gap_fault_s,
             maximum_handoff_position_error_rad=self.config.motion_position_tolerance_rad,
             maximum_handoff_velocity_error_rad_s=self.config.maximum_joint_velocity_rad_s,
             activation_lateness_s=2.0 * self.config.nominal_tick_period_s,

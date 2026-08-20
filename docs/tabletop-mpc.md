@@ -107,10 +107,14 @@ published. Finger motion is not controlled by MPC.
 ## Failure behavior
 
 An infeasible or late MPC result never replaces the active certified horizon.
-The executor finishes the unchanged horizon and holds its endpoint. A rejected
-physical close or post-grasp continuation opens the hand and uses the already
-installed exact reverse. Controller, transport, or watchdog failures retain the
-commissioned fail-closed ownership path.
+The executor finishes that horizon and continues publishing its certified
+stationary endpoint while perception and planning retry. A later feasible
+window may splice from the held endpoint on the same predecessor chain. There
+is deliberately no planner-window expiry fault: the independent fixed-rate
+control-loop gap, robot-state freshness, handoff error, transport, and PC2
+watchdog checks remain the safety authorities. A rejected physical close or
+post-grasp continuation opens the hand and uses the already installed exact
+reverse.
 
 Before the first MPC window is installed, the arm is still stationary at the
 MotionGen pregrasp. An infeasible optimizer result therefore leaves the arm

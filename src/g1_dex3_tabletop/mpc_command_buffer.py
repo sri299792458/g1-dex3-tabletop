@@ -284,7 +284,6 @@ class RollingMPCCommandBuffer:
         *,
         plan_sha256: str,
         maximum_velocity_rad_s: float,
-        maximum_window_gap_s: float,
         maximum_handoff_position_error_rad: float,
         maximum_handoff_velocity_error_rad_s: float,
         activation_lateness_s: float,
@@ -293,7 +292,6 @@ class RollingMPCCommandBuffer:
             raise ValueError("MPC plan SHA-256 must contain 64 characters")
         for name, value in (
             ("maximum_velocity_rad_s", maximum_velocity_rad_s),
-            ("maximum_window_gap_s", maximum_window_gap_s),
             ("maximum_handoff_position_error_rad", maximum_handoff_position_error_rad),
             ("maximum_handoff_velocity_error_rad_s", maximum_handoff_velocity_error_rad_s),
             ("activation_lateness_s", activation_lateness_s),
@@ -302,7 +300,6 @@ class RollingMPCCommandBuffer:
                 raise ValueError(f"{name} must be positive and finite")
         self.plan_sha256 = plan_sha256
         self.maximum_velocity_rad_s = float(maximum_velocity_rad_s)
-        self.maximum_window_gap_s = float(maximum_window_gap_s)
         self.maximum_handoff_position_error_rad = float(maximum_handoff_position_error_rad)
         self.maximum_handoff_velocity_error_rad_s = float(maximum_handoff_velocity_error_rad_s)
         self.activation_lateness_s = float(activation_lateness_s)
@@ -403,17 +400,24 @@ class RollingMPCCommandBuffer:
         else:
             if window.predecessor_sha256 != self._active.content_sha256:
                 raise ValueError("MPC trajectory predecessor is not the active trajectory")
-            if window.valid_from_monotonic_s > self._active.expiration_monotonic_s:
-                raise ValueError("MPC handoff occurs after the active trajectory expires")
-            old_command = self._active.sample_command(monotonic_s=window.valid_from_monotonic_s)
+            # A certified window ends in a stationary position target.  If
+            # perception or optimization needs longer than that horizon, the
+            # fixed-rate controller keeps publishing the endpoint.  A later
+            # window therefore splices from that held endpoint rather than
+            # turning planner availability into a robot-control fault.
+            predecessor_sample_s = min(
+                window.valid_from_monotonic_s,
+                self._active.expiration_monotonic_s,
+            )
+            old_command = self._active.sample_command(monotonic_s=predecessor_sample_s)
             old_predicted = self._active.sample_predicted_q(
-                monotonic_s=window.valid_from_monotonic_s
+                monotonic_s=predecessor_sample_s
             )
             old_predicted_dq = self._active.sample_predicted_dq(
-                monotonic_s=window.valid_from_monotonic_s
+                monotonic_s=predecessor_sample_s
             )
             old_predicted_ddq = self._active.sample_predicted_ddq(
-                monotonic_s=window.valid_from_monotonic_s
+                monotonic_s=predecessor_sample_s
             )
             continuity_error = float(np.max(np.abs(first_command - old_command)))
             predicted_error = float(
@@ -491,14 +495,21 @@ class RollingMPCCommandBuffer:
         relative = max(now + lead - self._active.valid_from_monotonic_s, 0.0)
         handoff_offset = math.ceil((relative - 1.0e-12) / quantum) * quantum
         valid_from = self._active.valid_from_monotonic_s + handoff_offset
-        if valid_from > self._active.expiration_monotonic_s + 1.0e-12:
-            raise RuntimeError("active MPC trajectory has insufficient certified horizon")
+        predecessor_sample_s = min(valid_from, self._active.expiration_monotonic_s)
         return MPCHandoffBoundary(
             valid_from_monotonic_s=valid_from,
-            command_q_rad=tuple(self._active.sample_command(monotonic_s=valid_from)),
-            predicted_q_rad=tuple(self._active.sample_predicted_q(monotonic_s=valid_from)),
-            predicted_dq_rad_s=tuple(self._active.sample_predicted_dq(monotonic_s=valid_from)),
-            predicted_ddq_rad_s2=tuple(self._active.sample_predicted_ddq(monotonic_s=valid_from)),
+            command_q_rad=tuple(
+                self._active.sample_command(monotonic_s=predecessor_sample_s)
+            ),
+            predicted_q_rad=tuple(
+                self._active.sample_predicted_q(monotonic_s=predecessor_sample_s)
+            ),
+            predicted_dq_rad_s=tuple(
+                self._active.sample_predicted_dq(monotonic_s=predecessor_sample_s)
+            ),
+            predicted_ddq_rad_s2=tuple(
+                self._active.sample_predicted_ddq(monotonic_s=predecessor_sample_s)
+            ),
             predecessor_sha256=self._active.content_sha256,
             committed_route_progress_index=self.committed_route_progress_index,
         )
@@ -542,12 +553,6 @@ class RollingMPCCommandBuffer:
             if self._prestart_command_q is None:
                 raise RuntimeError("no MPC command trajectory has been installed")
             return self._prestart_command_q.copy()
-        if now > self._active.expiration_monotonic_s + self.maximum_window_gap_s:
-            raise RuntimeError(
-                "MPC command trajectory expired "
-                f"{now - self._active.expiration_monotonic_s:.4f}s ago; "
-                f"limit is {self.maximum_window_gap_s:.4f}s"
-            )
         sample_time = min(
             max(now, self._active.valid_from_monotonic_s),
             self._active.expiration_monotonic_s,

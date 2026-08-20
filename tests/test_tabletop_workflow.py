@@ -427,6 +427,116 @@ def test_mpc_initial_window_timeout_never_starts_streaming() -> None:
     assert not synchronized.started
 
 
+def test_mpc_retries_a_rejected_replacement_from_the_unchanged_predecessor() -> None:
+    q = (0.0,) * 7
+    calls = []
+
+    class Synchronized:
+        state = ExecutorState.READY
+        active = None
+
+        def observe_state(self):
+            return SimpleNamespace(receipt_monotonic_s=10.0)
+
+        def prepare_streaming_handoff(self, **_kwargs):
+            return SimpleNamespace(
+                predicted_q_rad=q,
+                predicted_dq_rad_s=q,
+                predicted_ddq_rad_s2=q,
+                command_q_rad=q,
+                valid_from_monotonic_s=time.monotonic() + 1.0,
+                predecessor_sha256=(
+                    None if self.active is None else self.active.content_sha256
+                ),
+                committed_route_progress_index=0,
+            )
+
+        def start_streaming_trajectory(self, *, window, **_kwargs):
+            self.active = window
+            self.state = ExecutorState.MOVING
+            return window
+
+        def streaming_trajectory_status(self):
+            return {
+                "terminal": False,
+                "active": True,
+                "queued": False,
+                "terminal_pending": False,
+                "remaining_s": 0.0,
+            }
+
+        def update_streaming_trajectory(self, *, window):
+            assert window.predecessor_sha256 == self.active.content_sha256
+            self.active = window
+            self.state = ExecutorState.READY
+            return window
+
+    class Planner:
+        def request_payload(self, command, **kwargs):
+            assert command == "step-moving-grasp-mpc"
+            generation = len(calls)
+            calls.append(generation)
+            payload = kwargs["payload"]
+            feasible = generation != 1
+            return {
+                "payload": MPCCommandWindow(
+                    generation=generation,
+                    plan_sha256="a" * 64,
+                    source_state_monotonic_s=10.0,
+                    valid_from_monotonic_s=payload["valid_from_monotonic_s"],
+                    sample_time_s=(0.0, 0.8),
+                    command_q_rad=(q, q),
+                    predicted_q_rad=(q, q),
+                    predicted_dq_rad_s=(q, q),
+                    predicted_ddq_rad_s2=(q, q),
+                    predecessor_sha256=payload["predecessor_sha256"],
+                    feasible=feasible,
+                    terminal=generation == 2,
+                    solve_time_s=0.02,
+                    diagnostics={
+                        "curobo_feasible": feasible,
+                        "curobo_constraints": [],
+                    },
+                ).to_dict()
+            }
+
+    synchronized = Synchronized()
+    phase_record = {
+        "completed": False,
+        "preparation": None,
+        "windows": [],
+        "rejected_windows": [],
+        "moving_targets": [],
+    }
+    _preparation, windows = _execute_mpc_phase(
+        synchronized,
+        SimpleNamespace(check=lambda: None),
+        Planner(),
+        arm="left",
+        trajectory=SimpleNamespace(
+            from_pose_id="move_to_pregrasp",
+            to_pose_id="grasp_approach",
+        ),
+        plan_sha256="a" * 64,
+        control_config=SimpleNamespace(
+            motion_timeout_s=1.0,
+            nominal_tick_period_s=0.004,
+        ),
+        phase_record=phase_record,
+        prepared_mpc={
+            "phase": "grasp_approach",
+            "physical_mode": "open_contact",
+            "reused_warm_model": True,
+            "reconfiguration_time_s": 0.1,
+        },
+    )
+
+    assert calls == [0, 1, 2]
+    assert [item["generation"] for item in windows] == [0, 2]
+    assert [item["generation"] for item in phase_record["rejected_windows"]] == [1]
+    assert phase_record["completed"]
+
+
 def test_planner_pool_keeps_distinct_role_and_arm_slots() -> None:
     pool = TabletopPlannerPool()
 
