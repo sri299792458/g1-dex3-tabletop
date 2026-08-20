@@ -4770,3 +4770,30 @@ Primary references:
 - Verification passed Ruff, `414 passed, 7 skipped` in the control environment,
   and `414 passed, 1 skipped` in the CUDA planner environment. No robot command
   was sent.
+
+## 2026-08-20 — Initial MPC rejection now holds and retries instead of faulting
+
+- Physical run `tabletop_20260820T231034Z` reached the selected left-arm
+  pregrasp and then entered zero torque. The cube-frame change was not the
+  cause. The first MPC result passed both strict collision checks, including
+  `5.026 mm` hand/table clearance for the required `5.000 mm`, but its command
+  path peaked at `0.2570 rad/s` against the unchanged `0.2000 rad/s` physical
+  limit. CuRobo's full state reached `0.2635 rad/s` against its reserved
+  `0.1900 rad/s` optimizer limit, so rejecting that window was correct.
+- The wrapper error was the response: no MPC command had been installed, yet a
+  generic `RuntimeError` bypassed the existing pregrasp recovery and entered
+  the fail-closed zero-torque cleanup.
+- A command-free replay of the exact retained pregrasp boundary showed the
+  receding-horizon behavior is not deterministic on one solve. Its first solve
+  was infeasible; the immediate next solve from the same stationary state was
+  feasible with a `0.0923 rad/s` command peak and passed strict validation.
+- Production now holds the unchanged pregrasp and retries rejected initial
+  windows with fresh cube/body observations under the existing motion timeout.
+  No streaming command is created until a feasible window exists. Exhausting
+  that timeout runs the already validated pregrasp-to-clearance recovery,
+  restores the initial finger posture, reverses the supported escape, and then
+  restores seated FSM 3. Actual controller, transport, and watchdog faults
+  still retain the zero-torque path.
+- Verification passed Ruff, `416 passed, 7 skipped` in the control environment,
+  and `416 passed, 1 skipped` in the CUDA planner environment. No robot command
+  was sent while diagnosing or implementing the change.

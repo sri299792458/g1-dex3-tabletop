@@ -132,6 +132,10 @@ class TabletopTaskRejected(RuntimeError):
     """The controller is healthy, but this pick attempt should return and stop."""
 
 
+class MPCInitialWindowUnavailable(RuntimeError):
+    """MPC never started, so the frozen pregrasp reverse remains valid."""
+
+
 def _run_id() -> str:
     return datetime.now(timezone.utc).strftime("tabletop_%Y%m%dT%H%M%SZ")
 
@@ -604,6 +608,31 @@ def _trajectory_with_endpoints(
     )
 
 
+def _mpc_window_rejection_reason(window: MPCCommandWindow) -> str:
+    """Name the primary certified-window rejection without dumping its arrays."""
+
+    diagnostics = window.diagnostics
+    cspace = diagnostics.get("curobo_cspace_bound_diagnostics", {})
+    velocity = cspace.get("velocity", {}) if isinstance(cspace, dict) else {}
+    if float(velocity.get("maximum_violation", 0.0)) > 0.0:
+        return (
+            f"{velocity.get('joint', 'unknown joint')} velocity "
+            f"{float(velocity.get('value', float('nan'))):.4f}rad/s is outside "
+            f"[{float(velocity.get('active_lower_bound', float('nan'))):.4f}, "
+            f"{float(velocity.get('active_upper_bound', float('nan'))):.4f}]rad/s; "
+            "validated command peak="
+            f"{float(diagnostics.get('peak_velocity_rad_s', float('nan'))):.4f}rad/s"
+        )
+    strict_failure = diagnostics.get("strict_failure")
+    if strict_failure is not None:
+        links = diagnostics.get("strict_failure_links")
+        return f"strict {strict_failure}: links={links}"
+    if not bool(diagnostics.get("curobo_feasible", True)):
+        constraints = diagnostics.get("curobo_constraints")
+        return f"CuRobo constraints were infeasible: {constraints}"
+    return "certified MPC window was infeasible"
+
+
 def _execute_mpc_phase(
     synchronized,
     driver,
@@ -741,13 +770,33 @@ def _execute_mpc_phase(
         return window
 
     windows: list[dict] = []
-    first = request_window()
-    if not first.feasible:
-        if phase_record is not None:
-            phase_record.setdefault("rejected_windows", []).append(first.to_dict())
-        raise RuntimeError(
-            f"CuRobo MPC produced no feasible initial window for {phase}; "
-            "no streaming motion was started"
+    initial_deadline = time.monotonic() + control_config.motion_timeout_s
+    initial_rejections = 0
+    last_rejection = "no window was returned"
+    while True:
+        try:
+            first = request_window()
+        except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+            driver.check()
+            last_rejection = str(error)
+        else:
+            if first.feasible:
+                break
+            if phase_record is not None:
+                phase_record.setdefault("rejected_windows", []).append(first.to_dict())
+            last_rejection = _mpc_window_rejection_reason(first)
+        initial_rejections += 1
+        if time.monotonic() >= initial_deadline:
+            raise MPCInitialWindowUnavailable(
+                f"CuRobo MPC produced no feasible initial window for {phase} within "
+                f"{control_config.motion_timeout_s:.2f}s after {initial_rejections} "
+                f"rejections; last rejection: {last_rejection}; no streaming motion "
+                "was started"
+            )
+        print(
+            f"CuRobo MPC rejected initial window {initial_rejections}: "
+            f"{last_rejection}; holding the stationary pregrasp and retrying",
+            flush=True,
         )
     try:
         accepted = synchronized.start_streaming_trajectory(
@@ -1905,7 +1954,29 @@ def run_tabletop(args) -> int:
                 "tau_est remain recorded diagnostics; beginning grasp approach",
                 flush=True,
             )
-            mpc_approach_record = execute_phase("grasp_approach")
+            try:
+                mpc_approach_record = execute_phase("grasp_approach")
+            except MPCInitialWindowUnavailable as error:
+                driver.check()
+                print(
+                    "TASK REJECTED — moving-target MPC did not leave pregrasp; "
+                    f"executing the validated pregrasp reverse: {error}",
+                    flush=True,
+                )
+                execute_recovery("move_to_pregrasp", "return_to_clearance")
+                _command_fingers(
+                    dex_controller,
+                    driver,
+                    guard,
+                    left=initial_left,
+                    right=initial_right,
+                    label="initial finger posture restoration after MPC rejection",
+                )
+                execute_phase("__handoff__", use_mpc=False)
+                rejection_return_completed = True
+                raise TabletopTaskRejected(
+                    f"moving-target MPC could not start: {error}"
+                ) from error
             if args.motion_controller == "mpc":
                 if mpc_approach_record is None:
                     raise RuntimeError("moving-target MPC approach produced no execution record")

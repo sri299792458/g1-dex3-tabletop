@@ -112,6 +112,14 @@ physical close or post-grasp continuation opens the hand and uses the already
 installed exact reverse. Controller, transport, or watchdog failures retain the
 commissioned fail-closed ownership path.
 
+Before the first MPC window is installed, the arm is still stationary at the
+MotionGen pregrasp. An infeasible optimizer result therefore leaves the arm
+unchanged and is retried with a fresh cube/body observation under the existing
+motion timeout. If no feasible initial window is found, the task uses the
+already validated `move_to_pregrasp -> return_to_clearance` recovery, reverses
+the supported escape, and restores seated control. An ordinary initial planning
+rejection is not a reason to request emergency zero torque.
+
 ## Current evidence and limitation
 
 The composed retained GPU replay moved the cube by 5 mm after the original task

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,8 +10,10 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
+from g1_aprilcube_calibration.executor_state_machine import ExecutorState
 from g1_aprilcube_calibration.timestamp_pairing import ImageTiming
 from g1_dex3_tabletop.hardware_tabletop import (
+    MPCInitialWindowUnavailable,
     _execute_mpc_phase,
     _executed_mpc_approach,
     _return_to_clearance_phases,
@@ -253,6 +256,175 @@ def test_mpc_uses_clearance_preparation_without_rebuilding() -> None:
         )
 
     assert events == ["moving-target"]
+
+
+def test_mpc_retries_an_infeasible_initial_window_while_holding_pregrasp() -> None:
+    calls = []
+    q = (0.0,) * 7
+
+    class Synchronized:
+        state = ExecutorState.READY
+
+        def observe_state(self):
+            return SimpleNamespace(receipt_monotonic_s=10.0)
+
+        def prepare_streaming_handoff(self, **_kwargs):
+            return SimpleNamespace(
+                predicted_q_rad=q,
+                predicted_dq_rad_s=q,
+                predicted_ddq_rad_s2=q,
+                command_q_rad=q,
+                valid_from_monotonic_s=time.monotonic() + 1.0,
+                predecessor_sha256=None,
+                committed_route_progress_index=0,
+            )
+
+        def start_streaming_trajectory(self, *, window, **_kwargs):
+            calls.append("started")
+            return window
+
+    class Planner:
+        def request_payload(self, command, **kwargs):
+            assert command == "step-moving-grasp-mpc"
+            generation = len([item for item in calls if item == "requested"])
+            calls.append("requested")
+            feasible = generation == 1
+            payload = kwargs["payload"]
+            return {
+                "payload": MPCCommandWindow(
+                    generation=generation,
+                    plan_sha256="a" * 64,
+                    source_state_monotonic_s=10.0,
+                    valid_from_monotonic_s=payload["valid_from_monotonic_s"],
+                    sample_time_s=(0.0, 0.8),
+                    command_q_rad=(q, q),
+                    predicted_q_rad=(q, q),
+                    predicted_dq_rad_s=(q, q),
+                    predicted_ddq_rad_s2=(q, q),
+                    predecessor_sha256=None,
+                    feasible=feasible,
+                    terminal=True,
+                    solve_time_s=0.02,
+                    diagnostics={
+                        "curobo_feasible": feasible,
+                        "curobo_constraints": [],
+                    },
+                ).to_dict()
+            }
+
+    phase_record = {
+        "completed": False,
+        "preparation": None,
+        "windows": [],
+        "rejected_windows": [],
+        "moving_targets": [],
+    }
+    preparation, windows = _execute_mpc_phase(
+        Synchronized(),
+        SimpleNamespace(check=lambda: None),
+        Planner(),
+        arm="left",
+        trajectory=SimpleNamespace(
+            from_pose_id="move_to_pregrasp",
+            to_pose_id="grasp_approach",
+        ),
+        plan_sha256="a" * 64,
+        control_config=SimpleNamespace(
+            motion_timeout_s=1.0,
+            nominal_tick_period_s=0.004,
+        ),
+        phase_record=phase_record,
+        prepared_mpc={
+            "phase": "grasp_approach",
+            "physical_mode": "open_contact",
+            "reused_warm_model": True,
+            "reconfiguration_time_s": 0.1,
+        },
+    )
+
+    assert preparation["phase"] == "grasp_approach"
+    assert calls == ["requested", "requested", "started"]
+    assert len(phase_record["rejected_windows"]) == 1
+    assert len(windows) == 1
+    assert phase_record["completed"]
+
+
+def test_mpc_initial_window_timeout_never_starts_streaming() -> None:
+    q = (0.0,) * 7
+
+    class Synchronized:
+        state = ExecutorState.READY
+        started = False
+
+        def observe_state(self):
+            return SimpleNamespace(receipt_monotonic_s=10.0)
+
+        def prepare_streaming_handoff(self, **_kwargs):
+            return SimpleNamespace(
+                predicted_q_rad=q,
+                predicted_dq_rad_s=q,
+                predicted_ddq_rad_s2=q,
+                command_q_rad=q,
+                valid_from_monotonic_s=time.monotonic() + 1.0,
+                predecessor_sha256=None,
+                committed_route_progress_index=0,
+            )
+
+        def start_streaming_trajectory(self, **_kwargs):
+            self.started = True
+            raise AssertionError("an infeasible window must not start streaming")
+
+    class Planner:
+        def request_payload(self, _command, **kwargs):
+            payload = kwargs["payload"]
+            return {
+                "payload": MPCCommandWindow(
+                    generation=0,
+                    plan_sha256="a" * 64,
+                    source_state_monotonic_s=10.0,
+                    valid_from_monotonic_s=payload["valid_from_monotonic_s"],
+                    sample_time_s=(0.0, 0.8),
+                    command_q_rad=(q, q),
+                    predicted_q_rad=(q, q),
+                    predicted_dq_rad_s=(q, q),
+                    predicted_ddq_rad_s2=(q, q),
+                    predecessor_sha256=None,
+                    feasible=False,
+                    terminal=False,
+                    solve_time_s=0.02,
+                    diagnostics={
+                        "curobo_feasible": False,
+                        "curobo_constraints": [
+                            {"name": "cspace", "maximum": 1.0}
+                        ],
+                    },
+                ).to_dict()
+            }
+
+    synchronized = Synchronized()
+    with pytest.raises(MPCInitialWindowUnavailable, match="no streaming motion"):
+        _execute_mpc_phase(
+            synchronized,
+            SimpleNamespace(check=lambda: None),
+            Planner(),
+            arm="left",
+            trajectory=SimpleNamespace(
+                from_pose_id="move_to_pregrasp",
+                to_pose_id="grasp_approach",
+            ),
+            plan_sha256="a" * 64,
+            control_config=SimpleNamespace(
+                motion_timeout_s=0.0,
+                nominal_tick_period_s=0.004,
+            ),
+            prepared_mpc={
+                "phase": "grasp_approach",
+                "physical_mode": "open_contact",
+                "reused_warm_model": True,
+                "reconfiguration_time_s": 0.1,
+            },
+        )
+    assert not synchronized.started
 
 
 def test_planner_pool_keeps_distinct_role_and_arm_slots() -> None:
