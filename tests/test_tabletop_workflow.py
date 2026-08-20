@@ -38,7 +38,13 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _validate_start_relative_retention_clearance,
     _validate_strict_supported_escape_self_collision,
 )
-from g1_dex3_tabletop.tabletop_contracts import SupportedEscapePlan, TabletopObservation
+from g1_dex3_tabletop.tabletop_contracts import (
+    SupportedEscapePlan,
+    TabletopCuboid,
+    TabletopObservation,
+    TabletopPickPlaceRequest,
+    TabletopTaskRequest,
+)
 from g1_dex3_tabletop.tabletop_object import load_tabletop_object_profile
 from g1_dex3_tabletop.tabletop_perception import (
     camera_motion_from_fixed_cube,
@@ -46,6 +52,7 @@ from g1_dex3_tabletop.tabletop_perception import (
 )
 from g1_dex3_tabletop.tabletop_workflow import (
     build_tabletop_request,
+    destination_request_for_pick_place,
     request_at_clearance,
     request_at_clearance_observation,
 )
@@ -103,6 +110,97 @@ def test_cube_contact_links_are_disabled_only_during_final_grasp_approach(
         "left_hand_index_1_link",
     }
     assert result == (0.020, "grasp_link", 4)
+
+
+def test_pick_place_destination_reexpresses_world_and_marks_only_support() -> None:
+    source = TabletopTaskRequest(
+        observation=_observation(),
+        arm="left",
+        torso_T_camera=tuple(tuple(row) for row in np.eye(4)),
+        joint_position_offsets_rad={},
+        calibration_bundle_sha256="a" * 64,
+        grasp_shortlist_path="config/tabletop/cube_dex3_executable_v1/shortlist.yaml",
+        grasp_shortlist_sha256="b" * 64,
+        object_dimensions_m=(0.04, 0.04, 0.04),
+        environment_cuboids=(
+            TabletopCuboid(
+                object_id="cube60",
+                object_T_cuboid=(
+                    (1.0, 0.0, 0.0, 0.2),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.01),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+                dimensions_m=(0.06, 0.06, 0.06),
+            ),
+        ),
+    )
+    source_T_destination = np.eye(4)
+    source_T_destination[0, 3] = 0.2
+    source_T_destination[2, 3] = 0.05
+    destination = destination_request_for_pick_place(
+        TabletopPickPlaceRequest(
+            source_request=source,
+            source_T_destination_object=source_T_destination,
+            destination_support_object_id="cube60",
+        )
+    )
+
+    assert destination.environment_cuboids[0].role == "placement_support"
+    expected_destination_T_support = np.eye(4)
+    expected_destination_T_support[2, 3] = -0.04
+    np.testing.assert_allclose(
+        destination.environment_cuboids[0].object_T_cuboid,
+        expected_destination_T_support,
+    )
+    assert destination.observation.camera_T_object[0][3] == pytest.approx(0.2)
+    assert destination.observation.camera_T_object[2][3] == pytest.approx(0.05)
+    np.testing.assert_allclose(
+        destination.table_reference_camera_T_object,
+        source.observation.camera_T_object,
+    )
+    point, _canonical, _down = _table_from_resting_object(destination, np.eye(4))
+    np.testing.assert_allclose(point, (0.0, 0.0, -0.02))
+
+
+def test_environment_cuboid_uses_detector_frame_not_face_up_permutation() -> None:
+    request = TabletopTaskRequest(
+        observation=_observation(),
+        arm="left",
+        torso_T_camera=tuple(tuple(row) for row in np.eye(4)),
+        joint_position_offsets_rad={},
+        calibration_bundle_sha256="a" * 64,
+        grasp_shortlist_path="config/tabletop/cube_dex3_executable_v1/shortlist.yaml",
+        grasp_shortlist_sha256="b" * 64,
+        environment_cuboids=(
+            TabletopCuboid(
+                object_id="other",
+                object_T_cuboid=(
+                    (1.0, 0.0, 0.0, 0.2),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+                dimensions_m=(0.06, 0.06, 0.06),
+            ),
+        ),
+    )
+    detector_pose = np.eye(4)
+    detector_pose[:3, :3] = Rotation.from_euler("y", 90, degrees=True).as_matrix()
+    document = request.to_dict(include_hash=False)
+    document["observation"]["camera_T_object"] = detector_pose.tolist()
+    document["observation"].pop("content_sha256", None)
+    request = TabletopTaskRequest.from_dict(document)
+
+    scene = _base_scene(request, np.eye(4), include_cube=False)
+
+    expected = detector_pose.copy()
+    expected[:3, 3] += detector_pose[:3, :3] @ np.asarray((0.2, 0.0, 0.0))
+    pose = scene["cuboid"]["other"]["pose"]
+    actual = np.eye(4)
+    actual[:3, 3] = pose[:3]
+    actual[:3, :3] = Rotation.from_quat((*pose[4:], pose[3])).as_matrix()
+    np.testing.assert_allclose(actual, expected, atol=1.0e-9)
 
 
 def test_corrected_return_executes_both_post_retreat_legs() -> None:

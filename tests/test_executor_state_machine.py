@@ -49,6 +49,28 @@ def pose_set() -> PoseSet:
     return result
 
 
+def right_boundary_pose_set(command_q: np.ndarray) -> PoseSet:
+    full = np.zeros(29)
+    full[22:29] = command_q
+    record = PoseRecord(
+        id="clearance",
+        group="test",
+        measured_calibration_q=tuple(command_q),
+        measured_full_q=tuple(full),
+        calibration_q_spread=(0.0,) * 7,
+        recorded_at_utc=UTC,
+        recorded_monotonic_s=1.0,
+    )
+    return PoseSet(
+        robot_model="g1_29dof_rev_1_0",
+        mode_machine=5,
+        urdf_sha256="a" * 64,
+        calibration_arm="right",
+        poses=(record,),
+        audit_log=(PoseAuditEvent("add", record.id, UTC),),
+    )
+
+
 def config() -> ExecutorConfig:
     return ExecutorConfig(
         maximum_joint_velocity_rad_s=0.2,
@@ -542,6 +564,45 @@ def test_reached_boundary_can_atomically_replace_only_the_remaining_plan() -> No
     assert executor.pose_set is replacement
     assert executor.approved_validation_report_sha256 == "c" * 64
     assert "boundary-corrected remaining plan installed" in executor.events[-1].reason
+
+
+def test_settled_controller_switches_active_arm_without_changing_command() -> None:
+    _clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    reference = transport.observe()
+    before = np.asarray(transport.commands[-1].q14).copy()
+    replacement = right_boundary_pose_set(np.zeros(7))
+
+    executor.switch_validated_arm_plan(
+        pose_set=replacement,
+        approved_validation_report_sha256="c" * 64,
+        validated_reference_state=reference,
+        boundary_pose_id="clearance",
+    )
+
+    assert executor.pose_set is replacement
+    assert executor.pose_set.calibration_arm == "right"
+    assert executor.current_pose_id == "clearance"
+    np.testing.assert_array_equal(transport.commands[-1].q14, before)
+    assert "identical full-weight command" in executor.events[-1].reason
+
+
+def test_arm_plan_switch_rejects_a_changed_boundary_command() -> None:
+    _clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    reference = transport.observe()
+
+    with pytest.raises(ValueError, match="boundary differs"):
+        executor.switch_validated_arm_plan(
+            pose_set=right_boundary_pose_set(np.full(7, 0.001)),
+            approved_validation_report_sha256="c" * 64,
+            validated_reference_state=reference,
+            boundary_pose_id="clearance",
+        )
+
+    assert executor.pose_set.calibration_arm == "left"
 
 
 def test_remaining_plan_replacement_rejects_boundary_command_discontinuity() -> None:

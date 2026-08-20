@@ -4391,3 +4391,42 @@ Primary references:
   because both bind the collision model; the persistent CUDA worker is already
   warm. Nominal motion time is therefore unchanged. No robot command was sent
   while implementing this change.
+
+## 2026-08-20 — Fixed two-cube stack coordinator
+
+- The stacking task is deliberately one explicit coordinator, not a generic
+  task graph or home-grown task language: move the 60 mm R3 cube on the bare
+  table, observe its actual result, then place the 40 mm R3 cube on it.
+- A separate table marker is not required for this fixed task. Before stage one,
+  the stationary 40 mm cube is the finite world obstacle. Before stage two, the
+  reobserved 60 mm cube is the finite placement support. Both uniquely tagged
+  cubes must be detected in the same image subset.
+- Destination requests retain the original on-table cube observation solely as
+  explicit plane evidence. The planner therefore keeps the real table at its
+  observed height while checking the 60 mm cube as a finite cuboid; it does not
+  infer a fictitious full table plane beneath the elevated 40 mm destination.
+- Both arms first traverse independently planned supported escapes. Only one
+  arm subsequently moves at a time. Proximity to the two live hands orders the
+  two possible arm assignments but cannot approve one: complete source,
+  destination, attached-transfer, fixed-close, measured-close, self-collision,
+  table-plane, and finite-world checks remain authoritative.
+- Five placement proposals span only the non-overlapping interior of the table
+  segment evidenced by the two observed cube centers. The proposal nearest the
+  original 60 mm position is tried first; no preferred midpoint or synthetic
+  table boundary is introduced. Full CuRobo feasibility makes the final choice.
+- Stage-one feasibility includes a nominal stage-two proof so the 60 mm cube is
+  not deliberately moved into a known dead end. After physical stage one, the
+  final stage-two request is rebuilt from the observed 60 mm pose; failure to
+  plan then is an ordinary task rejection and returns both arms through their
+  frozen supported routes.
+- The same grasp candidate must pass source pickup, destination placement, and
+  the attached transfer. A source-only winner is no longer accepted and then
+  failed at the destination; the planner records each rejected grasp and tries
+  the next existing shortlist candidate. Measured-contact collision checkers
+  are built lazily only for a plan selected for execution, and validation never
+  reruns motion planning.
+- Existing single-cube implementations are reused for RealSense launch,
+  calibration, gravity feedforward, fixed-rate control, Dex3 open/close and
+  retention evidence, PC2 watchdog/handback, raw MCAP recording, and frozen
+  rejection routes. No new robot command was sent while implementing or
+  testing this coordinator.

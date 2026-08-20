@@ -18,9 +18,11 @@ from g1_dex3_tabletop.state_estimation import CameraStateEstimate
 from g1_dex3_tabletop.tabletop_contracts import (
     EstimatedCameraPlanningState,
     SupportedEscapePlan,
+    TabletopCuboid,
     TabletopExecutionPlan,
     TabletopFixture,
     TabletopObservation,
+    TabletopPickPlaceRequest,
     TabletopTaskPlan,
     TabletopTaskRequest,
     combine_tabletop_plans,
@@ -60,6 +62,7 @@ def build_tabletop_request(
     maximum_arm_velocity_rad_s: float | None = None,
     presentation_id: str = "direct",
     fixture: TabletopFixture | None = None,
+    environment_cuboids: tuple[TabletopCuboid, ...] = (),
 ) -> TabletopTaskRequest:
     task = load_task_config(task_config_path)
     if CalibrationBundle.load(calibration_bundle_path).content_sha256 != (
@@ -90,6 +93,7 @@ def build_tabletop_request(
         grasp_shortlist_sha256=file_sha256(shortlist),
         presentation_id=presentation_id,
         fixture=fixture,
+        environment_cuboids=environment_cuboids,
         object_dimensions_m=tuple(object_dimensions_m),
         open_transit_table_patch_dimensions_m=tuple(
             task["table"]["open_transit_patch_dimensions_m"]
@@ -160,6 +164,9 @@ def request_at_clearance_observation(
         grasp_shortlist_sha256=loaded_request.grasp_shortlist_sha256,
         presentation_id=loaded_request.presentation_id,
         fixture=loaded_request.fixture,
+        environment_cuboids=loaded_request.environment_cuboids,
+        table_reference_camera_T_object=loaded_request.table_reference_camera_T_object,
+        table_reference_object_dimensions_m=(loaded_request.table_reference_object_dimensions_m),
         object_dimensions_m=loaded_request.object_dimensions_m,
         open_transit_table_patch_dimensions_m=(
             loaded_request.open_transit_table_patch_dimensions_m
@@ -201,6 +208,57 @@ def request_at_estimated_pregrasp(
         current_input_timing=current_input.to_dict(),
     )
     return replace(clearance_request, estimated_planning_state=state)
+
+
+def destination_request_for_pick_place(
+    request: TabletopPickPlaceRequest,
+) -> TabletopTaskRequest:
+    """Express the same fixed world in the destination object's frame."""
+
+    source = request.source_request
+    if source.estimated_planning_state is not None:
+        raise ValueError("pick-place destination synthesis requires a visual boundary request")
+    source_T_destination = np.asarray(request.source_T_destination_object, dtype=np.float64)
+    destination_T_source = np.linalg.inv(source_T_destination)
+    camera_T_destination = (
+        np.asarray(source.observation.camera_T_object, dtype=np.float64) @ source_T_destination
+    )
+    destination_environment = []
+    for cuboid in source.environment_cuboids:
+        role = (
+            "placement_support"
+            if cuboid.object_id == request.destination_support_object_id
+            else "obstacle"
+        )
+        destination_environment.append(
+            TabletopCuboid(
+                object_id=cuboid.object_id,
+                object_T_cuboid=destination_T_source
+                @ np.asarray(cuboid.object_T_cuboid, dtype=np.float64),
+                dimensions_m=cuboid.dimensions_m,
+                role=role,
+            )
+        )
+    destination_observation = TabletopObservation(
+        snapshot=source.observation.snapshot,
+        camera_T_object=camera_T_destination,
+        camera_profile_sha256=source.observation.camera_profile_sha256,
+        source_frame_sha256=source.observation.source_frame_sha256,
+        object_translation_spread_mm=source.observation.object_translation_spread_mm,
+        object_rotation_spread_deg=source.observation.object_rotation_spread_deg,
+    )
+    table_reference_pose = source.table_reference_camera_T_object
+    table_reference_dimensions = source.table_reference_object_dimensions_m
+    if table_reference_pose is None:
+        table_reference_pose = source.observation.camera_T_object
+        table_reference_dimensions = source.object_dimensions_m
+    return replace(
+        source,
+        observation=destination_observation,
+        environment_cuboids=tuple(destination_environment),
+        table_reference_camera_T_object=table_reference_pose,
+        table_reference_object_dimensions_m=table_reference_dimensions,
+    )
 
 
 def assemble_execution_plan(

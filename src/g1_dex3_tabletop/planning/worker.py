@@ -18,6 +18,7 @@ from g1_dex3_tabletop.planning.curobo_backend import (
 )
 from g1_dex3_tabletop.planning.tabletop_mpc import benchmark_from_paths
 from g1_dex3_tabletop.planning.tabletop_planner import (
+    PickPlaceRetentionRouteValidator,
     plan_supported_escape,
     plan_tabletop_pregrasp,
     plan_tabletop_task,
@@ -28,7 +29,9 @@ from g1_dex3_tabletop.planning.tabletop_session import TabletopPlanningSession
 from g1_dex3_tabletop.planning.waist_yaw_analysis import analyze_waist_yaw_from_paths
 from g1_dex3_tabletop.tabletop_contracts import (
     CharucoSupportedEscapeRequest,
+    PickPlaceRetentionRouteValidationRequest,
     RetentionRouteValidationRequest,
+    TabletopPickPlaceRequest,
     TabletopTaskRequest,
 )
 
@@ -69,6 +72,14 @@ def build_parser() -> argparse.ArgumentParser:
         (
             "plan-tabletop-task",
             "plan the qualified cube pick, lift, replace, retreat, and return",
+        ),
+        (
+            "plan-tabletop-pick-place",
+            "plan one fixed source grasp, attached transfer, placement, and return",
+        ),
+        (
+            "validate-pick-place-retention-route",
+            "recheck a fixed source-to-placement route at the measured close posture",
         ),
         (
             "validate-retention-route",
@@ -201,6 +212,9 @@ def _serve_tabletop() -> int:
                     elif command == "plan-supported-escape":
                         request = TabletopTaskRequest.from_json(request_path)
                         result = session.plan_escape(request, progress=progress)
+                    elif command == "plan-tabletop-pick-place":
+                        request = TabletopPickPlaceRequest.from_json(request_path)
+                        result = session.plan_pick_place(request, progress=progress)
                     elif command == "replan-tabletop-at-clearance":
                         request = TabletopTaskRequest.from_json(request_path)
                         result = session.replan_at_clearance(request, progress=progress)
@@ -219,6 +233,12 @@ def _serve_tabletop() -> int:
                     elif command == "validate-retention-route":
                         request = RetentionRouteValidationRequest.from_json(request_path)
                         result = session.validate_retention_route(request, progress=progress)
+                    elif command == "validate-pick-place-retention-route":
+                        request = PickPlaceRetentionRouteValidationRequest.from_json(request_path)
+                        result = session.validate_pick_place_retention_route(
+                            request,
+                            progress=progress,
+                        )
                     else:
                         raise ValueError(f"unsupported persistent planner command: {command}")
                     result.write_json(output_path)
@@ -302,6 +322,22 @@ def main(argv: list[str] | None = None) -> int:
                 "plan_sha256": result.content_sha256,
                 "operation": args.command,
             }
+        elif args.command == "validate-pick-place-retention-route":
+            request = PickPlaceRetentionRouteValidationRequest.from_json(args.request)
+            validator = PickPlaceRetentionRouteValidator(
+                request.pick_place_request,
+                request.pick_place_plan,
+            )
+            result = validator.validate(
+                request,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            summary = {
+                "commands_robot": False,
+                "output": str(args.output.resolve()),
+                "plan_sha256": result.content_sha256,
+                "operation": args.command,
+            }
         elif args.command == "plan-charuco-supported-escape":
             request = CharucoSupportedEscapeRequest.from_json(args.request)
             result = plan_supported_escape(
@@ -341,6 +377,22 @@ def main(argv: list[str] | None = None) -> int:
                     request,
                     progress=lambda message: print(message, file=sys.stderr, flush=True),
                 )
+            summary = {
+                "commands_robot": False,
+                "output": str(args.output.resolve()),
+                "plan_sha256": result.content_sha256,
+                "operation": args.command,
+            }
+        elif args.command == "plan-tabletop-pick-place":
+            request = TabletopPickPlaceRequest.from_json(args.request)
+            session = TabletopPlanningSession()
+            try:
+                result = session.plan_pick_place(
+                    request,
+                    progress=lambda message: print(message, file=sys.stderr, flush=True),
+                )
+            finally:
+                session.close()
             summary = {
                 "commands_robot": False,
                 "output": str(args.output.resolve()),

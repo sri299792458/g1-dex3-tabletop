@@ -432,6 +432,50 @@ PC2 does not generate a point cloud or perform live depth-to-color alignment.
 The driver publishes the two raw motion streams separately; it does not
 synthesize an orientation estimate.
 
+### Fixed two-cube stack
+
+`run-stack` is one explicit workflow, not a generic task language. Both the
+40 mm and 60 mm uniquely tagged R3 cubes start on the bare table and must be
+jointly visible. The robot starts seated in FSM 3 with both arms supported and
+stationary on the table.
+
+```bash
+cd /home/kanth042/g1-dex3-tabletop
+./tools/g1_tabletop_hardware.sh run-stack \
+  --network-interface enp134s0 \
+  --calibration-bundle config/calibrations/dex3_shared_20260812_selected_free.json \
+  --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
+```
+
+The controller lifts the left arm and then the right arm through independently
+planned supported escapes. It opens and measures both hands at clearance, then
+orders the two possible arm assignments by live hand-to-cube distance. That
+distance is only an ordering heuristic: an assignment is selectable only when
+the same grasp passes the complete source pickup, destination placement, and
+attached-payload transfer checks for both stages.
+
+The first stage moves the 60 mm cube to one of five finite proposals along the
+table segment already evidenced by the two cube centers; the stationary 40 mm
+cube remains a strict finite obstacle. After the 60 mm cube is released and the
+arm returns to clearance, both cubes are observed again. The second stage is
+then planned from the actual 60 mm pose, with that finite cube as the placement
+support, and places the 40 mm cube on top. No midpoint rule, table boundary,
+separate board, or hidden task description is used. Only one arm moves at a
+time; both arms finally reverse their supported escapes in right-then-left
+order and seated control is restored.
+
+Destination planning carries the original on-table cube observation as explicit
+evidence for the unchanged real table plane. It does not infer a new plane under
+the elevated 40 mm destination and therefore does not turn the top of the finite
+60 mm support into a large fictitious raised table.
+
+Planning and measured-close validation reuse the single-cube CuRobo, Dex3,
+gravity-feedforward, controller, watchdog, RealSense, and MCAP implementations.
+Expected grasp rejection returns through frozen routes. Controller, transport,
+or watchdog faults retain the existing fail-closed zero-torque behavior.
+`--maximum-arm-velocity-rad-s` and `--skip-camera-recording` have the same
+meaning as in `run-tabletop`.
+
 ## Verification
 
 CPU-safe checks (no robot commands):

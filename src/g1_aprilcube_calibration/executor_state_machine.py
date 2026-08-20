@@ -667,6 +667,103 @@ class PoseExecutor:
             now,
         )
 
+    def switch_validated_arm_plan(
+        self,
+        *,
+        pose_set: PoseSet,
+        approved_validation_report_sha256: str,
+        validated_reference_state: RobotStateSample,
+        boundary_pose_id: str,
+    ) -> None:
+        """Switch the selected arm without changing the held 14-joint command.
+
+        This is deliberately not a general controller reconfiguration.  It is
+        legal only at a settled boundary with full ownership, and the new
+        hash-bound plan must begin at the exact command already being sent for
+        its selected arm.  The previously selected arm becomes the unchanged
+        opposite-arm hold.
+        """
+
+        if self.state not in {ExecutorState.READY, ExecutorState.HOLDING}:
+            raise RuntimeError("an arm-plan switch requires a settled controller")
+        if self._pending_pose_id is not None or self._mpc_command_buffer is not None:
+            raise RuntimeError("an arm-plan switch cannot occur during active motion")
+        if self._command_q14 is None or self._weight != 1.0:
+            raise RuntimeError("an arm-plan switch requires full command ownership")
+        if pose_set.calibration_arm == self.pose_set.calibration_arm:
+            raise ValueError("an arm-plan switch must select the opposite arm")
+        if not _SHA256_PATTERN.fullmatch(approved_validation_report_sha256):
+            raise ValueError("approved validation report hash must be lowercase SHA-256")
+        if pose_set.robot_model != self.pose_set.robot_model:
+            raise ValueError("replacement pose set belongs to a different robot model")
+        if pose_set.mode_machine != self.pose_set.mode_machine:
+            raise ValueError("replacement pose set uses a different mode machine")
+        if pose_set.urdf_sha256 != self.pose_set.urdf_sha256:
+            raise ValueError("replacement pose set belongs to a different URDF")
+        if not validated_reference_state.is_mode5:
+            raise ValueError("validated plan reference is not mode_machine=5")
+        if not boundary_pose_id:
+            raise ValueError("arm-plan switch boundary must be named")
+
+        new_arm = pose_set.calibration_arm
+        current_new_arm_command = (
+            self._command_q14[:7].copy() if new_arm == "left" else self._command_q14[7:].copy()
+        )
+        if boundary_pose_id != HANDOFF_POSE_ID:
+            matching = [pose for pose in pose_set.poses if pose.id == boundary_pose_id]
+            if len(matching) != 1:
+                raise ValueError("new arm plan does not contain its switch boundary exactly once")
+            boundary_error = float(
+                np.max(
+                    np.abs(np.asarray(matching[0].command_calibration_q) - current_new_arm_command)
+                )
+            )
+            if boundary_error > _COMMAND_COMPLETION_EPSILON_RAD:
+                raise ValueError(
+                    "new arm plan boundary differs from the active command by "
+                    f"{boundary_error:.9f}rad"
+                )
+
+        now = self.clock.monotonic()
+        live_state = self.transport.observe()
+        self._validate_fresh_state(live_state, now)
+        reference_drift = float(
+            np.max(np.abs(live_state.position - validated_reference_state.position))
+        )
+        if reference_drift > self.config.settled_position_spread_rad:
+            raise ValueError(
+                "loaded state changed after arm-switch validation by "
+                f"{reference_drift:.4f}rad; limit is "
+                f"{self.config.settled_position_spread_rad:.4f}rad"
+            )
+
+        self.pose_set = pose_set
+        self.approved_validation_report_sha256 = approved_validation_report_sha256
+        self.handoff_q = current_new_arm_command.copy()
+        old_arm = opposite_arm(new_arm)
+        self.hold_q = (
+            self._command_q14[:7].copy() if old_arm == "left" else self._command_q14[7:].copy()
+        )
+        self._opposite_hold = OppositeArmHold(
+            calibration_arm=new_arm,
+            command_q=self.hold_q,
+        )
+        self._opposite_hold.rebase_monitor(live_state)
+        self._calibration_goal_q = current_new_arm_command.copy()
+        self._goal_q14 = self._command_q14.copy()
+        self.current_pose_id = boundary_pose_id
+        self._reset_settle_window()
+        if self.gravity_feedforward is not None:
+            self.gravity_feedforward.seed_reference(validated_reference_state.position)
+        self._send(now)
+        self._transition(
+            self.state,
+            "switched selected arm at an identical full-weight command; "
+            f"new arm={new_arm}, boundary={boundary_pose_id}, "
+            f"live reference drift={reference_drift:.4f}rad",
+            now,
+        )
+
     def tick(self) -> ExecutorState:
         now = self.clock.monotonic()
         if self.state in {ExecutorState.STOPPED, ExecutorState.OBSERVING}:

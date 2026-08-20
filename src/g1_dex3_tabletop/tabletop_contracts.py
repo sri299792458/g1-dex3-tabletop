@@ -379,6 +379,48 @@ class TabletopFixture:
 
 
 @dataclass(frozen=True, slots=True)
+class TabletopCuboid:
+    """One fixed cuboid expressed in the manipulated detected-object frame."""
+
+    object_id: str
+    object_T_cuboid: tuple[tuple[float, ...], ...]
+    dimensions_m: tuple[float, ...]
+    role: str = "obstacle"
+
+    def __post_init__(self) -> None:
+        if not self.object_id.strip():
+            raise ValueError("tabletop cuboid ID must be non-empty")
+        if self.object_id in {"manipulated_object", "open_transit_table_patch"}:
+            raise ValueError("tabletop cuboid ID is reserved")
+        object.__setattr__(
+            self,
+            "object_T_cuboid",
+            _finite_transform(self.object_T_cuboid, "object_T_cuboid"),
+        )
+        object.__setattr__(
+            self,
+            "dimensions_m",
+            _finite_vector(self.dimensions_m, 3, "tabletop cuboid dimensions"),
+        )
+        if any(value <= 0.0 for value in self.dimensions_m):
+            raise ValueError("tabletop cuboid dimensions must be positive")
+        if self.role not in {"obstacle", "placement_support"}:
+            raise ValueError(f"unsupported tabletop cuboid role: {self.role}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "object_id": self.object_id,
+            "object_T_cuboid": [list(row) for row in self.object_T_cuboid],
+            "dimensions_m": list(self.dimensions_m),
+            "role": self.role,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TabletopCuboid:
+        return cls(**data)
+
+
+@dataclass(frozen=True, slots=True)
 class TabletopTaskRequest:
     """Complete scene, calibration, and robot state for one selected-arm task."""
 
@@ -392,6 +434,9 @@ class TabletopTaskRequest:
     estimated_planning_state: EstimatedCameraPlanningState | None = None
     presentation_id: str = "direct"
     fixture: TabletopFixture | None = None
+    environment_cuboids: tuple[TabletopCuboid, ...] = ()
+    table_reference_camera_T_object: tuple[tuple[float, ...], ...] | None = None
+    table_reference_object_dimensions_m: tuple[float, ...] | None = None
     object_dimensions_m: tuple[float, ...] = (0.040, 0.040, 0.040)
     open_transit_table_patch_dimensions_m: tuple[float, ...] = (0.400, 0.400, 0.020)
     minimum_hand_plane_clearance_m: float = 0.005
@@ -416,6 +461,36 @@ class TabletopTaskRequest:
             raise ValueError("direct tabletop presentation cannot contain a fixture")
         if self.presentation_id != "direct" and self.fixture is None:
             raise ValueError("non-direct tabletop presentation requires a fixture")
+        cuboids = tuple(
+            value if isinstance(value, TabletopCuboid) else TabletopCuboid.from_dict(value)
+            for value in self.environment_cuboids
+        )
+        ids = tuple(value.object_id for value in cuboids)
+        if len(set(ids)) != len(ids):
+            raise ValueError("tabletop environment cuboid IDs must be unique")
+        if sum(value.role == "placement_support" for value in cuboids) > 1:
+            raise ValueError("a tabletop request can have at most one placement support")
+        object.__setattr__(self, "environment_cuboids", cuboids)
+        table_reference = self.table_reference_camera_T_object
+        table_dimensions = self.table_reference_object_dimensions_m
+        if (table_reference is None) != (table_dimensions is None):
+            raise ValueError("table reference pose and dimensions must be supplied together")
+        if table_reference is not None:
+            if self.fixture is not None:
+                raise ValueError("fixture requests cannot override their table reference")
+            object.__setattr__(
+                self,
+                "table_reference_camera_T_object",
+                _finite_transform(table_reference, "table_reference_camera_T_object"),
+            )
+            dimensions = _finite_vector(
+                table_dimensions,
+                3,
+                "table_reference_object_dimensions_m",
+            )
+            if any(value <= 0.0 for value in dimensions):
+                raise ValueError("table reference object dimensions must be positive")
+            object.__setattr__(self, "table_reference_object_dimensions_m", dimensions)
         object.__setattr__(self, "arm", validate_arm_side(self.arm))
         object.__setattr__(
             self,
@@ -508,6 +583,17 @@ class TabletopTaskRequest:
             "grasp_shortlist_sha256": self.grasp_shortlist_sha256,
             "presentation_id": self.presentation_id,
             "fixture": None if self.fixture is None else self.fixture.to_dict(),
+            "environment_cuboids": [value.to_dict() for value in self.environment_cuboids],
+            "table_reference_camera_T_object": (
+                None
+                if self.table_reference_camera_T_object is None
+                else [list(row) for row in self.table_reference_camera_T_object]
+            ),
+            "table_reference_object_dimensions_m": (
+                None
+                if self.table_reference_object_dimensions_m is None
+                else list(self.table_reference_object_dimensions_m)
+            ),
             "object_dimensions_m": list(self.object_dimensions_m),
             "open_transit_table_patch_dimensions_m": list(
                 self.open_transit_table_patch_dimensions_m
@@ -641,6 +727,280 @@ class TabletopTaskPlan:
 
     @classmethod
     def from_json(cls, path: str | Path) -> TabletopTaskPlan:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+PICK_PLACE_PHASE_ORDER = (
+    "move_to_pregrasp",
+    "grasp_approach",
+    "retention_test_lift",
+    "payload_lift",
+    "payload_transfer",
+    "placement_lower",
+    "placement_contact",
+    "placement_retreat",
+    "return_to_clearance",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class TabletopPickPlaceRequest:
+    """One fixed source-to-destination cube transfer using a single arm.
+
+    ``source_T_destination_object`` uses detector-defined physical object
+    frames. It deliberately excludes the planner's private face-up cube-axis
+    permutation.
+    """
+
+    source_request: TabletopTaskRequest
+    source_T_destination_object: tuple[tuple[float, ...], ...]
+    destination_support_object_id: str | None = None
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    operation: str = "plan_tabletop_pick_place"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PLANNER_SCHEMA_VERSION:
+            raise ValueError("unsupported tabletop pick-place schema version")
+        if self.operation != "plan_tabletop_pick_place":
+            raise ValueError("unsupported tabletop pick-place operation")
+        if not isinstance(self.source_request, TabletopTaskRequest):
+            object.__setattr__(
+                self,
+                "source_request",
+                TabletopTaskRequest.from_dict(self.source_request),
+            )
+        object.__setattr__(
+            self,
+            "source_T_destination_object",
+            _finite_transform(
+                self.source_T_destination_object,
+                "source_T_destination_object",
+            ),
+        )
+        support = self.destination_support_object_id
+        if support is not None:
+            support = str(support).strip()
+            if not support:
+                raise ValueError("destination support object ID must be non-empty")
+            environment_ids = {
+                value.object_id for value in self.source_request.environment_cuboids
+            }
+            if support not in environment_ids:
+                raise ValueError("destination support is absent from the source world")
+            object.__setattr__(self, "destination_support_object_id", support)
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "operation": self.operation,
+            "source_request": self.source_request.to_dict(),
+            "source_T_destination_object": [list(row) for row in self.source_T_destination_object],
+            "destination_support_object_id": self.destination_support_object_id,
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TabletopPickPlaceRequest:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        request = cls(**values)
+        if expected_hash is not None and expected_hash != request.content_sha256:
+            raise ValueError("tabletop pick-place request SHA-256 mismatch")
+        return request
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> TabletopPickPlaceRequest:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class TabletopPickPlacePlan:
+    """The fixed nine-motion source-to-destination lifecycle."""
+
+    request_sha256: str
+    arm: str
+    selected_candidate_id: str
+    source_task: TabletopTaskPlan
+    destination_task: TabletopTaskPlan
+    trajectories: tuple[PlannedTrajectory, ...]
+    phase_order: tuple[str, ...]
+    planner_provenance: dict[str, Any]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    kind: str = "g1_tabletop_pick_place_plan"
+
+    def __post_init__(self) -> None:
+        if len(self.request_sha256) != 64:
+            raise ValueError("request SHA-256 must contain 64 characters")
+        object.__setattr__(self, "arm", validate_arm_side(self.arm))
+        for name in ("source_task", "destination_task"):
+            value = getattr(self, name)
+            if not isinstance(value, TabletopTaskPlan):
+                value = TabletopTaskPlan.from_dict(value)
+                object.__setattr__(self, name, value)
+            if value.arm != self.arm:
+                raise ValueError("pick-place task uses a different arm")
+            if value.selected_candidate_id != self.selected_candidate_id:
+                raise ValueError("pick-place task changed the selected grasp")
+        object.__setattr__(
+            self,
+            "trajectories",
+            tuple(
+                value
+                if isinstance(value, PlannedTrajectory)
+                else PlannedTrajectory.from_dict(value)
+                for value in self.trajectories
+            ),
+        )
+        object.__setattr__(self, "phase_order", tuple(self.phase_order))
+        if self.phase_order != PICK_PLACE_PHASE_ORDER:
+            raise ValueError("tabletop pick-place plan has an invalid phase order")
+        if tuple(value.to_pose_id for value in self.trajectories) != self.phase_order:
+            raise ValueError("pick-place trajectory endpoints differ from its phase order")
+        if len(self.trajectories) != len(PICK_PLACE_PHASE_ORDER):
+            raise ValueError("tabletop pick-place plan is incomplete")
+        if self.trajectories[0].from_pose_id != "clearance":
+            raise ValueError("tabletop pick-place plan must begin at clearance")
+        for previous, current in zip(self.trajectories, self.trajectories[1:], strict=False):
+            error = float(
+                np.max(
+                    np.abs(
+                        np.asarray(previous.command_q_rad[-1])
+                        - np.asarray(current.command_q_rad[0])
+                    )
+                )
+            )
+            if error > 1.0e-8:
+                raise ValueError(
+                    "tabletop pick-place trajectory discontinuity: "
+                    f"{previous.to_pose_id}->{current.to_pose_id}={error:.9f}rad"
+                )
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "request_sha256": self.request_sha256,
+            "arm": self.arm,
+            "selected_candidate_id": self.selected_candidate_id,
+            "source_task": self.source_task.to_dict(),
+            "destination_task": self.destination_task.to_dict(),
+            "trajectories": [value.to_dict() for value in self.trajectories],
+            "phase_order": list(self.phase_order),
+            "planner_provenance": self.planner_provenance,
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TabletopPickPlacePlan:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        plan = cls(**values)
+        if expected_hash is not None and expected_hash != plan.content_sha256:
+            raise ValueError("tabletop pick-place plan SHA-256 mismatch")
+        return plan
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> TabletopPickPlacePlan:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class PickPlaceRetentionRouteValidationRequest:
+    """Recheck the complete source-to-placement route at the measured close."""
+
+    pick_place_request: TabletopPickPlaceRequest
+    pick_place_plan: TabletopPickPlacePlan
+    measured_active_dex3_q_rad: tuple[float, ...]
+    blocked_motor_ids: tuple[int, ...]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    operation: str = "validate_pick_place_retention_route"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PLANNER_SCHEMA_VERSION:
+            raise ValueError("unsupported pick-place retention schema version")
+        if self.operation != "validate_pick_place_retention_route":
+            raise ValueError("unsupported pick-place retention operation")
+        if not isinstance(self.pick_place_request, TabletopPickPlaceRequest):
+            object.__setattr__(
+                self,
+                "pick_place_request",
+                TabletopPickPlaceRequest.from_dict(self.pick_place_request),
+            )
+        if not isinstance(self.pick_place_plan, TabletopPickPlacePlan):
+            object.__setattr__(
+                self,
+                "pick_place_plan",
+                TabletopPickPlacePlan.from_dict(self.pick_place_plan),
+            )
+        if self.pick_place_plan.request_sha256 != self.pick_place_request.content_sha256:
+            raise ValueError("pick-place retention plan belongs to a different request")
+        object.__setattr__(
+            self,
+            "measured_active_dex3_q_rad",
+            _finite_vector(
+                self.measured_active_dex3_q_rad,
+                7,
+                "measured_active_dex3_q_rad",
+            ),
+        )
+        blocked = tuple(int(value) for value in self.blocked_motor_ids)
+        if (
+            not blocked
+            or len(set(blocked)) != len(blocked)
+            or any(value < 0 or value >= 7 for value in blocked)
+        ):
+            raise ValueError("pick-place retention blocked motor IDs are invalid")
+        object.__setattr__(self, "blocked_motor_ids", blocked)
+
+    @property
+    def content_sha256(self) -> str:
+        return _hash(self.to_dict(include_hash=False))
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        result = {
+            "schema_version": self.schema_version,
+            "operation": self.operation,
+            "pick_place_request": self.pick_place_request.to_dict(),
+            "pick_place_plan": self.pick_place_plan.to_dict(),
+            "measured_active_dex3_q_rad": list(self.measured_active_dex3_q_rad),
+            "blocked_motor_ids": list(self.blocked_motor_ids),
+        }
+        if include_hash:
+            result["content_sha256"] = self.content_sha256
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PickPlaceRetentionRouteValidationRequest:
+        values = dict(data)
+        expected_hash = values.pop("content_sha256", None)
+        request = cls(**values)
+        if expected_hash is not None and expected_hash != request.content_sha256:
+            raise ValueError("pick-place retention request SHA-256 mismatch")
+        return request
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> PickPlaceRetentionRouteValidationRequest:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     def write_json(self, path: str | Path) -> None:

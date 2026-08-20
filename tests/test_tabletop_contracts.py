@@ -8,6 +8,7 @@ import pytest
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
 from g1_dex3_tabletop.planning.dex3_handedness import dex3_execution_profile
 from g1_dex3_tabletop.tabletop_contracts import (
+    PICK_PLACE_PHASE_ORDER,
     CharucoBoardObservation,
     CharucoSupportedEscapeRequest,
     EstimatedCameraPlanningState,
@@ -15,8 +16,11 @@ from g1_dex3_tabletop.tabletop_contracts import (
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
+    TabletopCuboid,
     TabletopExecutionPlan,
     TabletopObservation,
+    TabletopPickPlacePlan,
+    TabletopPickPlaceRequest,
     TabletopPregraspPlan,
     TabletopTaskPlan,
     TabletopTaskRequest,
@@ -162,6 +166,102 @@ def test_tabletop_request_rejects_invalid_arm_velocity() -> None:
     values["maximum_arm_velocity_rad_s"] = 0.0
     with pytest.raises(ValueError, match="maximum_arm_velocity_rad_s"):
         TabletopTaskRequest.from_dict(values)
+
+
+def test_table_reference_pose_and_dimensions_are_atomic() -> None:
+    values = request().to_dict(include_hash=False)
+    values["table_reference_camera_T_object"] = identity()
+    with pytest.raises(ValueError, match="pose and dimensions"):
+        TabletopTaskRequest.from_dict(values)
+
+
+def test_pick_place_request_binds_relative_destination_and_support(tmp_path: Path) -> None:
+    source = request()
+    values = source.to_dict(include_hash=False)
+    values["environment_cuboids"] = [
+        TabletopCuboid(
+            object_id="cube60",
+            object_T_cuboid=identity(),
+            dimensions_m=(0.06, 0.06, 0.06),
+        ).to_dict()
+    ]
+    source = TabletopTaskRequest.from_dict(values)
+    destination = [list(row) for row in identity()]
+    destination[0][3] = 0.1
+    pick_place = TabletopPickPlaceRequest(
+        source_request=source,
+        source_T_destination_object=destination,
+        destination_support_object_id="cube60",
+    )
+    path = tmp_path / "pick_place_request.json"
+    pick_place.write_json(path)
+    assert TabletopPickPlaceRequest.from_json(path) == pick_place
+
+    bad = pick_place.to_dict(include_hash=False)
+    bad["destination_support_object_id"] = "missing"
+    with pytest.raises(ValueError, match="absent from the source world"):
+        TabletopPickPlaceRequest.from_dict(bad)
+
+
+def test_pick_place_plan_has_one_fixed_continuous_sequence() -> None:
+    open_q, close_q = dex3_execution_profile("right")
+    lifecycle_phases = (
+        "move_to_pregrasp",
+        "grasp_approach",
+        "retention_test_lift",
+        "payload_lift",
+        "payload_lower",
+        "payload_replace",
+        "grasp_retreat",
+        "return_to_clearance",
+    )
+    lifecycle = []
+    source = "clearance"
+    for index, phase in enumerate(lifecycle_phases):
+        lifecycle.append(trajectory(source, phase, index / 100, (index + 1) / 100))
+        source = phase
+    task = TabletopTaskPlan(
+        request_sha256="a" * 64,
+        arm="right",
+        selected_candidate_id="candidate",
+        object_T_grasp=identity(),
+        open_active_dex3_q_rad=open_q,
+        close_target_active_dex3_q_rad=close_q,
+        initial_active_dex3_q_rad=(0.1,) * 7,
+        trajectories=tuple(lifecycle),
+        phase_order=lifecycle_phases,
+        planner_provenance={},
+    )
+    pick_place_trajectories = []
+    source = "clearance"
+    for index, phase in enumerate(PICK_PLACE_PHASE_ORDER):
+        pick_place_trajectories.append(trajectory(source, phase, index / 100, (index + 1) / 100))
+        source = phase
+    plan = TabletopPickPlacePlan(
+        request_sha256="b" * 64,
+        arm="right",
+        selected_candidate_id="candidate",
+        source_task=task,
+        destination_task=task,
+        trajectories=tuple(pick_place_trajectories),
+        phase_order=PICK_PLACE_PHASE_ORDER,
+        planner_provenance={},
+    )
+    assert TabletopPickPlacePlan.from_dict(plan.to_dict()) == plan
+
+    discontinuous = list(pick_place_trajectories)
+    discontinuous[4] = trajectory("payload_lift", "payload_transfer", 0.2, 0.3)
+    with pytest.raises(ValueError, match="trajectory discontinuity"):
+        TabletopPickPlacePlan(
+            request_sha256="b" * 64,
+            arm="right",
+            selected_candidate_id="candidate",
+            source_task=task,
+            destination_task=task,
+            trajectories=tuple(discontinuous),
+            phase_order=PICK_PLACE_PHASE_ORDER,
+            planner_provenance={},
+        )
 
 
 def test_supported_escape_requires_exact_reverse() -> None:

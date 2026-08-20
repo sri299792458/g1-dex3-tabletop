@@ -8,7 +8,6 @@ import hashlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from itertools import permutations, product
 from pathlib import Path
 from typing import Any
 
@@ -48,14 +47,20 @@ from g1_dex3_tabletop.planning.g1_model import (
     model_source_hashes,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
+    PICK_PLACE_PHASE_ORDER,
     CharucoSupportedEscapeRequest,
+    PickPlaceRetentionRouteValidationRequest,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
+    TabletopPickPlacePlan,
+    TabletopPickPlaceRequest,
     TabletopPregraspPlan,
     TabletopTaskPlan,
     TabletopTaskRequest,
 )
+from g1_dex3_tabletop.tabletop_geometry import canonical_resting_cube_pose
+from g1_dex3_tabletop.tabletop_workflow import destination_request_for_pick_place
 
 ROOT = Path(__file__).resolve().parents[3]
 WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M = 1.0e-6
@@ -403,6 +408,31 @@ def _anchor_trajectory_start(
     )
 
 
+def _anchor_trajectory_end(
+    trajectory: PlannedTrajectory,
+    *,
+    command_q_rad: np.ndarray,
+    model_q_rad: np.ndarray,
+) -> PlannedTrajectory:
+    """Preserve the exact next-phase boundary across float32 CuRobo output."""
+
+    reversed_trajectory = _reverse_trajectory(trajectory)
+    anchored = _anchor_trajectory_start(
+        reversed_trajectory,
+        command_q_rad=command_q_rad,
+        model_q_rad=model_q_rad,
+    )
+    restored = _reverse_trajectory(anchored)
+    return PlannedTrajectory(
+        from_pose_id=trajectory.from_pose_id,
+        to_pose_id=trajectory.to_pose_id,
+        sample_time_s=restored.sample_time_s,
+        command_q_rad=restored.command_q_rad,
+        model_q_rad=restored.model_q_rad,
+        planning_time_s=trajectory.planning_time_s,
+    )
+
+
 def _split_lift_trajectory(
     trajectory: PlannedTrajectory,
     *,
@@ -557,32 +587,7 @@ def _candidate_transform(entry: dict[str, Any]) -> np.ndarray:
 
 
 def _canonical_resting_cube_pose(base_T_detected_object: np.ndarray) -> np.ndarray:
-    """Map the uppermost physical cube face to canonical object +Z."""
-
-    detected = np.asarray(base_T_detected_object, dtype=np.float64)
-    rotations = []
-    for permutation in permutations(range(3)):
-        for signs in product((-1.0, 1.0), repeat=3):
-            symmetry = np.zeros((3, 3), dtype=np.float64)
-            symmetry[list(permutation), range(3)] = signs
-            if np.linalg.det(symmetry) > 0.0:
-                rotations.append(symmetry)
-    candidates = [
-        symmetry
-        for symmetry in rotations
-        if float((detected[:3, :3] @ symmetry)[2, 2]) >= np.cos(np.deg2rad(20.0))
-    ]
-    if not candidates:
-        raise RuntimeError(
-            "AprilCube is not resting on a face: no face normal points upward within 20 degrees"
-        )
-    # The four rotations about the upward face are physically equivalent.
-    # Select the smallest frame change deterministically; tabletop yaw remains
-    # exactly whatever the detector observed.
-    symmetry = max(candidates, key=lambda value: (float(np.trace(value)), *value.ravel()))
-    canonical = detected.copy()
-    canonical[:3, :3] = detected[:3, :3] @ symmetry
-    return canonical
+    return canonical_resting_cube_pose(base_T_detected_object)
 
 
 def _table_from_resting_object(
@@ -598,12 +603,35 @@ def _table_from_resting_object(
     base_T_camera = base_T_torso @ np.asarray(request.torso_T_camera)
     detected_object = base_T_camera @ np.asarray(request.planning_camera_T_object)
     base_T_object = _canonical_resting_cube_pose(detected_object)
-    object_up = base_T_object[:3, 2]
+    table_reference = request.table_reference_camera_T_object
+    if table_reference is None:
+        base_T_table_reference = base_T_object
+        reference_extent = request.object_dimensions_m[2]
+        fixture_height = 0.0 if request.fixture is None else request.fixture.support_height_m
+    else:
+        base_T_table_reference = _canonical_resting_cube_pose(
+            base_T_camera @ np.asarray(table_reference)
+        )
+        assert request.table_reference_object_dimensions_m is not None
+        reference_extent = request.table_reference_object_dimensions_m[2]
+        fixture_height = 0.0
+    object_up = base_T_table_reference[:3, 2]
     down = -object_up
-    extent = request.object_dimensions_m[2]
-    support_height = 0.0 if request.fixture is None else request.fixture.support_height_m
-    top_origin = base_T_object[:3, 3] + (0.5 * extent + support_height) * down
+    top_origin = base_T_table_reference[:3, 3] + (0.5 * reference_extent + fixture_height) * down
     return top_origin, base_T_object, down
+
+
+def _base_T_detected_object(
+    request: TabletopTaskRequest,
+    base_T_torso: np.ndarray,
+) -> np.ndarray:
+    """Return the unpermuted detector frame used by inter-object contracts."""
+
+    return (
+        np.asarray(base_T_torso, dtype=np.float64)
+        @ np.asarray(request.torso_T_camera, dtype=np.float64)
+        @ np.asarray(request.planning_camera_T_object, dtype=np.float64)
+    )
 
 
 def _table_from_charuco_board(
@@ -659,6 +687,8 @@ def _base_scene(
     *,
     include_cube: bool,
     include_open_transit_table_patch: bool = False,
+    include_environment_cuboids: bool = True,
+    include_placement_support: bool = True,
 ) -> dict[str, Any]:
     plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
     scene: dict[str, Any] = {"cuboid": {}}
@@ -667,6 +697,16 @@ def _base_scene(
             "dims": list(request.object_dimensions_m),
             "pose": _pose_list(base_T_object),
         }
+    if include_environment_cuboids:
+        base_T_detected_object = _base_T_detected_object(request, base_T_torso)
+        for cuboid in request.environment_cuboids:
+            if cuboid.role == "placement_support" and not include_placement_support:
+                continue
+            base_T_cuboid = base_T_detected_object @ np.asarray(cuboid.object_T_cuboid)
+            scene["cuboid"][cuboid.object_id] = {
+                "dims": list(cuboid.dimensions_m),
+                "pose": _pose_list(base_T_cuboid),
+            }
     if include_open_transit_table_patch:
         dimensions = request.open_transit_table_patch_dimensions_m
         base_T_patch = base_T_object.copy()
@@ -704,7 +744,12 @@ def _attached_lift_scene(
     attached cube, preserving every hand/fixture collision rule.
     """
 
-    scene = _base_scene(request, base_T_torso, include_cube=False)
+    scene = _base_scene(
+        request,
+        base_T_torso,
+        include_cube=False,
+        include_placement_support=False,
+    )
     if request.fixture is not None:
         meshes = scene.get("mesh", {})
         meshes.pop(request.fixture.fixture_id, None)
@@ -716,6 +761,7 @@ def _attached_lift_scene(
 def _fixture_collision_checker(
     request: TabletopTaskRequest,
     base_T_object: np.ndarray,
+    base_T_detected_object: np.ndarray,
     down: np.ndarray,
     *,
     device_cfg,
@@ -724,19 +770,29 @@ def _fixture_collision_checker(
 
     path = _fixture_mesh_path(request)
     fixture_pose = _base_T_fixture(request, base_T_object, down)
-    if path is None or fixture_pose is None:
+    cuboids = {
+        cuboid.object_id: {
+            "dims": list(cuboid.dimensions_m),
+            "pose": _pose_list(base_T_detected_object @ np.asarray(cuboid.object_T_cuboid)),
+        }
+        for cuboid in request.environment_cuboids
+    }
+    if (path is None or fixture_pose is None) and not cuboids:
         return None
-    assert request.fixture is not None
-    return CuroboWorldCollisionChecker(
-        scene={
-            "mesh": {
-                request.fixture.fixture_id: {
-                    "file_path": str(path),
-                    "pose": _pose_list(fixture_pose),
-                    "scale": list(request.fixture.mesh_scale),
-                }
+    scene: dict[str, Any] = {}
+    if cuboids:
+        scene["cuboid"] = cuboids
+    if path is not None and fixture_pose is not None:
+        assert request.fixture is not None
+        scene["mesh"] = {
+            request.fixture.fixture_id: {
+                "file_path": str(path),
+                "pose": _pose_list(fixture_pose),
+                "scale": list(request.fixture.mesh_scale),
             }
-        },
+        }
+    return CuroboWorldCollisionChecker(
+        scene=scene,
         device_cfg=device_cfg,
     )
 
@@ -937,6 +993,71 @@ def _validate_start_relative_retention_clearance(
     )
 
 
+def _validate_pick_place_retention_clearance(
+    clearances: np.ndarray,
+    link_names: tuple[str, ...],
+    *,
+    required_m: float,
+) -> _StartRelativePlaneClearance:
+    """Validate contact→free-space→contact without assuming equal endpoints."""
+
+    values = np.asarray(clearances, dtype=np.float64)
+    links = tuple(link_names)
+    if values.ndim != 1 or len(values) < 3 or len(links) != len(values):
+        raise ValueError("pick-place clearance evidence must be one finite route")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("pick-place clearance evidence must be finite")
+    tolerance = PLANE_CLEARANCE_NUMERICAL_TOLERANCE_M
+    if values[0] <= 0.0 or values[-1] <= 0.0:
+        boundary_index = 0 if values[0] <= values[-1] else len(values) - 1
+        raise RuntimeError(
+            "measured close pick-place endpoint is not above its supporting plane: "
+            f"clearance={values[boundary_index]:.4f}m at {links[boundary_index]} "
+            f"sample {boundary_index}/{len(values) - 1}"
+        )
+    full = np.flatnonzero(values >= required_m - tolerance)
+    if len(full) == 0:
+        raise RuntimeError(
+            "measured close pick-place route never reaches the required free-space "
+            f"hand/table margin {required_m:.4f}m"
+        )
+    first_full = int(full[0])
+    last_full = int(full[-1])
+    outbound_minimum_sample = int(np.argmin(values[: first_full + 1]))
+    if values[outbound_minimum_sample] < values[0] - tolerance:
+        raise RuntimeError(
+            "measured close pick-place escape moves below its achieved source contact "
+            f"clearance: {values[outbound_minimum_sample]:.4f}m at sample "
+            f"{outbound_minimum_sample}/{len(values) - 1}; source={values[0]:.4f}m"
+        )
+    interior = values[first_full : last_full + 1]
+    interior_offset = int(np.argmin(interior))
+    interior_sample = first_full + interior_offset
+    if interior[interior_offset] < required_m - tolerance:
+        raise RuntimeError(
+            "measured close pick-place route drops below the required free-space "
+            f"margin: {values[interior_sample]:.4f}m at sample "
+            f"{interior_sample}/{len(values) - 1}; required={required_m:.4f}m"
+        )
+    inbound_offset = int(np.argmin(values[last_full:]))
+    inbound_sample = last_full + inbound_offset
+    if values[inbound_sample] < values[-1] - tolerance:
+        raise RuntimeError(
+            "measured close pick-place placement moves below its destination contact "
+            f"clearance: {values[inbound_sample]:.4f}m at sample "
+            f"{inbound_sample}/{len(values) - 1}; destination={values[-1]:.4f}m"
+        )
+    minimum_sample = int(np.argmin(values))
+    return _StartRelativePlaneClearance(
+        minimum_m=float(values[minimum_sample]),
+        minimum_link=links[minimum_sample],
+        minimum_sample=minimum_sample,
+        boundary_m=min(float(values[0]), float(values[-1])),
+        first_full_margin_sample=first_full,
+        last_full_margin_sample=last_full,
+    )
+
+
 class _FixedCloseSweepValidator:
     """Check the commanded finger sweep at a candidate's fixed arm contact pose.
 
@@ -951,6 +1072,7 @@ class _FixedCloseSweepValidator:
         *,
         request: TabletopTaskRequest,
         base_T_object: np.ndarray,
+        base_T_detected_object: np.ndarray,
         plane_point: np.ndarray,
         down: np.ndarray,
         open_q: np.ndarray,
@@ -978,6 +1100,7 @@ class _FixedCloseSweepValidator:
         self.fixture_checker = _fixture_collision_checker(
             request,
             base_T_object,
+            base_T_detected_object,
             self.down,
             device_cfg=self.device_cfg,
         )
@@ -1050,6 +1173,8 @@ class _FixedCloseSweepValidator:
     def batch_candidate_rejections(
         self,
         grasp_matrices: list[np.ndarray],
+        *,
+        exact_table_evidence: list[tuple[float, str, int]] | None = None,
     ) -> dict[int, tuple[str, str]]:
         """Prune target-fixed hand/fixture and hand/table failures on CUDA."""
 
@@ -1060,6 +1185,13 @@ class _FixedCloseSweepValidator:
         matrices = np.asarray(grasp_matrices, dtype=np.float64)
         if matrices.ndim != 3 or matrices.shape[1:] != (4, 4):
             raise ValueError("fixed-close candidate poses must have shape N x 4 x 4")
+        if self.request.fixture is None:
+            if exact_table_evidence is None or len(exact_table_evidence) != len(matrices):
+                raise ValueError(
+                    "direct-table fixed-close pruning requires exact qualification evidence"
+                )
+        elif exact_table_evidence is not None:
+            raise ValueError("fixture planning cannot use direct-table qualification evidence")
         sample_count = len(self.finger_sweep)
         candidates_per_batch = max(
             FIXED_CLOSE_COLLISION_BATCH_SAMPLES // sample_count,
@@ -1110,16 +1242,20 @@ class _FixedCloseSweepValidator:
                         ),
                     )
                     continue
-                minimum = float(minimum_clearance[local_index].item())
-                if minimum < self.request.minimum_hand_plane_clearance_m:
+                if exact_table_evidence is None:
+                    minimum = float(minimum_clearance[local_index].item())
                     flattened = int(minimum_flat[local_index].item())
                     sample = flattened // int(world.shape[-2])
                     sphere = flattened % int(world.shape[-2])
+                    link_name = self.hand_sphere_link_names[sphere]
+                else:
+                    minimum, link_name, sample = exact_table_evidence[candidate_index]
+                if minimum < self.request.minimum_hand_plane_clearance_m:
                     rejections[candidate_index] = (
                         "batched_fixed_close_table_plane",
                         (
                             f"clearance={minimum:.4f}m at "
-                            f"{self.hand_sphere_link_names[sphere]} sample "
+                            f"{link_name} sample "
                             f"{sample}/{sample_count - 1}; required="
                             f"{self.request.minimum_hand_plane_clearance_m:.4f}m"
                         ),
@@ -2353,7 +2489,12 @@ def _validate_open_route(
             f"{pair[0]}/{pair[1]}={penetration * 1000.0:.3f}mm at sample {sample_index}",
         )
 
-    cube_scene = _base_scene(request, base_T_torso, include_cube=True)
+    cube_scene = _base_scene(
+        request,
+        base_T_torso,
+        include_cube=True,
+        include_environment_cuboids=False,
+    )
     route_cube_clearances = _world_cuboid_clearances(
         robot=open_robot,
         q_samples=open_route_q,
@@ -2371,6 +2512,35 @@ def _validate_open_route(
         sample_index, link_name, object_name, clearance = closest_cube
         raise _BranchRejected(
             "open_route_strict_cube_collision",
+            f"{link_name}/{object_name}={clearance * 1000.0:+.3f}mm "
+            f"clearance at sample {sample_index}; required "
+            f"{OPEN_TRANSIT_OBJECT_CLEARANCE_M * 1000.0:.3f}mm",
+        )
+
+    environment_scene = _base_scene(
+        request,
+        base_T_torso,
+        include_cube=False,
+        include_environment_cuboids=True,
+    )
+    environment_scene.get("cuboid", {}).pop("open_transit_table_patch", None)
+    route_environment_clearances = _world_cuboid_clearances(
+        robot=open_robot,
+        q_samples=open_route_q,
+        scene=environment_scene,
+        device_cfg=device_cfg,
+        disabled_links=set(),
+        checker=strict_checker,
+    )
+    closest_environment = None
+    for sample_index, clearances in enumerate(route_environment_clearances):
+        for (link_name, object_name), clearance in clearances.items():
+            if closest_environment is None or clearance < closest_environment[3]:
+                closest_environment = (sample_index, link_name, object_name, clearance)
+    if closest_environment is not None:
+        sample_index, link_name, object_name, clearance = closest_environment
+        raise _BranchRejected(
+            "open_route_environment_collision",
             f"{link_name}/{object_name}={clearance * 1000.0:+.3f}mm "
             f"clearance at sample {sample_index}; required "
             f"{OPEN_TRANSIT_OBJECT_CLEARANCE_M * 1000.0:.3f}mm",
@@ -2710,6 +2880,198 @@ def _plan_attached_lift(
         _cleanup(planner)
 
 
+def _rename_trajectory(
+    trajectory: PlannedTrajectory,
+    *,
+    from_pose_id: str,
+    to_pose_id: str,
+) -> PlannedTrajectory:
+    return PlannedTrajectory(
+        from_pose_id=from_pose_id,
+        to_pose_id=to_pose_id,
+        sample_time_s=trajectory.sample_time_s,
+        command_q_rad=trajectory.command_q_rad,
+        model_q_rad=trajectory.model_q_rad,
+        planning_time_s=trajectory.planning_time_s,
+    )
+
+
+def _attached_transfer_scene(
+    request: TabletopPickPlaceRequest,
+    base_T_torso: np.ndarray,
+) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
+    """Build one table/world scene covering the complete source-destination span."""
+
+    source = request.source_request
+    plane_point, base_T_object, down = _table_from_resting_object(source, base_T_torso)
+    scene = _base_scene(
+        source,
+        base_T_torso,
+        include_cube=False,
+        include_open_transit_table_patch=False,
+    )
+    dimensions = np.asarray(source.open_transit_table_patch_dimensions_m, dtype=np.float64)
+    relative = np.asarray(request.source_T_destination_object, dtype=np.float64)
+    base_T_detected_source = _base_T_detected_object(source, base_T_torso)
+    base_T_destination = base_T_detected_source @ relative
+    displacement = base_T_destination[:3, 3] - base_T_object[:3, 3]
+    displacement_xy = base_T_object[:3, :2].T @ displacement
+    expanded = dimensions.copy()
+    expanded[:2] += np.abs(displacement_xy)
+    base_T_patch = base_T_object.copy()
+    base_T_patch[:3, 3] = (
+        plane_point + base_T_object[:3, :2] @ (0.5 * displacement_xy) + 0.5 * expanded[2] * down
+    )
+    scene.setdefault("cuboid", {})["open_transit_table_patch"] = {
+        "dims": expanded.tolist(),
+        "pose": _pose_list(base_T_patch),
+    }
+    return scene, plane_point, down
+
+
+def _plan_attached_transfer(
+    request: TabletopPickPlaceRequest,
+    source_task: TabletopTaskPlan,
+    destination_task: TabletopTaskPlan,
+) -> tuple[PlannedTrajectory, dict[str, Any]]:
+    """Connect the two already-validated lifted states with the payload attached."""
+
+    import torch
+    from curobo.types import DeviceCfg
+
+    source = request.source_request
+    arm = source.arm
+    if source_task.arm != arm or destination_task.arm != arm:
+        raise ValueError("pick-place transfer tasks use a different arm")
+    if source_task.selected_candidate_id != destination_task.selected_candidate_id:
+        raise ValueError("pick-place transfer changed the selected grasp")
+    if not np.allclose(
+        source_task.object_T_grasp,
+        destination_task.object_T_grasp,
+        atol=1.0e-9,
+        rtol=0.0,
+    ):
+        raise ValueError("pick-place transfer changed the object-to-grasp transform")
+
+    source_lift = source_task.trajectories[3]
+    destination_lift = destination_task.trajectories[3]
+    start_command = np.asarray(source_lift.command_q_rad[-1], dtype=np.float64)
+    start_model = np.asarray(source_lift.model_q_rad[-1], dtype=np.float64)
+    goal_command = np.asarray(destination_lift.command_q_rad[-1], dtype=np.float64)
+    goal_model = np.asarray(destination_lift.model_q_rad[-1], dtype=np.float64)
+    close_target = dex3_execution_profile(arm)[1]
+    transfer_snapshot = _snapshot_at_arm_q(source, tuple(start_command))
+    robot, _ = build_tabletop_robot_config(
+        arm=arm,
+        snapshot=transfer_snapshot,
+        joint_position_offsets_rad=source.joint_position_offsets_rad,
+        active_finger_q_rad=close_target,
+    )
+    device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+    checker = CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+    start_state = _joint_state(device_cfg, start_model, arm_joint_names(arm))
+    base_T_torso = (
+        checker.kinematics.compute_kinematics(start_state)
+        .tool_poses["torso_link"]
+        .get_matrix()[0]
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    _use_moving_grasp_frame_only(robot, arm=arm)
+    scene, plane_point, down = _attached_transfer_scene(request, base_T_torso)
+    planner = None
+    started = time.monotonic()
+    try:
+        planner, planner_device = _planner(
+            robot,
+            scene,
+            max_goalset=1,
+            seed=source.random_seed,
+        )
+        start_state = _joint_state(planner_device, start_model, arm_joint_names(arm))
+        goal_state = _joint_state(planner_device, goal_model, arm_joint_names(arm))
+        sphere_count = _attach_cube(
+            planner,
+            start_state,
+            invert_transform(np.asarray(source_task.object_T_grasp, dtype=np.float64)),
+            source.object_dimensions_m,
+            arm=arm,
+        )
+        result = planner.plan_cspace(
+            goal_state=goal_state,
+            current_state=start_state,
+            max_attempts=10,
+            enable_graph_attempt=1,
+        )
+        if result is None or not bool(result.success.any()):
+            raise _BranchRejected(
+                "attached_payload_transfer",
+                _cspace_failure_reason(result),
+            )
+        transfer = _result_trajectory(
+            planner,
+            result,
+            arm=arm,
+            from_id="payload_lift",
+            to_id="payload_transfer",
+            offsets=source.joint_position_offsets_rad,
+            maximum_velocity_rad_s=source.maximum_arm_velocity_rad_s,
+        )
+        transfer = _anchor_trajectory_start(
+            transfer,
+            command_q_rad=start_command,
+            model_q_rad=start_model,
+        )
+        transfer = _anchor_trajectory_end(
+            transfer,
+            command_q_rad=goal_command,
+            model_q_rad=goal_model,
+        )
+        transfer_q = np.asarray(transfer.model_q_rad, dtype=np.float64)
+        hand_clearance, hand_link, hand_sample = _local_plane_clearance(
+            planner,
+            transfer_q,
+            arm=arm,
+            plane_point=plane_point,
+            down=down,
+            include_payload=False,
+        )
+        if hand_clearance < source.minimum_hand_plane_clearance_m:
+            raise _BranchRejected(
+                "attached_transfer_table_plane",
+                f"hand clearance={hand_clearance:.4f}m at {hand_link} sample "
+                f"{hand_sample}; required={source.minimum_hand_plane_clearance_m:.4f}m",
+            )
+        payload_clearance, payload_link, payload_sample = _local_plane_clearance(
+            planner,
+            transfer_q,
+            arm=arm,
+            plane_point=plane_point,
+            down=down,
+            include_payload=True,
+        )
+        if payload_clearance < source.minimum_hand_plane_clearance_m:
+            raise _BranchRejected(
+                "attached_transfer_payload_table_plane",
+                f"payload clearance={payload_clearance:.4f}m at {payload_link} sample "
+                f"{payload_sample}; required={source.minimum_hand_plane_clearance_m:.4f}m",
+            )
+        return transfer, {
+            "elapsed_s": time.monotonic() - started,
+            "attachment_sphere_count": sphere_count,
+            "minimum_hand_plane_clearance_m": hand_clearance,
+            "minimum_hand_plane_link": hand_link,
+            "minimum_hand_plane_sample": hand_sample,
+            "minimum_payload_plane_clearance_m": payload_clearance,
+            "minimum_payload_plane_link": payload_link,
+            "minimum_payload_plane_sample": payload_sample,
+            "world_cuboid_ids": sorted(scene.get("cuboid", {})),
+        }
+    finally:
+        _cleanup(planner)
+
+
 def _payload_route(task: TabletopTaskPlan) -> np.ndarray:
     payload_phases = (
         "retention_test_lift",
@@ -2773,6 +3135,7 @@ class RetentionRouteValidator:
         self.fixture_checker = _fixture_collision_checker(
             tabletop,
             base_T_object,
+            _base_T_detected_object(tabletop, base_T_torso),
             self.down,
             device_cfg=self.device_cfg,
         )
@@ -2893,6 +3256,170 @@ class RetentionRouteValidator:
         )
 
 
+def _pick_place_payload_route(plan: TabletopPickPlacePlan) -> np.ndarray:
+    payload_phases = PICK_PLACE_PHASE_ORDER[2:7]
+    trajectories = tuple(
+        value for value in plan.trajectories if value.to_pose_id in payload_phases
+    )
+    if tuple(value.to_pose_id for value in trajectories) != payload_phases:
+        raise ValueError("pick-place plan lacks its complete closed-payload route")
+    return np.concatenate(
+        (
+            np.asarray(trajectories[0].model_q_rad, dtype=np.float64),
+            *(np.asarray(value.model_q_rad[1:], dtype=np.float64) for value in trajectories[1:]),
+        ),
+        axis=0,
+    )
+
+
+class PickPlaceRetentionRouteValidator:
+    """Recheck the complete transfer using the actual contact-stopped Dex3 posture."""
+
+    def __init__(
+        self,
+        request: TabletopPickPlaceRequest,
+        plan: TabletopPickPlacePlan,
+    ) -> None:
+        import torch
+        from curobo.types import DeviceCfg, JointState
+
+        if plan.request_sha256 != request.content_sha256:
+            raise ValueError("pick-place retention plan belongs to a different request")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CuRobo retention validation requires a CUDA device")
+        self.request = request
+        self.plan = plan
+        self.tabletop = request.source_request
+        self.arm = self.tabletop.arm
+        self.route_q = _pick_place_payload_route(plan)
+        started = time.monotonic()
+        robot, self.active_joint_names, reference = build_tabletop_route_validation_robot_config(
+            arm=self.arm,
+            snapshot=self.tabletop.planning_snapshot,
+            joint_position_offsets_rad=self.tabletop.joint_position_offsets_rad,
+        )
+        self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+        self.checker = CuroboKinematicCollisionChecker(
+            robot=robot,
+            device_cfg=self.device_cfg,
+        )
+        reference_state = JointState.from_position(
+            self.device_cfg.to_device(np.asarray(reference, dtype=np.float64)[None]),
+            joint_names=list(self.active_joint_names),
+        )
+        kinematics = self.checker.kinematics.compute_kinematics(reference_state)
+        base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
+        self.plane_point, base_T_object, self.down = _table_from_resting_object(
+            self.tabletop,
+            base_T_torso,
+        )
+        self.environment_checker = _fixture_collision_checker(
+            self.tabletop,
+            base_T_object,
+            _base_T_detected_object(self.tabletop, base_T_torso),
+            self.down,
+            device_cfg=self.device_cfg,
+        )
+        self.cache_build_s = time.monotonic() - started
+
+    def validate(
+        self,
+        request: PickPlaceRetentionRouteValidationRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> RetentionRouteValidationResult:
+        report = progress or (lambda _message: None)
+        if request.pick_place_request.content_sha256 != self.request.content_sha256:
+            raise ValueError("retention request differs from the cached pick-place request")
+        if request.pick_place_plan.content_sha256 != self.plan.content_sha256:
+            raise ValueError("retention request differs from the cached pick-place plan")
+        finger_q = np.asarray(request.measured_active_dex3_q_rad, dtype=np.float64)
+        route_q = np.concatenate(
+            (self.route_q, np.repeat(finger_q[None], len(self.route_q), axis=0)),
+            axis=1,
+        )
+        started = time.monotonic()
+        collision_samples = self.checker.self_collision_pair_penetrations(
+            route_q,
+            joint_names=self.active_joint_names,
+        )
+        for sample_index, pairs in enumerate(collision_samples):
+            if not pairs:
+                continue
+            pair, penetration = max(pairs.items(), key=lambda item: item[1])
+            raise RuntimeError(
+                "measured close Dex3 posture invalidates the pick-place payload route: "
+                f"{pair[0]}/{pair[1]}={penetration * 1000.0:.3f}mm penetration "
+                f"at sample {sample_index}/{len(route_q) - 1}"
+            )
+        sphere_tensor = self.checker.robot_spheres(
+            route_q,
+            joint_names=self.active_joint_names,
+        )
+        spheres = sphere_tensor.detach().cpu().numpy().reshape(len(route_q), -1, 4)
+        hand_clearances, hand_links = _local_plane_clearance_samples_from_spheres(
+            spheres,
+            config=self.checker.config.kinematics_config,
+            arm=self.arm,
+            plane_point=self.plane_point,
+            down=self.down,
+            include_payload=False,
+        )
+        plane_policy = _validate_pick_place_retention_clearance(
+            hand_clearances,
+            hand_links,
+            required_m=self.tabletop.minimum_hand_plane_clearance_m,
+        )
+        if self.environment_checker is not None:
+            environment_hit = self.environment_checker.first_collision(
+                sphere_tensor,
+                kinematics_config=self.checker.config.kinematics_config,
+            )
+            if environment_hit is not None:
+                penetration, link_name, sample = environment_hit
+                raise RuntimeError(
+                    "measured close Dex3 posture invalidates the pick-place route "
+                    f"against the fixed world: {link_name} has "
+                    f"{penetration * 1000.0:.3f}mm penetration at sample "
+                    f"{sample}/{len(route_q) - 1}"
+                )
+        report(
+            "measured close-hand pick-place route passed strict self-collision, "
+            "fixed-world, and source-to-destination table-plane checks"
+        )
+        return RetentionRouteValidationResult(
+            request_sha256=request.content_sha256,
+            arm=self.arm,
+            selected_candidate_id=self.plan.selected_candidate_id,
+            route_sample_count=len(route_q),
+            minimum_hand_plane_clearance_m=plane_policy.minimum_m,
+            minimum_hand_plane_link=plane_policy.minimum_link,
+            minimum_hand_plane_sample=plane_policy.minimum_sample,
+            minimum_fixture_clearance_m=None,
+            minimum_fixture_clearance_link=None,
+            minimum_fixture_clearance_sample=None,
+            planner_provenance={
+                **model_source_hashes(),
+                "curobo_commit": CUROBO_COMMIT,
+                "elapsed_s": time.monotonic() - started,
+                "cached_kinematics": True,
+                "cache_build_s": self.cache_build_s,
+                "required_hand_plane_clearance_m": (self.tabletop.minimum_hand_plane_clearance_m),
+                "table_plane_policy": "positive_source_and_destination_contacts",
+                "source_contact_hand_plane_clearance_m": float(hand_clearances[0]),
+                "destination_contact_hand_plane_clearance_m": float(hand_clearances[-1]),
+                "first_full_margin_sample": plane_policy.first_full_margin_sample,
+                "last_full_margin_sample": plane_policy.last_full_margin_sample,
+                "policy": (
+                    "fixed pick-place closed-payload arm route; measured stable-close "
+                    "Dex3; strict full-robot self-collision, fixed cuboids, and table plane"
+                ),
+                "blocked_motor_ids": list(request.blocked_motor_ids),
+                "pressure_used_for_live_decision": False,
+            },
+        )
+
+
 def validate_retention_route(
     request: RetentionRouteValidationRequest,
     *,
@@ -2991,6 +3518,7 @@ def _plan_tabletop(
         fixed_close_validator = _FixedCloseSweepValidator(
             request=request,
             base_T_object=base_T_object,
+            base_T_detected_object=_base_T_detected_object(request, base_T_torso),
             plane_point=plane_point,
             down=down,
             open_q=open_q,
@@ -3000,7 +3528,25 @@ def _plan_tabletop(
         approach_distance_m = float(shortlist["execution_contract"]["approach_distance_m"])
         branch_rejections: list[dict[str, Any]] = []
         stage_started = time.monotonic()
-        candidate_rejections = fixed_close_validator.batch_candidate_rejections(grasp_matrices)
+        exact_table_evidence = None
+        if request.fixture is None:
+            exact_table_evidence = []
+            for candidate in candidates:
+                evidence = candidate["execution_evidence"]
+                link_name = str(evidence["fixed_close_sweep_minimum_link"])
+                if arm == "left":
+                    link_name = link_name.replace("right_", "left_", 1)
+                exact_table_evidence.append(
+                    (
+                        float(evidence["fixed_close_sweep_table_clearance_m"]),
+                        link_name,
+                        int(evidence["fixed_close_sweep_minimum_sample"]),
+                    )
+                )
+        candidate_rejections = fixed_close_validator.batch_candidate_rejections(
+            grasp_matrices,
+            exact_table_evidence=exact_table_evidence,
+        )
         batched_fixed_close_s = time.monotonic() - stage_started
         remaining_indices = [
             index for index in range(len(candidates)) if index not in candidate_rejections
@@ -3692,3 +4238,145 @@ def plan_tabletop_task(
     if not isinstance(result, TabletopTaskPlan):
         raise TypeError("complete task planner returned only a pregrasp route")
     return result
+
+
+def plan_tabletop_pick_place(
+    request: TabletopPickPlaceRequest,
+    *,
+    open_planner_cache: ReusableOpenPlanner | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> TabletopPickPlacePlan:
+    """Plan one fixed pick/place sequence without introducing a task graph."""
+
+    report = progress or (lambda _message: None)
+    started = time.monotonic()
+    source = request.source_request
+    report("planning the qualified source grasp and attached lift")
+    first_source_task = plan_tabletop_task(
+        source,
+        open_planner_cache=open_planner_cache,
+        progress=report,
+    )
+    destination = destination_request_for_pick_place(request)
+    _shortlist, candidates = _load_shortlist(source)
+    candidate_ids = [str(value["candidate_id"]) for value in candidates]
+    candidate_order = [
+        first_source_task.selected_candidate_id,
+        *(value for value in candidate_ids if value != first_source_task.selected_candidate_id),
+    ]
+    pick_place_rejections: list[dict[str, str]] = []
+    source_task = destination_task = transfer = transfer_provenance = None
+    for candidate_id in candidate_order:
+        if candidate_id == first_source_task.selected_candidate_id:
+            current_source = first_source_task
+        else:
+            report(f"trying next source/destination grasp {candidate_id}")
+            try:
+                current_source = plan_tabletop_task(
+                    source,
+                    required_candidate_id=candidate_id,
+                    open_planner_cache=open_planner_cache,
+                    progress=report,
+                )
+            except RuntimeError as error:
+                pick_place_rejections.append(
+                    {
+                        "candidate_id": candidate_id,
+                        "stage": "source",
+                        "reason": str(error),
+                    }
+                )
+                continue
+        report(
+            "planning the destination contact and reverse retreat while preserving "
+            f"grasp {candidate_id}"
+        )
+        try:
+            current_destination = plan_tabletop_task(
+                destination,
+                required_candidate_id=candidate_id,
+                open_planner_cache=open_planner_cache,
+                progress=report,
+            )
+            report("planning the attached-payload bridge between validated lifted states")
+            current_transfer, current_transfer_provenance = _plan_attached_transfer(
+                request,
+                current_source,
+                current_destination,
+            )
+        except RuntimeError as error:
+            pick_place_rejections.append(
+                {
+                    "candidate_id": candidate_id,
+                    "stage": "destination_or_transfer",
+                    "reason": str(error),
+                }
+            )
+            continue
+        source_task = current_source
+        destination_task = current_destination
+        transfer = current_transfer
+        transfer_provenance = current_transfer_provenance
+        break
+    if (
+        source_task is None
+        or destination_task is None
+        or transfer is None
+        or transfer_provenance is None
+    ):
+        raise RuntimeError(
+            "no qualified grasp passed the complete source, destination, and attached "
+            f"transfer lifecycle: {pick_place_rejections}"
+        )
+    destination_lower = _rename_trajectory(
+        destination_task.trajectories[4],
+        from_pose_id="payload_transfer",
+        to_pose_id="placement_lower",
+    )
+    destination_contact = _rename_trajectory(
+        destination_task.trajectories[5],
+        from_pose_id="placement_lower",
+        to_pose_id="placement_contact",
+    )
+    destination_retreat = _rename_trajectory(
+        destination_task.trajectories[6],
+        from_pose_id="placement_contact",
+        to_pose_id="placement_retreat",
+    )
+    destination_clearance = _rename_trajectory(
+        destination_task.trajectories[7],
+        from_pose_id="placement_retreat",
+        to_pose_id="return_to_clearance",
+    )
+    trajectories = (
+        *source_task.trajectories[:4],
+        transfer,
+        destination_lower,
+        destination_contact,
+        destination_retreat,
+        destination_clearance,
+    )
+    report(
+        f"pick-place plan ready with {len(trajectories)} fixed motion phases; "
+        "the source and destination use the same qualified grasp"
+    )
+    return TabletopPickPlacePlan(
+        request_sha256=request.content_sha256,
+        arm=source.arm,
+        selected_candidate_id=source_task.selected_candidate_id,
+        source_task=source_task,
+        destination_task=destination_task,
+        trajectories=trajectories,
+        phase_order=PICK_PLACE_PHASE_ORDER,
+        planner_provenance={
+            **model_source_hashes(),
+            "curobo_commit": CUROBO_COMMIT,
+            "elapsed_s": time.monotonic() - started,
+            "source_task_sha256": source_task.content_sha256,
+            "destination_task_sha256": destination_task.content_sha256,
+            "transfer": transfer_provenance,
+            "rejected_pick_place_grasps": pick_place_rejections,
+            "selection_policy": ("first-grasp-passing-source-destination-and-attached-transfer"),
+            "task_structure": "fixed_pick_place_sequence",
+        },
+    )

@@ -127,3 +127,77 @@ def observe_resting_cube(
         object_translation_spread_mm=translation_spread,
         object_rotation_spread_deg=rotation_spread,
     )
+
+
+def observe_resting_cube_pair(
+    images_bgr: Sequence[np.ndarray],
+    *,
+    camera_info: RectifiedCameraInfo,
+    cube40_detector: CorrespondenceDetector,
+    cube60_detector: CorrespondenceDetector,
+    snapshot: RobotSnapshot,
+    minimum_frames: int = 3,
+    maximum_translation_spread_mm: float = 5.0,
+    maximum_rotation_spread_deg: float = 2.0,
+    minimum_tag_short_side_px: float = 25.0,
+    maximum_reprojection_error_px: float = 3.0,
+) -> tuple[TabletopObservation, TabletopObservation]:
+    """Observe both uniquely tagged cubes from the same accepted image frames."""
+
+    common = set(
+        observe_resting_cube(
+            images_bgr,
+            camera_info=camera_info,
+            detector=cube40_detector,
+            snapshot=snapshot,
+            minimum_frames=minimum_frames,
+            maximum_translation_spread_mm=maximum_translation_spread_mm,
+            maximum_rotation_spread_deg=maximum_rotation_spread_deg,
+            minimum_tag_short_side_px=minimum_tag_short_side_px,
+            maximum_reprojection_error_px=maximum_reprojection_error_px,
+        ).source_frame_sha256
+    )
+    common.intersection_update(
+        observe_resting_cube(
+            images_bgr,
+            camera_info=camera_info,
+            detector=cube60_detector,
+            snapshot=snapshot,
+            minimum_frames=minimum_frames,
+            maximum_translation_spread_mm=maximum_translation_spread_mm,
+            maximum_rotation_spread_deg=maximum_rotation_spread_deg,
+            minimum_tag_short_side_px=minimum_tag_short_side_px,
+            maximum_reprojection_error_px=maximum_reprojection_error_px,
+        ).source_frame_sha256
+    )
+    paired_images = tuple(
+        image
+        for image in images_bgr
+        if hashlib.sha256(np.asarray(image).tobytes()).hexdigest() in common
+    )
+    if len(paired_images) < minimum_frames:
+        raise ValueError(
+            "the two cubes were not jointly detected in enough frames: "
+            f"{len(paired_images)}/{len(images_bgr)} common, need {minimum_frames}"
+        )
+    arguments = {
+        "camera_info": camera_info,
+        "snapshot": snapshot,
+        "minimum_frames": minimum_frames,
+        "maximum_translation_spread_mm": maximum_translation_spread_mm,
+        "maximum_rotation_spread_deg": maximum_rotation_spread_deg,
+        "minimum_tag_short_side_px": minimum_tag_short_side_px,
+        "maximum_reprojection_error_px": maximum_reprojection_error_px,
+    }
+    return (
+        observe_resting_cube(
+            paired_images,
+            detector=cube40_detector,
+            **arguments,
+        ),
+        observe_resting_cube(
+            paired_images,
+            detector=cube60_detector,
+            **arguments,
+        ),
+    )

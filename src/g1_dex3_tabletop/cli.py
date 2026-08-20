@@ -215,6 +215,50 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("/tmp/g1-dex3-tabletop-command.lock"),
     )
+    stack = subparsers.add_parser(
+        "run-stack",
+        help="move the 60 mm cube, reobserve it, then place the 40 mm cube on top",
+    )
+    stack.add_argument("--network-interface", required=True)
+    stack.add_argument("--domain-id", type=int, default=0)
+    stack.add_argument("--hardware-config", type=Path)
+    stack.add_argument("--calibration-bundle", type=Path, default=DEFAULT_BUNDLE)
+    stack.add_argument("--task-config", type=Path, default=DEFAULT_TASK_CONFIG)
+    stack.add_argument("--quality-config", type=Path, default=DEFAULT_QUALITY)
+    stack.add_argument("--output-root", type=Path, default=ROOT / "runs")
+    stack.add_argument("--observation-frames", type=int, default=5)
+    stack.add_argument(
+        "--maximum-arm-velocity-rad-s",
+        type=float,
+        default=None,
+        help="explicit per-run limit; omitted uses the task-config default",
+    )
+    stack.add_argument(
+        "--pc2-host",
+        default=os.environ.get("G1_PC2_HOST", "unitree@192.168.123.164"),
+    )
+    stack.add_argument(
+        "--pc2-ssh-identity",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "G1_PC2_SSH_IDENTITY",
+                str(Path.home() / ".ssh/g1_pc2_ed25519"),
+            )
+        ),
+    )
+    stack.add_argument("--confirm", required=True)
+    stack.add_argument("--no-window", action="store_true")
+    stack.add_argument(
+        "--skip-camera-recording",
+        action="store_true",
+        help="exclude raw RGB, depth, and CameraInfo from the MCAP",
+    )
+    stack.add_argument(
+        "--lock-file",
+        type=Path,
+        default=Path("/tmp/g1-dex3-tabletop-command.lock"),
+    )
     compliance = subparsers.add_parser(
         "measure-seat-compliance",
         help=("seated fixed-ChArUco A/B diagnostic: lift and exactly return both arms"),
@@ -496,6 +540,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.hardware_config is None:
             args.hardware_config = hardware_path
         handlers["run-tabletop"] = run_tabletop
+    if args.command == "run-stack":
+        from g1_dex3_tabletop.hardware_stack import run_stack
+
+        hardware_path, _target_path = _arm_paths("left")
+        if args.hardware_config is None:
+            args.hardware_config = hardware_path
+        handlers["run-stack"] = run_stack
     if args.command == "collect-calibration":
         from g1_dex3_tabletop.hardware_calibration import run_collect_calibration
 

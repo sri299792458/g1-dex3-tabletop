@@ -12,18 +12,23 @@ from g1_aprilcube_calibration.joint_map import arm_indices
 from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
 from g1_dex3_tabletop.planning.tabletop_mpc import TabletopPhaseMPC, mpc_phase_spec
 from g1_dex3_tabletop.planning.tabletop_planner import (
+    PickPlaceRetentionRouteValidator,
     RetentionRouteValidator,
     ReusableOpenPlanner,
     plan_supported_escape,
+    plan_tabletop_pick_place,
     plan_tabletop_pregrasp,
     plan_tabletop_task,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
+    PickPlaceRetentionRouteValidationRequest,
     PregraspRemainingPlan,
     RetentionRouteValidationRequest,
     RetentionRouteValidationResult,
     SupportedEscapePlan,
     TabletopExecutionPlan,
+    TabletopPickPlacePlan,
+    TabletopPickPlaceRequest,
     TabletopPregraspPlan,
     TabletopTaskPlan,
     TabletopTaskRequest,
@@ -48,6 +53,9 @@ class TabletopPlanningSession:
         self._execution: TabletopExecutionPlan | None = None
         self._active_task: TabletopTaskPlan | None = None
         self._retention_validator: RetentionRouteValidator | None = None
+        self._pick_place_request: TabletopPickPlaceRequest | None = None
+        self._pick_place_plan: TabletopPickPlacePlan | None = None
+        self._pick_place_retention_validator: PickPlaceRetentionRouteValidator | None = None
         self._phase_mpc: TabletopPhaseMPC | None = None
         self._active_phase_mpc: TabletopPhaseMPC | None = None
         self._open_planner = ReusableOpenPlanner()
@@ -103,7 +111,63 @@ class TabletopPlanningSession:
         self._execution = None
         self._active_task = None
         self._retention_validator = None
+        self._pick_place_request = None
+        self._pick_place_plan = None
+        self._pick_place_retention_validator = None
         return escape
+
+    def plan_pick_place(
+        self,
+        request: TabletopPickPlaceRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> TabletopPickPlacePlan:
+        """Plan one fixed source-to-destination transfer in the warm worker."""
+
+        controller = self._phase_mpc
+        if controller is not None:
+            controller.close()
+        self._phase_mpc = None
+        self._active_phase_mpc = None
+        plan = plan_tabletop_pick_place(
+            request,
+            open_planner_cache=self._open_planner,
+            progress=progress,
+        )
+        self._pick_place_request = request
+        self._pick_place_plan = plan
+        self._pick_place_retention_validator = None
+        return plan
+
+    def validate_pick_place_retention_route(
+        self,
+        request: PickPlaceRetentionRouteValidationRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> RetentionRouteValidationResult:
+        """Validate one measured close against its supplied frozen transfer.
+
+        Stack feasibility planning can evaluate more than one complete transfer
+        before either arm moves.  The most recently planned transfer is not
+        necessarily the one selected for execution, so rebuild only the cheap
+        collision checker when the hash-bound request names another already
+        supplied plan.  Motion planning is never repeated here.
+        """
+
+        if (
+            self._pick_place_request is None
+            or self._pick_place_plan is None
+            or self._pick_place_retention_validator is None
+            or self._pick_place_request.content_sha256 != request.pick_place_request.content_sha256
+            or self._pick_place_plan.content_sha256 != request.pick_place_plan.content_sha256
+        ):
+            self._pick_place_request = request.pick_place_request
+            self._pick_place_plan = request.pick_place_plan
+            self._pick_place_retention_validator = PickPlaceRetentionRouteValidator(
+                request.pick_place_request,
+                request.pick_place_plan,
+            )
+        return self._pick_place_retention_validator.validate(request, progress=progress)
 
     def plan_pregrasp_at_clearance(
         self,

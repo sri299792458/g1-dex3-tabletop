@@ -40,6 +40,9 @@ class Executor:
     def replace_validated_remaining_plan(self, **kwargs):
         self.replaced_plan = kwargs
 
+    def switch_validated_arm_plan(self, **kwargs):
+        self.switched_plan = kwargs
+
     def start_trajectory(self, **kwargs):
         self.trajectory = kwargs
 
@@ -151,3 +154,13 @@ def test_synchronized_executor_serializes_remaining_plan_replacement():
     synchronized.replace_validated_remaining_plan(**values)
 
     assert raw.replaced_plan == values
+
+
+def test_synchronized_executor_serializes_arm_plan_switch():
+    raw = Executor()
+    synchronized = SynchronizedPoseExecutor(raw)
+    values = {"pose_set": object(), "boundary_pose_id": "clearance"}
+
+    synchronized.switch_validated_arm_plan(**values)
+
+    assert raw.switched_plan == values

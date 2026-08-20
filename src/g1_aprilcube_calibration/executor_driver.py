@@ -97,6 +97,9 @@ class SynchronizedPoseExecutor:
     def replace_validated_remaining_plan(self, **kwargs) -> None:
         self._call("replace_validated_remaining_plan", **kwargs)
 
+    def switch_validated_arm_plan(self, **kwargs) -> None:
+        self._call("switch_validated_arm_plan", **kwargs)
+
     def begin_capture(self) -> None:
         self._call("begin_capture")
 
