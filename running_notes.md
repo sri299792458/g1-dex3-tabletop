@@ -4696,3 +4696,12 @@ Primary references:
   still ran, and the final suites pass `405 passed, 7 skipped` in the control
   environment and `405 passed, 1 skipped` in the CUDA planner environment. No
   robot command was sent while implementing or benchmarking this change.
+
+## 2026-08-20 — Commissioned 0.2 rad/s tabletop default
+
+- Successful physical 40 mm and 60 mm tabletop trials established
+  `0.200 rad/s` as the normal selected-arm trajectory limit. It is now the task
+  configuration default instead of requiring a per-run override.
+- `--maximum-arm-velocity-rad-s` remains available for deliberately slower
+  runs. The independent hardware ceiling remains `0.200 rad/s`; Dex3 posture
+  timing is unchanged.

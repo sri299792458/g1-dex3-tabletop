@@ -23,10 +23,11 @@ motion:
   # tracking/table-pose error while keeping a failed-retention drop low.
   retention_test_lift_m: 0.030
   payload_lift_m: 0.100
-  # Conservative default. A run may explicitly request a faster value, but the
-  # hardware executor independently refuses anything above its commissioned
-  # ceiling. Dex3 posture timing is separate and unchanged.
-  maximum_arm_velocity_rad_s: 0.100
+  # Commissioned default after successful 40 mm and 60 mm tabletop trials.
+  # A run may explicitly request a slower value; the hardware executor still
+  # independently refuses anything above its commissioned ceiling. Dex3
+  # posture timing is separate and unchanged.
+  maximum_arm_velocity_rad_s: 0.200
 perception:
   minimum_frames: 3
   maximum_translation_spread_mm: 5.0

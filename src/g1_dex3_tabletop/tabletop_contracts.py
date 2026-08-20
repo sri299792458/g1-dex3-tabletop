@@ -443,7 +443,7 @@ class TabletopTaskRequest:
     supported_escape_m: float = 0.100
     retention_test_lift_m: float = 0.030
     lift_m: float = 0.100
-    maximum_arm_velocity_rad_s: float = 0.100
+    maximum_arm_velocity_rad_s: float = 0.200
     random_seed: int = 17
     schema_version: int = PLANNER_SCHEMA_VERSION
     operation: str = "plan_tabletop_pick_lift_replace"
