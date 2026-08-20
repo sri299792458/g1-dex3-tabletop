@@ -227,7 +227,7 @@ payload, placement, and return motion and uses MPC only for the visually
 updated pregrasp-to-grasp segment. It requires the fixed ChArUco table board as
 a camera/body reference and a detectable AprilCube during the approach. The
 exact lifecycle, window checks, retained offline evidence, and current
-hardware-blocking post-grasp latency are documented in
+commissioning status are documented in
 [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 
 With the default `trajectory` controller, the program performs one additional
@@ -265,9 +265,10 @@ fixed ChArUco table board and the cube. Each local grasp-approach window uses a
 fresh cube image plus pelvis, waist, and torso state to update the Cartesian
 goal in the fixed board frame. After the hand closes, the attached-payload
 lifecycle is rebuilt at the reached object pose and executed as frozen
-MotionGen trajectories. This is not yet cleared for hardware: the remaining
-post-grasp rebuild pauses for about 14 seconds in retained testing. See
-[`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
+MotionGen trajectories. Heavy CuRobo structures are paid at the stationary
+clearance boundary; the retained composed replay reduced the post-grasp rebuild
+to about 2.0 seconds. This path still requires staged hardware commissioning.
+See [`docs/tabletop-mpc.md`](docs/tabletop-mpc.md).
 
 The direct-table presentation above remains the default. To use the prime
 tower, fix its base to the table and place the selected cube centred and

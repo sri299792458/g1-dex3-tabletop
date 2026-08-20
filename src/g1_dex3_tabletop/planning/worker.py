@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     benchmark = subparsers.add_parser(
         "benchmark-tabletop-mpc",
-        help="offline phase-aware MPC replay of a complete retained tabletop lifecycle",
+        help="offline legacy full-lifecycle MPC regression for retained plans",
     )
     benchmark.add_argument("--loaded-request", type=Path, required=True)
     benchmark.add_argument("--clearance-request", type=Path, required=True)

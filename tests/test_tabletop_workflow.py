@@ -11,6 +11,7 @@ from scipy.spatial.transform import Rotation
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
 from g1_aprilcube_calibration.timestamp_pairing import ImageTiming
 from g1_dex3_tabletop.hardware_tabletop import (
+    _execute_mpc_phase,
     _executed_mpc_approach,
     _return_to_clearance_phases,
     _save_frames,
@@ -177,6 +178,81 @@ def test_executed_mpc_approach_stitches_only_committed_window_segments() -> None
     assert approach.model_q_rad[0][0] == pytest.approx(0.1)
     assert approach.model_q_rad[-1][0] == pytest.approx(0.135)
     assert approach.planning_time_s == pytest.approx(0.04)
+
+
+def test_mpc_observes_first_moving_target_after_cold_setup() -> None:
+    events = []
+
+    class Planner:
+        def request_payload(self, command, **_kwargs):
+            events.append(command)
+            return {
+                "payload": {
+                    "phase": "grasp_approach",
+                    "physical_mode": "open_contact",
+                    "reused_warm_model": False,
+                    "preparation_time_s": 2.5,
+                    "build_time_s": 1.5,
+                    "setup_time_s": 1.0,
+                    "reconfiguration_time_s": 0.0,
+                }
+            }
+
+    def moving_target():
+        events.append("moving-target")
+        raise RuntimeError("stop after observation-order check")
+
+    with pytest.raises(RuntimeError, match="observation-order"):
+        _execute_mpc_phase(
+            object(),
+            SimpleNamespace(check=lambda: None),
+            Planner(),
+            arm="left",
+            trajectory=SimpleNamespace(to_pose_id="grasp_approach"),
+            plan_sha256="a" * 64,
+            control_config=SimpleNamespace(),
+            moving_target_provider=moving_target,
+            reference_T_camera0=np.eye(4),
+        )
+
+    assert events == ["prepare-mpc-phase", "moving-target"]
+
+
+def test_mpc_uses_clearance_preparation_without_rebuilding() -> None:
+    events = []
+
+    class Planner:
+        def request_payload(self, command, **_kwargs):
+            events.append(command)
+            raise AssertionError("prebuilt MPC must not be rebuilt at pregrasp")
+
+    def moving_target():
+        events.append("moving-target")
+        raise RuntimeError("stop after prebuilt-model check")
+
+    with pytest.raises(RuntimeError, match="prebuilt-model"):
+        _execute_mpc_phase(
+            object(),
+            SimpleNamespace(check=lambda: None),
+            Planner(),
+            arm="left",
+            trajectory=SimpleNamespace(to_pose_id="grasp_approach"),
+            plan_sha256="a" * 64,
+            control_config=SimpleNamespace(),
+            moving_target_provider=moving_target,
+            reference_T_camera0=np.eye(4),
+            prepared_mpc={
+                "phase": "grasp_approach",
+                "physical_mode": "open_contact",
+                "reused_warm_model": False,
+                "preparation_time_s": 2.5,
+                "build_time_s": 1.5,
+                "setup_time_s": 1.0,
+                "reconfiguration_time_s": 0.0,
+            },
+        )
+
+    assert events == ["moving-target"]
 
 
 def test_planner_pool_keeps_distinct_role_and_arm_slots() -> None:

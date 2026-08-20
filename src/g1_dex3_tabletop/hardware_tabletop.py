@@ -618,34 +618,39 @@ def _execute_mpc_phase(
     phase_record: dict | None = None,
     moving_target_provider=None,
     reference_T_camera0=None,
+    prepared_mpc: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     """Execute the local grasp approach through visual Cartesian MPC."""
 
     phase = trajectory.to_pose_id
-    pending_moving_target = None if moving_target_provider is None else moving_target_provider()
-    try:
-        preparation_event = planner.request_payload(
-            "prepare-mpc-phase",
-            payload={
-                "phase": phase,
-                "measured_active_dex3_q_rad": (
-                    None
-                    if measured_active_dex3_q_rad is None
-                    else list(measured_active_dex3_q_rad)
-                ),
-                "reference_T_camera0": (
-                    None
-                    if reference_T_camera0 is None
-                    else np.asarray(reference_T_camera0, dtype=np.float64).tolist()
-                ),
-            },
-            control_check=driver.check,
-            timeout_s=30.0,
-        )
-    except (PlannerRequestRejected, RuntimeError) as error:
-        driver.check()
-        raise RuntimeError(f"CuRobo MPC preparation failed for {phase}: {error}") from error
-    preparation = dict(preparation_event["payload"])
+    if prepared_mpc is None:
+        try:
+            preparation_event = planner.request_payload(
+                "prepare-mpc-phase",
+                payload={
+                    "phase": phase,
+                    "measured_active_dex3_q_rad": (
+                        None
+                        if measured_active_dex3_q_rad is None
+                        else list(measured_active_dex3_q_rad)
+                    ),
+                    "reference_T_camera0": (
+                        None
+                        if reference_T_camera0 is None
+                        else np.asarray(reference_T_camera0, dtype=np.float64).tolist()
+                    ),
+                },
+                control_check=driver.check,
+                timeout_s=30.0,
+            )
+        except (PlannerRequestRejected, RuntimeError) as error:
+            driver.check()
+            raise RuntimeError(f"CuRobo MPC preparation failed for {phase}: {error}") from error
+        preparation = dict(preparation_event["payload"])
+    else:
+        preparation = dict(prepared_mpc)
+        if preparation.get("phase") != phase:
+            raise ValueError("prebuilt CuRobo MPC model belongs to another phase")
     if phase_record is not None:
         phase_record["preparation"] = preparation
     if preparation["reused_warm_model"]:
@@ -666,6 +671,10 @@ def _execute_mpc_phase(
         "control remained active",
         flush=True,
     )
+    # The target must be observed after any cold CUDA setup. Capturing it
+    # before a multi-second build would violate the unchanged source-age gate
+    # on the very first moving-target window.
+    pending_moving_target = None if moving_target_provider is None else moving_target_provider()
 
     handoff_lead_s = MPC_HANDOFF_INTERVAL_S
 
@@ -1481,6 +1490,7 @@ def run_tabletop(args) -> int:
                     from_pose_id="return_to_clearance",
                     to_pose_id="__handoff__",
                 )
+                mpc_clearance_preparation = None
                 if args.motion_controller == "trajectory":
                     pregrasp_path = task_run / "pregrasp_plan.json"
                     planner.request(
@@ -1526,6 +1536,20 @@ def run_tabletop(args) -> int:
                         initial_command_q_rad=escape.outbound.command_q_rad[-1],
                     )
                     stage_plan_sha256 = replanned_execution.content_sha256
+                    preparation_event = planner.request_payload(
+                        "prepare-mpc-phase",
+                        payload={
+                            "phase": "grasp_approach",
+                            "measured_active_dex3_q_rad": None,
+                            "reference_T_camera0": np.asarray(
+                                reference_T_camera0,
+                                dtype=np.float64,
+                            ).tolist(),
+                        },
+                        control_check=driver.check,
+                        timeout_s=30.0,
+                    )
+                    mpc_clearance_preparation = dict(preparation_event["payload"])
                 synchronized.replace_validated_remaining_plan(
                     pose_set=replanned_pose_set,
                     approved_validation_report_sha256=stage_plan_sha256,
@@ -1630,6 +1654,7 @@ def run_tabletop(args) -> int:
                         phase_record=phase_record,
                         moving_target_provider=current_moving_grasp_target,
                         reference_T_camera0=reference_T_camera0,
+                        prepared_mpc=mpc_clearance_preparation,
                     )
                     assert phase_record["preparation"] == preparation
                     assert phase_record["windows"] == windows

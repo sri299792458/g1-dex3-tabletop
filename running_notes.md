@@ -4552,6 +4552,39 @@ Primary references:
   command was sent. This branch is not cleared for hardware MPC commissioning
   until the post-grasp hold latency is removed and the composed lifecycle is
   replayed.
+
+## 2026-08-20 — Moving-target continuation reuses the planner pool
+
+- The isolated `perf/persistent-curobo-planner-pool` work was integrated rather
+  than implementing a second continuation cache. The hardware path now builds
+  the strict checker, fixed-close validator, open planner, and attached planner
+  at the stationary clearance boundary. Compatible live object, arm, finger,
+  and world values are updated in place; topology mismatches still rebuild and
+  fail through the existing planning boundary.
+- The moving-target continuation uses that same pool for terminal FK, the live
+  fixed-close sweep, attached-payload lift planning, and measured-close route
+  validation. It preserves the separate live object/table geometry and exact
+  accepted MPC reverse introduced above.
+- A first retained static probe paid `16.77 s` before motion and reduced the
+  post-grasp continuation from `14.29 s` to `1.91 s`. A complete retained 60 mm
+  direct-table replay then paid `13.68 s` of pre-motion construction and `2.50
+  s` of MPC setup, moved the cube by `5 mm`, reached the grasp in `81` accepted
+  windows over `20.00 s` of simulated motion, and rebuilt the post-grasp
+  lifecycle in `2.01 s`. Terminal error was `3.704 mm / 0.954 deg`; the same
+  grasp was retained and the approach return was its exact reverse.
+- The composed replay reported reuse of the strict checker, fixed-close
+  validator, and attached optimizer, with no topology rebuild. Payload planning
+  itself took `0.322 s`; the remainder of the `2.01 s` continuation was live
+  kinematic/collision reconfiguration and validation.
+- MPC construction was still located at pregrasp and the first camera target
+  was incorrectly captured before that multi-second setup. MPC is now prepared
+  immediately after the nominal lifecycle is planned at clearance, before the
+  clearance-to-pregrasp route. The first moving target is captured afterward,
+  preserving the unchanged source-age contract.
+- These are command-free retained-run results. They clear the architectural and
+  latency blockers for a staged physical test; they do not constitute physical
+  moving-cube commissioning.
+
 ## 2026-08-20 — Pruned invariant one-arm self-collision pairs
 
 - The normal tabletop model exposes only the selected arm's seven joints. The

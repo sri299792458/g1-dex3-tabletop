@@ -109,25 +109,30 @@ commissioned fail-closed ownership path.
 
 ## Current evidence and limitation
 
-The retained GPU replay moved the cube by 5 mm after the original task was
-planned. The repaired controller reached the live grasp in 85 accepted windows
-with no rejected window or collision. Simulated approach duration was 20.96 s;
-terminal error was 3.63 mm and 0.92 degrees, inside the existing 5 mm and 0.05
-rad contracts. This is an offline retained-run result, not a physical
-moving-cube commissioning result.
+The composed retained GPU replay moved the cube by 5 mm after the original task
+was planned. The repaired controller reached the live grasp in 81 accepted
+windows with no rejected window or collision. Simulated approach duration was
+20.00 s; terminal error was 3.70 mm and 0.95 degrees, inside the existing 5 mm
+and 0.05 rad contracts. It then preserved the same grasp, rebuilt the payload
+continuation in 2.01 s, and produced the exact accepted-approach reverse.
 
-The post-grasp continuation is correct but not yet operationally satisfactory.
-The retained static probe took about 14.3 s while the hand held the grasp;
-roughly 4.5 s was attached-lift planning and the rest was repeated
-kinematics/collision-model construction. That setup must be prepared or reused
-before motion without changing collision semantics. Until that pause is
-removed and the composed lifecycle is replayed, this branch is not cleared for
-a robot MPC run.
+The heavy strict checker, fixed-close validator, and attached optimizer were
+all reused without a topology rebuild. Their 13.68 s construction cost was paid
+at the stationary clearance boundary before the clearance-to-pregrasp motion.
+The MPC model itself took 2.50 s to prepare and is now also prepared at that
+boundary. A fresh cube frame is deliberately collected only after preparation,
+so cold CUDA setup cannot make the first target stale.
+
+This is an offline retained-run result, not a physical moving-cube
+commissioning result. The remaining approximately 2 s after closing is genuine
+live-pose payload planning and validation while the controller holds the
+grasp. It is no longer repeated model construction, and removing it would need
+safe concurrency with Dex3 closure rather than another cache or looser check.
 
 ## Invocation after commissioning
 
-Once the remaining hold latency is removed and the branch is explicitly
-cleared, the interface is:
+For a staged physical commissioning run after explicit review, the interface
+is:
 
 ```bash
 ./tools/g1_tabletop_hardware.sh run-tabletop \
