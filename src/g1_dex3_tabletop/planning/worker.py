@@ -202,6 +202,19 @@ def _serve_tabletop() -> int:
                         "operation": command,
                         "payload": payload,
                     }
+                elif command == "prewarm-tabletop-at-clearance":
+                    request = TabletopTaskRequest.from_json(Path(message["payload"]["request"]))
+                    payload = session.prewarm_task_at_clearance(
+                        request,
+                        progress=progress,
+                    )
+                    event = {
+                        "type": "result",
+                        "id": request_id,
+                        "ok": True,
+                        "operation": command,
+                        "payload": payload,
+                    }
                 elif command == "step-mpc-phase":
                     window = session.step_mpc_phase(message["payload"])
                     event = {

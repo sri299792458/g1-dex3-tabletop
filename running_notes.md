@@ -4552,3 +4552,114 @@ Primary references:
   command was sent. This branch is not cleared for hardware MPC commissioning
   until the post-grasp hold latency is removed and the composed lifecycle is
   replayed.
+## 2026-08-20 — Pruned invariant one-arm self-collision pairs
+
+- The normal tabletop model exposes only the selected arm's seven joints. The
+  head, trunk, legs, opposite arm, and opposite hand are all locked to the live
+  measured snapshot, so collision between any two of those links cannot change
+  during IK or trajectory optimization. Those locked-link/locked-link pairs are
+  now added to CuRobo's existing self-collision ignore topology. Every pair
+  involving the selected arm or hand remains governed by the prior policy.
+- CUDA resolution of the exact production models reduced the left-arm topology
+  from 216,578 to 113,926 sphere pairs and the right-arm topology to 117,206.
+  Both now use one map-reduce block per state, and an explicit audit found zero
+  remaining locked-link/locked-link pairs. The optional offline waist-yaw model
+  does not use this pruning because waist motion changes upper-body-to-leg
+  relationships.
+- A command-free alternating A/B replay used the same retained 60 mm left-arm
+  task request and selected the same grasp in every run. After excluding each
+  ordering's first-process CUDA/model cold-start outlier, two unpruned runs
+  averaged 14.58 s and two pruned runs averaged 12.72 s. The measured saving is
+  1.86 s, or 12.8%, for `plan_tabletop_task`; it is not a measurement of camera,
+  controller, supported-escape, or complete two-cube stacking wall time.
+- The two physical dorsal marker carriers remain modeled. Their 60 spheres add
+  23,520 pairs to the pruned left-arm topology: 17,370 from the selected plate,
+  5,250 from the opposite plate, and 900 plate-to-plate pairs. Removing them
+  would make the collision model physically incomplete while reducing a
+  measured 256-state strict validation by only about 0.18 ms, so they were not
+  changed.
+- No robot command was sent while implementing or benchmarking this change.
+
+## 2026-08-20 — Persistent per-arm CuRobo planner pool
+
+- Replaced the session's single open-hand cache with one small lazy pool keyed
+  by physical topology and arm: left/right open motion planners, left/right
+  closed-hand attached-payload planners, strict open/payload collision
+  checkers, and fixed-close sweep validators. Switching arms or moving from an
+  open phase to an attached phase can no longer evict an incompatible model.
+- Compatible CuRobo motion planners retain their CUDA graphs and update folded
+  kinematic tensors, collision-sphere padding, random seeds, and world scenes
+  in place. Strict checkers likewise retain their CUDA collision buffers when
+  locked-joint values change without changing topology. A topology mismatch
+  remains fail-safe: that one slot is rebuilt rather than copying incompatible
+  tensors.
+- Payload installation still updates both the IK and trajectory-optimization
+  `AttachmentManager` instances in the pinned CuRobo revision. The pool does
+  not weaken or remove any branch search, strict endpoint check, fixed-close
+  sweep, exact route validation, table/fixture check, measured-close check, or
+  phase-specific attachment rule.
+- The fixed-close cache key now describes its actual 14-DOF checker model. The
+  active arm/finger query posture is updated separately, so changing only the
+  reached pregrasp state does not falsely require a new checker. Compatible
+  changes to locked waist, legs, opposite arm, opposite hand, or joint offsets
+  now refold values into the retained checker; only a topology mismatch rebuilds
+  it.
+- A command-free retained 60 mm left-arm task selected
+  `cube_head__seed_0000000039__sample_205` with identical rejection decisions
+  and trajectory arrays between standalone construction and the pool's cold
+  path. Repeating the complete task in the same pool reduced wall time from
+  `15.29 s` cold to `1.85 s` warm. The warm solve preserved the same candidate,
+  phase order, trajectory shapes, and rejection decisions; GPU numerical
+  variation was at most `0.000514 rad` in joint samples and `0.000730 s` in
+  resampled timestamps, with every strict validation rerun.
+- A more representative command-free fixed pick/place replay moved the same
+  retained 60 mm scene by 100 mm. Standalone source, destination, and transfer
+  planning took `36.12 s`; the pooled lifecycle took `22.23 s`, saving
+  `13.90 s` (`38.5%`) while selecting the same grasp and passing the same full
+  source/destination/attached-transfer lifecycle. The actual clearance-to-
+  pregrasp then pregrasp-correction sequence also completed with the grasp
+  preserved; its corrected task took `7.98 s` because open and strict objects
+  were reused while the first attached planner and changed locked-state
+  fixed-close model still had to be created/resolved.
+- Real CUDA probes additionally changed the locked waist-pitch witness by
+  `0.01 rad`: both the motion planner and strict checker retained object
+  identity and updated compatible tensors without rebuilding topology. Normal
+  tests passed `402 passed, 7 skipped`; the complete CUDA planner-environment
+  suite passed `402 passed, 1 skipped` at this checkpoint.
+- No robot command was sent. All timing and equivalence checks used retained
+  request artifacts and command-free CUDA planning.
+
+## 2026-08-20 — Paid task-model startup before the first arm trajectory
+
+- The trajectory workflow now constructs the selected arm's strict,
+  fixed-close, open-hand, and attached-payload CuRobo objects after the
+  supported escape is solved but before that escape is executed. The two
+  motion optimizers each receive one disposable 5 mm upward query to exercise
+  their CUDA graphs. No result from those probes is installed for execution.
+- This is deliberately not a nominal task plan. A retained initial-clearance
+  request could not complete a grasp lifecycle even though its later fresh
+  clearance observation selected and executed
+  `cube_head__seed_0000000039__sample_205`. Treating nominal feasibility as a
+  pre-motion gate would therefore have been a regression. The warmup only
+  constructs compatible models; fresh visual/proprioceptive boundaries remain
+  authoritative.
+- The fixed-close validator now updates compatible locked-joint kinematics in
+  place. Its already-resolved 14-DOF checker is also reused by the subsequent
+  measured-contact retention validator instead of constructing the identical
+  model again. A topology change remains fail-safe and rebuilds the checker.
+- In a command-free replay of the retained successful 60 mm left-arm sequence,
+  construction-only warmup cost `13.35 s` before motion. The fresh-clearance
+  pregrasp plan then took `11.23 s`; `7.32 s` of that was genuine route search
+  over the observed scene. The post-pregrasp corrected task fell from the prior
+  `7.65 s` replay to `6.02 s`, and the post-plan retention-checker preparation
+  fell to `0.024 s`.
+- The remaining corrected-task time was measured rather than labeled startup:
+  `1.38 s` strict locked-body model resolution, `1.51 s` fixed-close model
+  resolution, `0.68 s` batched IK, `0.64 s` open-route planning/validation, and
+  `1.60 s` attached-lift planning/validation. Eliminating the two model-folding
+  costs would require a different collision-model representation, not another
+  cache wrapper.
+- The selected candidate remained identical, every normal and CUDA validation
+  still ran, and the final suites pass `405 passed, 7 skipped` in the control
+  environment and `405 passed, 1 skipped` in the CUDA planner environment. No
+  robot command was sent while implementing or benchmarking this change.

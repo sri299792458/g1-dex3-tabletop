@@ -20,7 +20,10 @@ from g1_dex3_tabletop.planning import tabletop_planner
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
 from g1_dex3_tabletop.planning.curobo_backend import sample_linear_joint_sweep
 from g1_dex3_tabletop.planning.tabletop_planner import (
+    ReusableMotionPlanner,
+    TabletopPlannerPool,
     _anchor_trajectory_start,
+    _attach_cube,
     _base_scene,
     _batched_ik_failure_diagnostic,
     _BranchRejected,
@@ -174,6 +177,271 @@ def test_executed_mpc_approach_stitches_only_committed_window_segments() -> None
     assert approach.model_q_rad[0][0] == pytest.approx(0.1)
     assert approach.model_q_rad[-1][0] == pytest.approx(0.135)
     assert approach.planning_time_s == pytest.approx(0.04)
+
+
+def test_planner_pool_keeps_distinct_role_and_arm_slots() -> None:
+    pool = TabletopPlannerPool()
+
+    left_open = pool.motion("open", "left")
+    assert pool.motion("open", "left") is left_open
+    assert pool.motion("attached", "left") is not left_open
+    assert pool.motion("open", "right") is not left_open
+
+    with pytest.raises(ValueError, match="role"):
+        pool.motion("unsupported", "left")
+    with pytest.raises(ValueError, match="arm"):
+        pool.motion("open", "middle")
+    pool.close()
+
+
+def test_planner_pool_reuses_only_matching_strict_checker_slot(monkeypatch) -> None:
+    created = []
+
+    class Checker:
+        def __init__(self, *, robot, device_cfg) -> None:
+            created.append((robot, device_cfg))
+
+    monkeypatch.setattr(tabletop_planner, "CuroboKinematicCollisionChecker", Checker)
+    pool = TabletopPlannerPool()
+    first, first_event = pool.acquire_strict_checker(
+        role="open",
+        arm="left",
+        robot={"id": 1},
+        device_cfg=object(),
+        configuration_key="same",
+    )
+    second, second_event = pool.acquire_strict_checker(
+        role="open",
+        arm="left",
+        robot={"id": 2},
+        device_cfg=object(),
+        configuration_key="same",
+    )
+    attached, attached_event = pool.acquire_strict_checker(
+        role="attached",
+        arm="left",
+        robot={"id": 3},
+        device_cfg=object(),
+        configuration_key="same",
+    )
+
+    assert second is first
+    assert first_event["reused"] is False
+    assert second_event["reused"] is True
+    assert attached is not first
+    assert attached_event["reused"] is False
+    assert len(created) == 2
+
+
+def test_planner_pool_reconfigures_compatible_fixed_close_validator(monkeypatch) -> None:
+    created = []
+
+    class Validator:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+            self.reconfigurations = []
+            created.append(self)
+
+        def reconfigure(self, **kwargs) -> None:
+            self.reconfigurations.append(kwargs)
+
+    monkeypatch.setattr(tabletop_planner, "_FixedCloseSweepValidator", Validator)
+    pool = TabletopPlannerPool()
+    arguments = {
+        "request": SimpleNamespace(arm="left"),
+        "base_T_object": np.eye(4),
+        "base_T_detected_object": np.eye(4),
+        "plane_point": np.zeros(3),
+        "down": np.asarray((0.0, 0.0, -1.0)),
+        "open_q": np.zeros(7),
+        "close_target_q": np.ones(7),
+    }
+    first, first_event = pool.acquire_fixed_close_validator(
+        configuration_key="same",
+        **arguments,
+    )
+    second, second_event = pool.acquire_fixed_close_validator(
+        configuration_key="same",
+        **arguments,
+    )
+    changed, changed_event = pool.acquire_fixed_close_validator(
+        configuration_key="changed",
+        **arguments,
+    )
+
+    assert second is first
+    assert changed is first
+    assert len(first.reconfigurations) == 2
+    assert first_event["reused"] is False
+    assert second_event["reused"] is True
+    assert second_event["kinematics_changed"] is False
+    assert changed_event["reused"] is True
+    assert changed_event["kinematics_changed"] is True
+    assert changed_event["topology_rebuilt"] is False
+    assert len(created) == 1
+
+
+def test_planner_pool_rebuilds_incompatible_fixed_close_validator(monkeypatch) -> None:
+    created = []
+
+    class Validator:
+        def __init__(self, **kwargs) -> None:
+            created.append(self)
+
+        def reconfigure(self, **kwargs) -> None:
+            if kwargs["update_kinematics"]:
+                raise RuntimeError("topology changed")
+
+    monkeypatch.setattr(tabletop_planner, "_FixedCloseSweepValidator", Validator)
+    pool = TabletopPlannerPool()
+    arguments = {
+        "request": SimpleNamespace(arm="left"),
+        "base_T_object": np.eye(4),
+        "base_T_detected_object": np.eye(4),
+        "plane_point": np.zeros(3),
+        "down": np.asarray((0.0, 0.0, -1.0)),
+        "open_q": np.zeros(7),
+        "close_target_q": np.ones(7),
+    }
+    first, _first_event = pool.acquire_fixed_close_validator(
+        configuration_key="first",
+        **arguments,
+    )
+    replacement, replacement_event = pool.acquire_fixed_close_validator(
+        configuration_key="incompatible",
+        **arguments,
+    )
+
+    assert replacement is not first
+    assert replacement_event["reused"] is False
+    assert replacement_event["topology_rebuilt"] is True
+    assert len(created) == 2
+
+
+def test_planner_pool_reuses_fixed_close_checker_for_retention(monkeypatch) -> None:
+    class Validator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+    created = []
+
+    class Retention:
+        def __init__(
+            self,
+            tabletop,
+            task,
+            *,
+            geometry=None,
+            fixed_close_validator=None,
+        ) -> None:
+            created.append((tabletop, task, geometry, fixed_close_validator))
+
+    monkeypatch.setattr(tabletop_planner, "_FixedCloseSweepValidator", Validator)
+    monkeypatch.setattr(tabletop_planner, "RetentionRouteValidator", Retention)
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_fixed_close_configuration_key",
+        lambda _request: "matching",
+    )
+    pool = TabletopPlannerPool()
+    request = SimpleNamespace(arm="left")
+    validator, _event = pool.acquire_fixed_close_validator(
+        configuration_key="matching",
+        request=request,
+        base_T_object=np.eye(4),
+        base_T_detected_object=np.eye(4),
+        plane_point=np.zeros(3),
+        down=np.asarray((0.0, 0.0, -1.0)),
+        open_q=np.zeros(7),
+        close_target_q=np.ones(7),
+    )
+    task = object()
+
+    result = pool.retention_validator(request, task)
+
+    assert isinstance(result, Retention)
+    assert created == [(request, task, None, validator)]
+
+
+def test_reusable_motion_planner_reuses_unchanged_configuration(monkeypatch) -> None:
+    created = []
+
+    class Planner:
+        def __init__(self) -> None:
+            self.reset_count = 0
+            self.destroy_count = 0
+
+        def reset_seed(self) -> None:
+            self.reset_count += 1
+
+        def destroy(self) -> None:
+            self.destroy_count += 1
+
+    def create(*_args, **_kwargs):
+        planner = Planner()
+        created.append(planner)
+        return planner, object()
+
+    monkeypatch.setattr(tabletop_planner, "_planner", create)
+    monkeypatch.setattr(tabletop_planner, "_cleanup", lambda planner: planner.destroy())
+    cache = ReusableMotionPlanner()
+    first, first_device, first_event = cache.acquire(
+        {}, {}, seed=7, kinematics_key="robot", scene_key="scene"
+    )
+    second, second_device, second_event = cache.acquire(
+        {}, {}, seed=7, kinematics_key="robot", scene_key="scene"
+    )
+
+    assert second is first
+    assert second_device is first_device
+    assert first_event["reused"] is False
+    assert {key: value for key, value in second_event.items() if key != "elapsed_s"} == {
+        "reused": True,
+        "configuration_changed": False,
+        "kinematics_changed": False,
+        "scene_changed": False,
+        "topology_rebuilt": False,
+    }
+    assert second_event["elapsed_s"] >= 0.0
+    assert first.reset_count == 1
+    assert len(created) == 1
+    cache.close()
+    assert first.destroy_count == 1
+
+
+def test_attached_cube_updates_ik_and_trajectory_optimizers() -> None:
+    torch = pytest.importorskip("torch")
+    updates = []
+
+    class Manager:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def update(self, spheres, state, **kwargs) -> None:
+            updates.append((self.label, spheres.detach().cpu().numpy(), state, kwargs))
+
+    state = SimpleNamespace(position=torch.zeros((1, 7), dtype=torch.float32))
+    planner = SimpleNamespace(
+        ik_solver=SimpleNamespace(
+            core=SimpleNamespace(attachment_manager=Manager("ik")),
+        ),
+        trajopt_solver=SimpleNamespace(
+            core=SimpleNamespace(attachment_manager=Manager("trajopt")),
+        ),
+    )
+
+    sphere_count = _attach_cube(
+        planner,
+        state,
+        np.eye(4),
+        (0.04, 0.04, 0.04),
+        arm="left",
+    )
+
+    assert sphere_count == 27
+    assert [value[0] for value in updates] == ["ik", "trajopt"]
+    assert np.array_equal(updates[0][1], updates[1][1])
+    assert updates[0][3]["link_name"] == updates[1][3]["link_name"]
 
 
 def test_supported_escape_accepts_only_strict_collision_free_samples() -> None:

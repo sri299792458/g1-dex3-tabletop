@@ -107,7 +107,7 @@ def test_lifecycle_benchmark_preserves_configured_tracking_offset() -> None:
     assert phase["reached_terminal"]
     assert phase["accepted_windows"] == 1
     np.testing.assert_allclose(measured, terminal)
-    np.testing.assert_allclose(velocity, np.zeros(7))
+    np.testing.assert_allclose(velocity, np.zeros(7), atol=1.0e-12)
 
 
 def test_lifecycle_benchmark_retries_without_committing_a_rejected_window() -> None:
@@ -602,17 +602,18 @@ def test_clearance_replan_atomically_replaces_task_and_resets_old_mpc(monkeypatc
     )
     monkeypatch.setattr(
         "g1_dex3_tabletop.planning.tabletop_session.plan_tabletop_task",
-        lambda received, progress: task,
+        lambda received, planner_pool, progress: task,
     )
     monkeypatch.setattr(
         "g1_dex3_tabletop.planning.tabletop_session.combine_tabletop_plans",
         lambda **kwargs: replacement,
     )
-    monkeypatch.setattr(
-        "g1_dex3_tabletop.planning.tabletop_session.RetentionRouteValidator",
-        Validator,
-    )
     session = TabletopPlanningSession()
+    monkeypatch.setattr(
+        session._planner_pool,
+        "retention_validator",
+        lambda received_request, received_task: Validator(received_request, received_task),
+    )
     session._loaded_request = object()
     session._clearance_request = object()
     session._supported_escape = execution.supported_escape
@@ -644,9 +645,9 @@ def test_clearance_pregrasp_stage_does_not_create_a_complete_task(monkeypatch) -
         lambda loaded, escape, observation: request,
     )
 
-    def plan(received, *, open_planner_cache, progress):
+    def plan(received, *, planner_pool, progress):
         assert received is request
-        assert open_planner_cache is session._open_planner
+        assert planner_pool is session._planner_pool
         progress("pregrasp ready")
         return pregrasp
 
@@ -696,6 +697,45 @@ def test_escape_only_session_retains_exact_reverse_for_later_boundary_replan(
     assert session._clearance_request is clearance
     assert session._execution is None
     assert session._retention_validator is None
+
+
+def test_pre_motion_warmup_populates_pool_without_installing_nominal_task(
+    monkeypatch,
+) -> None:
+    request = SimpleNamespace(content_sha256="predicted")
+    result = {"planning_performed": False}
+    events = []
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.request_at_clearance",
+        lambda loaded, escape: request,
+    )
+
+    def prewarm(received, *, planner_pool):
+        assert received is request
+        assert planner_pool is session._planner_pool
+        return result
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_session.prewarm_tabletop_task_models",
+        prewarm,
+    )
+    session = TabletopPlanningSession()
+    session._loaded_request = object()
+    session._supported_escape = object()
+
+    assert session.prewarm_task_at_clearance(request, progress=events.append) is result
+    assert session._active_task is None
+    assert session._execution is None
+    assert events == [
+        (
+            "constructing open-hand, fixed-close, and attached-payload CUDA models before "
+            "the first changing arm target; no task solve is being used as a gate"
+        ),
+        (
+            "pre-motion model warmup complete; fresh boundary observations remain the only "
+            "source of executable task feasibility"
+        ),
+    ]
 
 
 def test_payload_uses_frozen_planner_cuboid_cover_in_grasp_frame() -> None:

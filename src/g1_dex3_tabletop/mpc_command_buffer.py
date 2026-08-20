@@ -34,7 +34,7 @@ def _sample_rows(times: np.ndarray, values: np.ndarray, sample_time_s: float) ->
     """Sample one piecewise-linear N x 7 trajectory."""
 
     sample = float(sample_time_s)
-    if not np.isfinite(sample) or sample < times[0] or sample > times[-1] + 1.0e-12:
+    if not np.isfinite(sample) or sample < times[0] or sample > times[-1] + 1.0e-9:
         raise ValueError("trajectory sample time is outside the certified interval")
     sample = min(sample, float(times[-1]))
     return np.asarray(

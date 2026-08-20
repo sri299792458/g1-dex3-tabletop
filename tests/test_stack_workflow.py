@@ -245,7 +245,7 @@ def test_pick_place_tries_next_grasp_when_first_cannot_place(monkeypatch) -> Non
         )
         return _task(current, candidate_id=candidate_id, endpoints=endpoints)
 
-    def fake_transfer(_request, source_task, destination_task):
+    def fake_transfer(_request, source_task, destination_task, **_kwargs):
         return (
             _trajectory(
                 "payload_lift",

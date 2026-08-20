@@ -622,9 +622,7 @@ def _execute_mpc_phase(
     """Execute the local grasp approach through visual Cartesian MPC."""
 
     phase = trajectory.to_pose_id
-    pending_moving_target = (
-        None if moving_target_provider is None else moving_target_provider()
-    )
+    pending_moving_target = None if moving_target_provider is None else moving_target_provider()
     try:
         preparation_event = planner.request_payload(
             "prepare-mpc-phase",
@@ -1254,7 +1252,22 @@ def run_tabletop(args) -> int:
                 raise TabletopTaskRejected(f"supported escape planning failed: {error}") from error
             escape = SupportedEscapePlan.from_json(escape_path)
             clearance_request = request_at_clearance(loaded_request, escape)
-            clearance_request.write_json(task_run / "initial_clearance_request.json")
+            initial_clearance_request_path = task_run / "initial_clearance_request.json"
+            clearance_request.write_json(initial_clearance_request_path)
+            try:
+                prewarm_event = planner.request_payload(
+                    "prewarm-tabletop-at-clearance",
+                    payload={"request": str(initial_clearance_request_path.resolve())},
+                    control_check=driver.check,
+                    timeout_s=180.0,
+                )
+            except (PlannerRequestRejected, RuntimeError) as error:
+                driver.check()
+                raise TabletopTaskRejected(f"pre-motion planner warmup failed: {error}") from error
+            atomic_write_json(
+                task_run / "pre_motion_planner_warmup.json",
+                prewarm_event["payload"],
+            )
             pose_set = pose_set_from_trajectories(
                 arm=arm,
                 trajectories=(escape.outbound, escape.inbound),
@@ -1269,9 +1282,11 @@ def run_tabletop(args) -> int:
                 validated_reference_state=loaded_state,
             )
             print(
-                "REVERSIBLE SUPPORTED ESCAPE FROZEN — the table-normal lift and its "
-                "exact reverse return to handoff are validated. The only executable "
-                "grasp task will be planned from a fresh fixed-cube observation at clearance",
+                "PRE-MOTION PLANNING READY — the reversible supported escape is frozen; "
+                "open-hand, fixed-close, and attached-payload CUDA models were constructed "
+                "against the predicted clearance state without solving a nominal task. "
+                "The real task will still be planned from a fresh fixed-cube observation at "
+                "clearance",
                 flush=True,
             )
             initial_left = held_hands.left.position
@@ -1449,13 +1464,17 @@ def run_tabletop(args) -> int:
                         raise RuntimeError(
                             "live moving-target estimate belongs to another table anchor"
                         )
-                    return synchronized_input, estimate, {
-                        **target,
-                        "source_monotonic_s": frame.timing.receipt_monotonic_s,
-                        "source_utc": frame.timing.receipt_utc,
-                        "source_header_stamp_ns": frame.timing.header_stamp_ns,
-                        "camera_profile_sha256": frame.camera_info.profile_sha256,
-                    }
+                    return (
+                        synchronized_input,
+                        estimate,
+                        {
+                            **target,
+                            "source_monotonic_s": frame.timing.receipt_monotonic_s,
+                            "source_utc": frame.timing.receipt_utc,
+                            "source_header_stamp_ns": frame.timing.header_stamp_ns,
+                            "camera_profile_sha256": frame.camera_info.profile_sha256,
+                        },
+                    )
 
                 escape_return = _trajectory_with_endpoints(
                     escape.inbound,
@@ -1590,11 +1609,7 @@ def run_tabletop(args) -> int:
                 measured_active_dex3_q_rad=None,
                 use_mpc: bool = True,
             ) -> dict | None:
-                if (
-                    args.motion_controller == "mpc"
-                    and use_mpc
-                    and name == "grasp_approach"
-                ):
+                if args.motion_controller == "mpc" and use_mpc and name == "grasp_approach":
                     phase_record = {
                         "completed": False,
                         "preparation": None,
@@ -1842,8 +1857,11 @@ def run_tabletop(args) -> int:
                     f"{task.selected_candidate_id} was preserved and every remaining "
                     "motion was planned from the exact active command; "
                     f"planning={task.planner_provenance['elapsed_s']:.2f}s, "
-                    "open_optimizer_reused="
-                    f"{task.planner_provenance['open_optimizer_reused']}",
+                    "planner_pool_reuse="
+                    f"strict:{task.planner_provenance['strict_checker_reused']},"
+                    f"fixed_close:{task.planner_provenance['fixed_close_validator_reused']},"
+                    f"open:{task.planner_provenance['open_optimizer_reused']},"
+                    f"payload:{task.planner_provenance['attached_optimizer_reused']}",
                     flush=True,
                 )
                 execute_phase("estimated_pregrasp", use_mpc=False)
@@ -1881,9 +1899,7 @@ def run_tabletop(args) -> int:
                 moving_targets = mpc_approach_record["moving_targets"]
                 if not moving_targets:
                     raise RuntimeError("moving-target MPC approach recorded no live cube target")
-                terminal_window = MPCCommandWindow.from_dict(
-                    mpc_approach_record["windows"][-1]
-                )
+                terminal_window = MPCCommandWindow.from_dict(mpc_approach_record["windows"][-1])
                 terminal_target = terminal_window.diagnostics.get("moving_target")
                 if not isinstance(terminal_target, dict):
                     raise RuntimeError("terminal MPC window has no bound moving target")
@@ -1906,8 +1922,7 @@ def run_tabletop(args) -> int:
                     from_pose_id="grasp_approach",
                     to_pose_id="grasp_retreat",
                     sample_time_s=tuple(
-                        duration - value
-                        for value in reversed(executed_approach.sample_time_s)
+                        duration - value for value in reversed(executed_approach.sample_time_s)
                     ),
                     command_q_rad=tuple(reversed(executed_approach.command_q_rad)),
                     model_q_rad=tuple(reversed(executed_approach.model_q_rad)),
@@ -2273,9 +2288,7 @@ def run_tabletop(args) -> int:
                 "supported_escape_plan_sha256": escape.content_sha256,
                 "active_plan_sha256": active_plan_sha256,
                 "active_plan_kind": (
-                    task.kind
-                    if args.motion_controller == "mpc"
-                    else execution.kind
+                    task.kind if args.motion_controller == "mpc" else execution.kind
                 ),
                 "pregrasp_plan_sha256": (
                     pregrasp_plan.content_sha256

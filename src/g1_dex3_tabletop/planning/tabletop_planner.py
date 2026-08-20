@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import gc
 import hashlib
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -131,6 +132,9 @@ class _LiftBranchPlan:
     payload_minimum_plane_clearance_m: float
     payload_start_plane_clearance_m: float
     attachment_sphere_count: int
+    attached_optimizer_reused: bool
+    attached_optimizer_topology_rebuilt: bool
+    attached_optimizer_reconfiguration_s: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,9 +209,7 @@ def _object_contact_links(arm: str) -> tuple[str, ...]:
     enabled and are still checked independently on every route/window.
     """
 
-    return tuple(
-        f"{arm}_hand_{suffix}_link" for suffix in DEX3_MOTOR_JOINT_SUFFIXES[arm]
-    )
+    return tuple(f"{arm}_hand_{suffix}_link" for suffix in DEX3_MOTOR_JOINT_SUFFIXES[arm])
 
 
 def _local_table_plane_links(arm: str) -> tuple[str, ...]:
@@ -736,9 +738,7 @@ def _base_scene(
         if not all(value is not None for value in overrides):
             raise ValueError("live tabletop geometry overrides must be supplied together")
         base_T_object = np.asarray(base_T_object_override, dtype=np.float64)
-        base_T_detected_object = np.asarray(
-            base_T_detected_object_override, dtype=np.float64
-        )
+        base_T_detected_object = np.asarray(base_T_detected_object_override, dtype=np.float64)
         plane_point = np.asarray(plane_point_override, dtype=np.float64)
         down = np.asarray(down_override, dtype=np.float64)
     else:
@@ -1168,6 +1168,73 @@ class _FixedCloseSweepValidator:
         self.relative_hand_sweep_spheres, self.hand_sphere_link_names = (
             self._build_relative_hand_sweep(reference)
         )
+        self.reference_q = tuple(float(value) for value in reference)
+        self._reference_arm_q = tuple(float(value) for value in reference[:7])
+        self.cache_build_s = time.monotonic() - started
+
+    def reconfigure(
+        self,
+        *,
+        request: TabletopTaskRequest,
+        base_T_object: np.ndarray,
+        base_T_detected_object: np.ndarray,
+        plane_point: np.ndarray,
+        down: np.ndarray,
+        open_q: np.ndarray,
+        close_target_q: np.ndarray,
+        update_kinematics: bool = False,
+    ) -> None:
+        """Update compatible model values and task geometry in place."""
+
+        if request.arm != self.arm:
+            raise ValueError("fixed-close checker cannot switch arms")
+        started = time.monotonic()
+        if update_kinematics:
+            from curobo._src.types.robot import RobotCfg
+
+            robot, active_joint_names, _reference = build_tabletop_route_validation_robot_config(
+                arm=self.arm,
+                snapshot=request.planning_snapshot,
+                joint_position_offsets_rad=request.joint_position_offsets_rad,
+            )
+            if tuple(active_joint_names) != tuple(self.active_joint_names):
+                raise RuntimeError("fixed-close checker active joints changed")
+            source = RobotCfg.create(robot, device_cfg=self.device_cfg).kinematics
+            ReusableMotionPlanner._assert_compatible(self.checker.config, source)
+            self.checker.config.kinematics_config.copy_(source.kinematics_config)
+            self.checker.config.self_collision_config.sphere_padding.copy_(
+                source.self_collision_config.sphere_padding
+            )
+        self.request = request
+        self.plane_point = np.asarray(plane_point, dtype=np.float64)
+        self.down = np.asarray(down, dtype=np.float64)
+        self.finger_sweep = sample_linear_joint_sweep(open_q, close_target_q)
+        reference = np.asarray(request.planning_snapshot.measured_q29_rad, dtype=np.float64)[
+            np.asarray(arm_indices(self.arm))
+        ]
+        self._reference_arm_q = tuple(
+            float(value + request.joint_position_offsets_rad.get(name, 0.0))
+            for name, value in zip(arm_joint_names(self.arm), reference, strict=True)
+        )
+        active_fingers = (
+            request.planning_snapshot.left_dex3_q_rad
+            if self.arm == "left"
+            else request.planning_snapshot.right_dex3_q_rad
+        )
+        self.reference_q = (
+            *self._reference_arm_q,
+            *tuple(float(value) for value in active_fingers),
+        )
+        self.fixture_checker = _fixture_collision_checker(
+            request,
+            base_T_object,
+            base_T_detected_object,
+            self.down,
+            device_cfg=self.device_cfg,
+        )
+        self.relative_hand_sweep_spheres, self.hand_sphere_link_names = (
+            self._build_relative_hand_sweep(self._reference_arm_q)
+        )
         self.cache_build_s = time.monotonic() - started
 
     def _build_relative_hand_sweep(
@@ -1443,6 +1510,176 @@ class _FixedCloseSweepValidator:
         )
 
 
+@dataclass(slots=True)
+class _CheckerPoolEntry:
+    configuration_key: str
+    checker: CuroboKinematicCollisionChecker
+
+
+@dataclass(slots=True)
+class _FixedClosePoolEntry:
+    configuration_key: str
+    validator: _FixedCloseSweepValidator
+
+
+class TabletopPlannerPool:
+    """Small lazy per-arm pool for expensive CuRobo planning objects."""
+
+    def __init__(self) -> None:
+        self._motion: dict[tuple[str, str], ReusableMotionPlanner] = {}
+        self._strict: dict[tuple[str, str], _CheckerPoolEntry] = {}
+        self._fixed_close: dict[str, _FixedClosePoolEntry] = {}
+
+    def motion(self, role: str, arm: str) -> ReusableMotionPlanner:
+        if role not in ("open", "attached"):
+            raise ValueError(f"unsupported reusable planner role: {role}")
+        if arm not in ("left", "right"):
+            raise ValueError(f"unsupported reusable planner arm: {arm}")
+        key = (role, arm)
+        planner = self._motion.get(key)
+        if planner is None:
+            planner = ReusableMotionPlanner()
+            self._motion[key] = planner
+        return planner
+
+    def acquire_strict_checker(
+        self,
+        *,
+        role: str,
+        arm: str,
+        robot: dict[str, Any],
+        device_cfg,
+        configuration_key: str,
+    ) -> tuple[CuroboKinematicCollisionChecker, dict[str, Any]]:
+        if role not in ("open", "attached"):
+            raise ValueError(f"unsupported reusable checker role: {role}")
+        if arm not in ("left", "right"):
+            raise ValueError(f"unsupported reusable checker arm: {arm}")
+        started = time.monotonic()
+        key = (role, arm)
+        entry = self._strict.get(key)
+        if entry is not None and entry.configuration_key == configuration_key:
+            return entry.checker, {
+                "reused": True,
+                "kinematics_changed": False,
+                "topology_rebuilt": False,
+                "elapsed_s": time.monotonic() - started,
+            }
+        if entry is not None:
+            from curobo._src.types.robot import RobotCfg
+
+            source = RobotCfg.create(robot, device_cfg=device_cfg).kinematics
+            try:
+                ReusableMotionPlanner._assert_compatible(entry.checker.config, source)
+            except RuntimeError:
+                pass
+            else:
+                entry.checker.config.kinematics_config.copy_(source.kinematics_config)
+                entry.checker.config.self_collision_config.sphere_padding.copy_(
+                    source.self_collision_config.sphere_padding
+                )
+                entry.configuration_key = configuration_key
+                return entry.checker, {
+                    "reused": True,
+                    "kinematics_changed": True,
+                    "topology_rebuilt": False,
+                    "elapsed_s": time.monotonic() - started,
+                }
+        checker = CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+        self._strict[key] = _CheckerPoolEntry(configuration_key, checker)
+        return checker, {
+            "reused": False,
+            "kinematics_changed": True,
+            "topology_rebuilt": entry is not None,
+            "elapsed_s": time.monotonic() - started,
+        }
+
+    def acquire_fixed_close_validator(
+        self,
+        *,
+        configuration_key: str,
+        request: TabletopTaskRequest,
+        base_T_object: np.ndarray,
+        base_T_detected_object: np.ndarray,
+        plane_point: np.ndarray,
+        down: np.ndarray,
+        open_q: np.ndarray,
+        close_target_q: np.ndarray,
+    ) -> tuple[_FixedCloseSweepValidator, dict[str, Any]]:
+        started = time.monotonic()
+        entry = self._fixed_close.get(request.arm)
+        if entry is not None:
+            kinematics_changed = entry.configuration_key != configuration_key
+            try:
+                entry.validator.reconfigure(
+                    request=request,
+                    base_T_object=base_T_object,
+                    base_T_detected_object=base_T_detected_object,
+                    plane_point=plane_point,
+                    down=down,
+                    open_q=open_q,
+                    close_target_q=close_target_q,
+                    update_kinematics=kinematics_changed,
+                )
+            except RuntimeError:
+                pass
+            else:
+                entry.configuration_key = configuration_key
+                return entry.validator, {
+                    "reused": True,
+                    "kinematics_changed": kinematics_changed,
+                    "topology_rebuilt": False,
+                    "elapsed_s": time.monotonic() - started,
+                }
+        validator = _FixedCloseSweepValidator(
+            request=request,
+            base_T_object=base_T_object,
+            base_T_detected_object=base_T_detected_object,
+            plane_point=plane_point,
+            down=down,
+            open_q=open_q,
+            close_target_q=close_target_q,
+        )
+        self._fixed_close[request.arm] = _FixedClosePoolEntry(
+            configuration_key,
+            validator,
+        )
+        return validator, {
+            "reused": False,
+            "kinematics_changed": True,
+            "topology_rebuilt": entry is not None,
+            "elapsed_s": time.monotonic() - started,
+        }
+
+    def retention_validator(
+        self,
+        tabletop: TabletopTaskRequest,
+        task: TabletopTaskPlan,
+        *,
+        geometry: _MovingGraspGeometry | None = None,
+    ) -> RetentionRouteValidator:
+        """Build route evidence around the already-resolved 14-DOF checker."""
+
+        entry = self._fixed_close.get(tabletop.arm)
+        expected_key = _fixed_close_configuration_key(tabletop)
+        if entry is None or entry.configuration_key != expected_key:
+            return RetentionRouteValidator(tabletop, task, geometry=geometry)
+        return RetentionRouteValidator(
+            tabletop,
+            task,
+            geometry=geometry,
+            fixed_close_validator=entry.validator,
+        )
+
+    def close(self) -> None:
+        planners = tuple(self._motion.values())
+        self._motion.clear()
+        self._strict.clear()
+        self._fixed_close.clear()
+        for planner in planners:
+            planner.close()
+
+
 def _world_cuboid_clearances(
     *,
     robot: dict[str, Any],
@@ -1567,13 +1804,38 @@ def _batched_pregrasp_ik_solver(
     return InverseKinematics(config)
 
 
-class ReusableOpenPlanner:
-    """Retain one fixed-shape open-hand MotionPlanner across task boundaries."""
+def _configuration_key(value: Any) -> str:
+    """Return a deterministic key for one JSON-compatible CuRobo value set."""
+
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _fixed_close_configuration_key(request: TabletopTaskRequest) -> str:
+    """Fingerprint the checker model, excluding its active arm/finger query state."""
+
+    robot, _active_joint_names, _reference = build_tabletop_route_validation_robot_config(
+        arm=request.arm,
+        snapshot=request.planning_snapshot,
+        joint_position_offsets_rad=request.joint_position_offsets_rad,
+    )
+    return _configuration_key(robot)
+
+
+class ReusableMotionPlanner:
+    """Retain one fixed-shape MotionPlanner and update compatible values in place."""
 
     def __init__(self) -> None:
         self._planner = None
         self._device_cfg = None
-        self._configuration_key: str | None = None
+        self._kinematics_key: str | None = None
+        self._scene_key: str | None = None
         self._seed: int | None = None
 
     @staticmethod
@@ -1636,7 +1898,8 @@ class ReusableOpenPlanner:
         scene: dict[str, Any],
         *,
         seed: int,
-        configuration_key: str,
+        kinematics_key: str,
+        scene_key: str,
     ) -> tuple[Any, Any, dict[str, Any]]:
         """Create or value-update one planner while preserving CUDA graph allocations."""
 
@@ -1651,7 +1914,8 @@ class ReusableOpenPlanner:
             )
             self._planner = planner
             self._device_cfg = device_cfg
-            self._configuration_key = configuration_key
+            self._kinematics_key = kinematics_key
+            self._scene_key = scene_key
             self._seed = seed
             return (
                 planner,
@@ -1659,14 +1923,18 @@ class ReusableOpenPlanner:
                 {
                     "reused": False,
                     "configuration_changed": True,
+                    "kinematics_changed": True,
+                    "scene_changed": True,
                     "topology_rebuilt": False,
                     "elapsed_s": time.monotonic() - started,
                 },
             )
-        if self._configuration_key != configuration_key:
-            from curobo._src.geom.types import SceneCfg
+        kinematics_changed = self._kinematics_key != kinematics_key
+        scene_changed = self._scene_key != scene_key
+        if kinematics_changed:
+            from curobo._src.types.robot import RobotCfg
 
-            source = robot.kinematics
+            source = RobotCfg.create(robot, device_cfg=self._device_cfg).kinematics
             targets = self._robot_configs(self._planner)
             try:
                 for target in targets:
@@ -1681,7 +1949,8 @@ class ReusableOpenPlanner:
                 )
                 self._planner = planner
                 self._device_cfg = device_cfg
-                self._configuration_key = configuration_key
+                self._kinematics_key = kinematics_key
+                self._scene_key = scene_key
                 self._seed = seed
                 return (
                     planner,
@@ -1689,6 +1958,8 @@ class ReusableOpenPlanner:
                     {
                         "reused": False,
                         "configuration_changed": True,
+                        "kinematics_changed": True,
+                        "scene_changed": True,
                         "topology_rebuilt": True,
                         "elapsed_s": time.monotonic() - started,
                     },
@@ -1698,19 +1969,21 @@ class ReusableOpenPlanner:
                 target.self_collision_config.sphere_padding.copy_(
                     source.self_collision_config.sphere_padding
                 )
+        if scene_changed:
+            from curobo._src.geom.types import SceneCfg
+
             self._planner.update_world(SceneCfg.create(scene))
-            self._planner.reset_seed()
-            self._configuration_key = configuration_key
-            changed = True
-        else:
-            self._planner.reset_seed()
-            changed = False
+        self._planner.reset_seed()
+        self._kinematics_key = kinematics_key
+        self._scene_key = scene_key
         return (
             self._planner,
             self._device_cfg,
             {
                 "reused": True,
-                "configuration_changed": changed,
+                "configuration_changed": kinematics_changed or scene_changed,
+                "kinematics_changed": kinematics_changed,
+                "scene_changed": scene_changed,
                 "topology_rebuilt": False,
                 "elapsed_s": time.monotonic() - started,
             },
@@ -1720,7 +1993,8 @@ class ReusableOpenPlanner:
         planner = self._planner
         self._planner = None
         self._device_cfg = None
-        self._configuration_key = None
+        self._kinematics_key = None
+        self._scene_key = None
         self._seed = None
         if planner is not None:
             _cleanup(planner)
@@ -2771,36 +3045,39 @@ def _plan_attached_lift(
     contact_snapshot: RobotSnapshot | None = None,
     base_T_object_override: np.ndarray | None = None,
     base_T_detected_object_override: np.ndarray | None = None,
+    attached_planner_cache: ReusableMotionPlanner | None = None,
 ) -> _LiftBranchPlan:
     """Plan with the descriptor close target; live measured fingers are rechecked later."""
 
     planner = None
+    cache_event: dict[str, Any] | None = None
     try:
-        if contact_snapshot is None:
-            contact_snapshot = _snapshot_at_arm_q(request, contact_command_q)
-        close_target_robot, _ = build_tabletop_robot_config(
+        close_target_robot, attached_scene = _attached_planner_configuration(
+            request=request,
+            close_target_q=close_target_q,
+            base_T_torso=base_T_torso,
             arm=arm,
-            snapshot=contact_snapshot,
-            joint_position_offsets_rad=request.joint_position_offsets_rad,
-            active_finger_q_rad=tuple(close_target_q),
-        )
-        _use_moving_grasp_frame_only(close_target_robot, arm=arm)
-        attached_scene = _attached_lift_scene(
-            request,
-            base_T_torso,
+            contact_snapshot=contact_snapshot,
             base_T_object_override=base_T_object_override,
             base_T_detected_object_override=base_T_detected_object_override,
-            plane_point_override=(
-                plane_point if base_T_object_override is not None else None
-            ),
+            plane_point_override=(plane_point if base_T_object_override is not None else None),
             down_override=down if base_T_object_override is not None else None,
         )
-        planner, device_cfg = _planner(
-            close_target_robot,
-            attached_scene,
-            max_goalset=1,
-            seed=request.random_seed,
-        )
+        if attached_planner_cache is None:
+            planner, device_cfg = _planner(
+                close_target_robot,
+                attached_scene,
+                max_goalset=1,
+                seed=request.random_seed,
+            )
+        else:
+            planner, device_cfg, cache_event = attached_planner_cache.acquire(
+                close_target_robot,
+                attached_scene,
+                seed=request.random_seed,
+                kinematics_key=_configuration_key(close_target_robot),
+                scene_key=_configuration_key(attached_scene),
+            )
         contact_state = _joint_state(device_cfg, contact_model_q, arm_joint_names(arm))
         object_T_grasp = _candidate_transform(selected)
         sphere_count = _attach_cube(
@@ -2949,9 +3226,52 @@ def _plan_attached_lift(
             payload_minimum_plane_clearance_m=payload_clearance,
             payload_start_plane_clearance_m=payload_start_clearance,
             attachment_sphere_count=sphere_count,
+            attached_optimizer_reused=(
+                False if cache_event is None else bool(cache_event["reused"])
+            ),
+            attached_optimizer_topology_rebuilt=(
+                False if cache_event is None else bool(cache_event["topology_rebuilt"])
+            ),
+            attached_optimizer_reconfiguration_s=(
+                0.0
+                if cache_event is None or not cache_event["reused"]
+                else float(cache_event["elapsed_s"])
+            ),
         )
     finally:
-        _cleanup(planner)
+        if attached_planner_cache is None:
+            _cleanup(planner)
+
+
+def _attached_planner_configuration(
+    *,
+    request: TabletopTaskRequest,
+    close_target_q: np.ndarray,
+    base_T_torso: np.ndarray,
+    arm: str,
+    contact_snapshot: RobotSnapshot | None = None,
+    base_T_object_override: np.ndarray | None = None,
+    base_T_detected_object_override: np.ndarray | None = None,
+    plane_point_override: np.ndarray | None = None,
+    down_override: np.ndarray | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the shared closed-hand/payload planner topology."""
+
+    close_target_robot, _ = build_tabletop_robot_config(
+        arm=arm,
+        snapshot=(request.planning_snapshot if contact_snapshot is None else contact_snapshot),
+        joint_position_offsets_rad=request.joint_position_offsets_rad,
+        active_finger_q_rad=tuple(close_target_q),
+    )
+    _use_moving_grasp_frame_only(close_target_robot, arm=arm)
+    return close_target_robot, _attached_lift_scene(
+        request,
+        base_T_torso,
+        base_T_object_override=base_T_object_override,
+        base_T_detected_object_override=base_T_detected_object_override,
+        plane_point_override=plane_point_override,
+        down_override=down_override,
+    )
 
 
 def _rename_trajectory(
@@ -3007,6 +3327,8 @@ def _plan_attached_transfer(
     request: TabletopPickPlaceRequest,
     source_task: TabletopTaskPlan,
     destination_task: TabletopTaskPlan,
+    *,
+    planner_pool: TabletopPlannerPool | None = None,
 ) -> tuple[PlannedTrajectory, dict[str, Any]]:
     """Connect the two already-validated lifted states with the payload attached."""
 
@@ -3041,8 +3363,25 @@ def _plan_attached_transfer(
         joint_position_offsets_rad=source.joint_position_offsets_rad,
         active_finger_q_rad=close_target,
     )
+    motion_robot = copy.deepcopy(robot)
+    _use_moving_grasp_frame_only(motion_robot, arm=arm)
+    motion_configuration_key = _configuration_key(motion_robot)
     device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
-    checker = CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+    strict_configuration_key = _configuration_key(robot)
+    strict_checker_reused = False
+    strict_checker_topology_rebuilt = False
+    if planner_pool is None:
+        checker = CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+    else:
+        checker, strict_event = planner_pool.acquire_strict_checker(
+            role="attached",
+            arm=arm,
+            robot=robot,
+            device_cfg=device_cfg,
+            configuration_key=strict_configuration_key,
+        )
+        strict_checker_reused = bool(strict_event["reused"])
+        strict_checker_topology_rebuilt = bool(strict_event["topology_rebuilt"])
     start_state = _joint_state(device_cfg, start_model, arm_joint_names(arm))
     base_T_torso = (
         checker.kinematics.compute_kinematics(start_state)
@@ -3052,17 +3391,26 @@ def _plan_attached_transfer(
         .cpu()
         .numpy()
     )
-    _use_moving_grasp_frame_only(robot, arm=arm)
     scene, plane_point, down = _attached_transfer_scene(request, base_T_torso)
     planner = None
+    cache_event: dict[str, Any] | None = None
     started = time.monotonic()
     try:
-        planner, planner_device = _planner(
-            robot,
-            scene,
-            max_goalset=1,
-            seed=source.random_seed,
-        )
+        if planner_pool is None:
+            planner, planner_device = _planner(
+                motion_robot,
+                scene,
+                max_goalset=1,
+                seed=source.random_seed,
+            )
+        else:
+            planner, planner_device, cache_event = planner_pool.motion("attached", arm).acquire(
+                motion_robot,
+                scene,
+                seed=source.random_seed,
+                kinematics_key=motion_configuration_key,
+                scene_key=_configuration_key(scene),
+            )
         start_state = _joint_state(planner_device, start_model, arm_joint_names(arm))
         goal_state = _joint_state(planner_device, goal_model, arm_joint_names(arm))
         sphere_count = _attach_cube(
@@ -3141,9 +3489,23 @@ def _plan_attached_transfer(
             "minimum_payload_plane_link": payload_link,
             "minimum_payload_plane_sample": payload_sample,
             "world_cuboid_ids": sorted(scene.get("cuboid", {})),
+            "strict_checker_reused": strict_checker_reused,
+            "strict_checker_topology_rebuilt": strict_checker_topology_rebuilt,
+            "attached_optimizer_reused": (
+                False if cache_event is None else bool(cache_event["reused"])
+            ),
+            "attached_optimizer_topology_rebuilt": (
+                False if cache_event is None else bool(cache_event["topology_rebuilt"])
+            ),
+            "attached_optimizer_reconfiguration_s": (
+                0.0
+                if cache_event is None or not cache_event["reused"]
+                else float(cache_event["elapsed_s"])
+            ),
         }
     finally:
-        _cleanup(planner)
+        if planner_pool is None:
+            _cleanup(planner)
 
 
 def _payload_route(task: TabletopTaskPlan) -> np.ndarray:
@@ -3173,6 +3535,7 @@ def _payload_route(task: TabletopTaskPlan) -> np.ndarray:
 def plan_moving_grasp_continuation(
     continuation: MovingGraspContinuationRequest,
     *,
+    planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> tuple[TabletopTaskPlan, _MovingGraspGeometry]:
     """Rebuild only the close/lift/replace lifecycle after moving-target MPC.
@@ -3212,7 +3575,17 @@ def plan_moving_grasp_continuation(
         joint_position_offsets_rad=request.joint_position_offsets_rad,
         active_finger_q_rad=active_fingers,
     )
-    checker = CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+    strict_event = None
+    if planner_pool is None:
+        checker = CuroboKinematicCollisionChecker(robot=robot, device_cfg=device_cfg)
+    else:
+        checker, strict_event = planner_pool.acquire_strict_checker(
+            role="open",
+            arm=arm,
+            robot=robot,
+            device_cfg=device_cfg,
+            configuration_key=_configuration_key(robot),
+        )
     contact_state = _joint_state(device_cfg, contact_model, arm_joint_names(arm))
     base_T_torso = (
         checker.kinematics.compute_kinematics(contact_state)
@@ -3233,9 +3606,9 @@ def plan_moving_grasp_continuation(
     base_T_object = canonical_resting_cube_pose(base_T_detected_object)
     down = -base_T_object[:3, 2]
     fixture_height = 0.0 if request.fixture is None else request.fixture.support_height_m
-    plane_point = base_T_object[:3, 3] + (
-        0.5 * request.object_dimensions_m[2] + fixture_height
-    ) * down
+    plane_point = (
+        base_T_object[:3, 3] + (0.5 * request.object_dimensions_m[2] + fixture_height) * down
+    )
     geometry = _MovingGraspGeometry(
         base_T_torso=base_T_torso,
         base_T_detected_object=base_T_detected_object,
@@ -3277,15 +3650,23 @@ def plan_moving_grasp_continuation(
         )
     _open_profile, close_profile = dex3_execution_profile(arm)
     close_target = np.asarray(close_profile, dtype=np.float64)
-    fixed_close_validator = _FixedCloseSweepValidator(
-        request=request,
-        base_T_object=base_T_object,
-        base_T_detected_object=base_T_detected_object,
-        plane_point=plane_point,
-        down=down,
-        open_q=np.asarray(active_fingers, dtype=np.float64),
-        close_target_q=close_target,
-    )
+    fixed_close_arguments = {
+        "request": request,
+        "base_T_object": base_T_object,
+        "base_T_detected_object": base_T_detected_object,
+        "plane_point": plane_point,
+        "down": down,
+        "open_q": np.asarray(active_fingers, dtype=np.float64),
+        "close_target_q": close_target,
+    }
+    fixed_close_event = None
+    if planner_pool is None:
+        fixed_close_validator = _FixedCloseSweepValidator(**fixed_close_arguments)
+    else:
+        fixed_close_validator, fixed_close_event = planner_pool.acquire_fixed_close_validator(
+            configuration_key=_fixed_close_configuration_key(request),
+            **fixed_close_arguments,
+        )
     fixed_close_sweep = fixed_close_validator.validate(contact_model, selected_candidate)
     report("moving-target terminal fixed-close sweep passed; planning attached lift")
     started = time.monotonic()
@@ -3303,6 +3684,9 @@ def plan_moving_grasp_continuation(
         contact_snapshot=contact_snapshot,
         base_T_object_override=base_T_object,
         base_T_detected_object_override=base_T_detected_object,
+        attached_planner_cache=(
+            None if planner_pool is None else planner_pool.motion("attached", arm)
+        ),
     )
     retention_test_lift = lift_plan.retention_test_lift
     payload_lift = lift_plan.payload_lift
@@ -3349,9 +3733,7 @@ def plan_moving_grasp_continuation(
             **prior.planner_provenance,
             "moving_target_continuation": {
                 "request_sha256": continuation.content_sha256,
-                "terminal_mpc_window_sha256": (
-                    continuation.terminal_mpc_window_sha256
-                ),
+                "terminal_mpc_window_sha256": (continuation.terminal_mpc_window_sha256),
                 "target_provenance": continuation.target_provenance,
                 "payload_replan_elapsed_s": time.monotonic() - started,
                 "base_T_detected_object": base_T_detected_object.tolist(),
@@ -3364,11 +3746,20 @@ def plan_moving_grasp_continuation(
                 "fixed_close_sweep_minimum_plane_clearance_m": (
                     fixed_close_sweep.minimum_plane_clearance_m
                 ),
-                "retention_test_lift_actual_m": (
-                    lift_plan.retention_test_lift_actual_m
+                "retention_test_lift_actual_m": (lift_plan.retention_test_lift_actual_m),
+                "payload_start_plane_clearance_m": (lift_plan.payload_start_plane_clearance_m),
+                "strict_checker_reused": (
+                    False if strict_event is None else bool(strict_event["reused"])
                 ),
-                "payload_start_plane_clearance_m": (
-                    lift_plan.payload_start_plane_clearance_m
+                "fixed_close_validator_reused": (
+                    False if fixed_close_event is None else bool(fixed_close_event["reused"])
+                ),
+                "attached_optimizer_reused": lift_plan.attached_optimizer_reused,
+                "attached_optimizer_topology_rebuilt": (
+                    lift_plan.attached_optimizer_topology_rebuilt
+                ),
+                "attached_optimizer_reconfiguration_s": (
+                    lift_plan.attached_optimizer_reconfiguration_s
                 ),
                 "return_policy": (
                     "reverse_new_payload_lift_then_reverse_exact_accepted_mpc_approach_"
@@ -3395,6 +3786,7 @@ class RetentionRouteValidator:
         task: TabletopTaskPlan,
         *,
         geometry: _MovingGraspGeometry | None = None,
+        fixed_close_validator: _FixedCloseSweepValidator | None = None,
     ) -> None:
         import torch
         from curobo.types import DeviceCfg, JointState
@@ -3408,16 +3800,28 @@ class RetentionRouteValidator:
         self.arm = tabletop.arm
         self.route_q = _payload_route(task)
         started = time.monotonic()
-        robot, self.active_joint_names, reference = build_tabletop_route_validation_robot_config(
-            arm=self.arm,
-            snapshot=tabletop.planning_snapshot,
-            joint_position_offsets_rad=tabletop.joint_position_offsets_rad,
-        )
-        self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
-        self.checker = CuroboKinematicCollisionChecker(
-            robot=robot,
-            device_cfg=self.device_cfg,
-        )
+        if fixed_close_validator is None:
+            robot, self.active_joint_names, reference = (
+                build_tabletop_route_validation_robot_config(
+                    arm=self.arm,
+                    snapshot=tabletop.planning_snapshot,
+                    joint_position_offsets_rad=tabletop.joint_position_offsets_rad,
+                )
+            )
+            self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+            self.checker = CuroboKinematicCollisionChecker(
+                robot=robot,
+                device_cfg=self.device_cfg,
+            )
+            self.reused_fixed_close_checker = False
+        else:
+            if fixed_close_validator.arm != self.arm:
+                raise ValueError("retention checker cannot reuse another arm's fixed-close model")
+            self.active_joint_names = fixed_close_validator.active_joint_names
+            reference = fixed_close_validator.reference_q
+            self.device_cfg = fixed_close_validator.device_cfg
+            self.checker = fixed_close_validator.checker
+            self.reused_fixed_close_checker = True
         reference_state = JointState.from_position(
             self.device_cfg.to_device(np.asarray(reference, dtype=np.float64)[None]),
             joint_names=list(self.active_joint_names),
@@ -3538,6 +3942,7 @@ class RetentionRouteValidator:
                 "elapsed_s": time.monotonic() - started,
                 "cached_kinematics": True,
                 "cache_build_s": self.cache_build_s,
+                "reused_fixed_close_checker": self.reused_fixed_close_checker,
                 "required_hand_plane_clearance_m": (self.tabletop.minimum_hand_plane_clearance_m),
                 "table_plane_policy": "positive_start_relative_escape_exact_reverse_return",
                 "boundary_hand_plane_clearance_m": plane_policy.boundary_m,
@@ -3739,13 +4144,15 @@ def _plan_tabletop(
     *,
     required_candidate_id: str | None = None,
     pregrasp_only: bool,
-    open_planner_cache: ReusableOpenPlanner | None = None,
+    planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopTaskPlan | TabletopPregraspPlan:
     """Plan either the first boundary route or one complete task."""
 
     report = progress or (lambda _message: None)
     arm = request.arm
+    open_planner_cache = None if planner_pool is None else planner_pool.motion("open", arm)
+    attached_planner_cache = None if planner_pool is None else planner_pool.motion("attached", arm)
     shortlist, candidates = _load_shortlist(request)
     if required_candidate_id is not None:
         candidates = [
@@ -3780,6 +4187,8 @@ def _plan_tabletop(
     started = time.monotonic()
     planner = None
     strict_model_resolution_s = 0.0
+    strict_checker_reused = False
+    strict_checker_topology_rebuilt = False
     optimizer_model_clone_s = 0.0
     open_optimizer_setup_s = 0.0
     open_optimizer_reconfiguration_s = 0.0
@@ -3788,6 +4197,7 @@ def _plan_tabletop(
     batched_ik_setup_s = 0.0
     batched_ik_s = 0.0
     batched_fixed_close_s = 0.0
+    fixed_close_validator_reused = False
     endpoint_precheck_s = 0.0
     fixed_close_sweep_validation_s = 0.0
     open_branch_planning_s = 0.0
@@ -3807,26 +4217,47 @@ def _plan_tabletop(
         # This checker is also the strict full-robot validator used by every
         # candidate branch, so no temporary model is needed.
         device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+        strict_configuration_key = _configuration_key(query_robot)
         stage_started = time.monotonic()
-        strict_open_checker = CuroboKinematicCollisionChecker(
-            robot=query_robot,
-            device_cfg=device_cfg,
-        )
+        if planner_pool is None:
+            strict_open_checker = CuroboKinematicCollisionChecker(
+                robot=query_robot,
+                device_cfg=device_cfg,
+            )
+        else:
+            strict_open_checker, strict_event = planner_pool.acquire_strict_checker(
+                role="open",
+                arm=arm,
+                robot=query_robot,
+                device_cfg=device_cfg,
+                configuration_key=strict_configuration_key,
+            )
+            strict_checker_reused = bool(strict_event["reused"])
+            strict_checker_topology_rebuilt = bool(strict_event["topology_rebuilt"])
         strict_model_resolution_s = time.monotonic() - stage_started
         state = _joint_state(device_cfg, reference_model, arm_joint_names(arm))
         kinematics = strict_open_checker.kinematics.compute_kinematics(state)
         base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
 
         plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
-        fixed_close_validator = _FixedCloseSweepValidator(
-            request=request,
-            base_T_object=base_T_object,
-            base_T_detected_object=_base_T_detected_object(request, base_T_torso),
-            plane_point=plane_point,
-            down=down,
-            open_q=open_q,
-            close_target_q=close_target_q,
-        )
+        fixed_close_arguments = {
+            "request": request,
+            "base_T_object": base_T_object,
+            "base_T_detected_object": _base_T_detected_object(request, base_T_torso),
+            "plane_point": plane_point,
+            "down": down,
+            "open_q": open_q,
+            "close_target_q": close_target_q,
+        }
+        if planner_pool is None:
+            fixed_close_validator = _FixedCloseSweepValidator(**fixed_close_arguments)
+        else:
+            fixed_close_configuration_key = _fixed_close_configuration_key(request)
+            fixed_close_validator, fixed_close_event = planner_pool.acquire_fixed_close_validator(
+                configuration_key=fixed_close_configuration_key,
+                **fixed_close_arguments,
+            )
+            fixed_close_validator_reused = bool(fixed_close_event["reused"])
         grasp_matrices = [base_T_object @ _candidate_transform(item) for item in candidates]
         approach_distance_m = float(shortlist["execution_contract"]["approach_distance_m"])
         branch_rejections: list[dict[str, Any]] = []
@@ -3899,6 +4330,7 @@ def _plan_tabletop(
             include_cube=True,
             include_open_transit_table_patch=True,
         )
+        open_scene_key = _configuration_key(scene)
 
         while remaining_indices:
             search_round += 1
@@ -3931,7 +4363,8 @@ def _plan_tabletop(
                         current_transit_robot,
                         current_scene,
                         seed=request.random_seed,
-                        configuration_key=request.content_sha256,
+                        kinematics_key=(strict_configuration_key + ":selected_open_transit"),
+                        scene_key=open_scene_key,
                     )
                     open_optimizer_reused = open_optimizer_reused or bool(cache_event["reused"])
                     open_optimizer_topology_rebuilt = open_optimizer_topology_rebuilt or bool(
@@ -4137,6 +4570,7 @@ def _plan_tabletop(
                         down=down,
                         arm=arm,
                         fixed_close_validator=fixed_close_validator,
+                        attached_planner_cache=attached_planner_cache,
                     )
                 finally:
                     attached_lift_planning_s += time.monotonic() - lift_started
@@ -4304,6 +4738,9 @@ def _plan_tabletop(
                     ),
                     "open_optimizer_reused": open_optimizer_reused,
                     "open_optimizer_topology_rebuilt": open_optimizer_topology_rebuilt,
+                    "strict_checker_reused": strict_checker_reused,
+                    "strict_checker_topology_rebuilt": strict_checker_topology_rebuilt,
+                    "fixed_close_validator_reused": fixed_close_validator_reused,
                 },
             )
 
@@ -4496,6 +4933,16 @@ def _plan_tabletop(
                 "return_policy": "exact reverse lift, grasp, and approach trajectories",
                 "open_optimizer_reused": open_optimizer_reused,
                 "open_optimizer_topology_rebuilt": open_optimizer_topology_rebuilt,
+                "strict_checker_reused": strict_checker_reused,
+                "strict_checker_topology_rebuilt": strict_checker_topology_rebuilt,
+                "fixed_close_validator_reused": fixed_close_validator_reused,
+                "attached_optimizer_reused": lift_plan.attached_optimizer_reused,
+                "attached_optimizer_topology_rebuilt": (
+                    lift_plan.attached_optimizer_topology_rebuilt
+                ),
+                "attached_optimizer_reconfiguration_s": (
+                    lift_plan.attached_optimizer_reconfiguration_s
+                ),
             },
         )
     finally:
@@ -4503,10 +4950,171 @@ def _plan_tabletop(
             _cleanup(planner)
 
 
+def prewarm_tabletop_task_models(
+    request: TabletopTaskRequest,
+    *,
+    planner_pool: TabletopPlannerPool,
+) -> dict[str, Any]:
+    """Construct every topology needed after motion starts, without solving a task."""
+
+    import torch
+    from curobo.types import DeviceCfg
+
+    started = time.monotonic()
+    arm = request.arm
+    snapshot = request.planning_snapshot
+    open_q = np.asarray(
+        snapshot.left_dex3_q_rad if arm == "left" else snapshot.right_dex3_q_rad,
+        dtype=np.float64,
+    )
+    close_target_q = np.asarray(dex3_execution_profile(arm)[1], dtype=np.float64)
+    reference = np.asarray(snapshot.measured_q29_rad, dtype=np.float64)[
+        np.asarray(arm_indices(arm))
+    ]
+    reference_model = np.asarray(
+        [
+            value + request.joint_position_offsets_rad.get(name, 0.0)
+            for name, value in zip(arm_joint_names(arm), reference, strict=True)
+        ]
+    )
+    query_robot, _ = build_tabletop_robot_config(
+        arm=arm,
+        snapshot=snapshot,
+        joint_position_offsets_rad=request.joint_position_offsets_rad,
+        active_finger_q_rad=tuple(open_q),
+    )
+    device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+    strict_configuration_key = _configuration_key(query_robot)
+    strict_checker, strict_event = planner_pool.acquire_strict_checker(
+        role="open",
+        arm=arm,
+        robot=query_robot,
+        device_cfg=device_cfg,
+        configuration_key=strict_configuration_key,
+    )
+    state = _joint_state(device_cfg, reference_model, arm_joint_names(arm))
+    base_T_torso = (
+        strict_checker.kinematics.compute_kinematics(state)
+        .tool_poses["torso_link"]
+        .get_matrix()[0]
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
+    fixed_close_validator, fixed_close_event = planner_pool.acquire_fixed_close_validator(
+        configuration_key=_fixed_close_configuration_key(request),
+        request=request,
+        base_T_object=base_T_object,
+        base_T_detected_object=_base_T_detected_object(request, base_T_torso),
+        plane_point=plane_point,
+        down=down,
+        open_q=open_q,
+        close_target_q=close_target_q,
+    )
+    if fixed_close_validator.arm != arm:
+        raise RuntimeError("fixed-close prewarm returned another arm's checker")
+
+    _use_moving_grasp_frame_only(query_robot, arm=arm)
+    open_robot = _resolved_motion_robot(
+        checker=strict_checker,
+        source_robot=query_robot,
+        arm=arm,
+        scope_world_to_selected_hand=True,
+    )
+    open_scene = _base_scene(
+        request,
+        base_T_torso,
+        include_cube=True,
+        include_open_transit_table_patch=True,
+    )
+    open_planner, open_device, open_event = planner_pool.motion("open", arm).acquire(
+        open_robot,
+        open_scene,
+        seed=request.random_seed,
+        kinematics_key=(strict_configuration_key + ":selected_open_transit"),
+        scene_key=_configuration_key(open_scene),
+    )
+    open_probe = _prewarm_motion_planner(
+        open_planner,
+        open_device,
+        reference_model,
+        arm=arm,
+        down=down,
+    )
+
+    attached_robot, attached_scene = _attached_planner_configuration(
+        request=request,
+        close_target_q=close_target_q,
+        base_T_torso=base_T_torso,
+        arm=arm,
+    )
+    attached_kinematics_key = _configuration_key(attached_robot)
+    attached_scene_key = _configuration_key(attached_scene)
+    attached_planner, attached_device, attached_event = planner_pool.motion(
+        "attached", arm
+    ).acquire(
+        attached_robot,
+        attached_scene,
+        seed=request.random_seed,
+        kinematics_key=attached_kinematics_key,
+        scene_key=attached_scene_key,
+    )
+    attached_probe = _prewarm_motion_planner(
+        attached_planner,
+        attached_device,
+        reference_model,
+        arm=arm,
+        down=down,
+    )
+    return {
+        "operation": "prewarm_tabletop_task_models",
+        "arm": arm,
+        "elapsed_s": time.monotonic() - started,
+        "strict_checker": strict_event,
+        "fixed_close_validator": fixed_close_event,
+        "open_optimizer": {**open_event, "probe": open_probe},
+        "attached_optimizer": {**attached_event, "probe": attached_probe},
+        "task_feasibility_planning_performed": False,
+        "robot_command_authorized": False,
+    }
+
+
+def _prewarm_motion_planner(
+    planner,
+    device_cfg,
+    reference_model: np.ndarray,
+    *,
+    arm: str,
+    down: np.ndarray,
+) -> dict[str, Any]:
+    """Exercise one optimizer graph with a disposable 5 mm upward query."""
+
+    from curobo.types import GoalToolPose, Pose
+
+    started = time.monotonic()
+    state = _joint_state(device_cfg, reference_model, arm_joint_names(arm))
+    target = _base_T_grasp(planner, state, arm=arm)
+    target[:3, 3] -= 0.005 * np.asarray(down, dtype=np.float64)
+    goal = GoalToolPose.from_poses(
+        {grasp_frame(arm): Pose.from_matrix(device_cfg.to_device(target[None]))},
+        ordered_tool_frames=[grasp_frame(arm)],
+    )
+    result = planner.plan_pose(goal, state, max_attempts=1)
+    success = result is not None and bool(result.success.any())
+    planner.reset_seed()
+    return {
+        "elapsed_s": time.monotonic() - started,
+        "success": success,
+        "query_translation_m": 0.005,
+        "installed_for_execution": False,
+    }
+
+
 def plan_tabletop_pregrasp(
     request: TabletopTaskRequest,
     *,
-    open_planner_cache: ReusableOpenPlanner | None = None,
+    planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopPregraspPlan:
     """Plan only the reversible clearance-to-pregrasp boundary route."""
@@ -4514,7 +5122,7 @@ def plan_tabletop_pregrasp(
     result = _plan_tabletop(
         request,
         pregrasp_only=True,
-        open_planner_cache=open_planner_cache,
+        planner_pool=planner_pool,
         progress=progress,
     )
     if not isinstance(result, TabletopPregraspPlan):
@@ -4526,7 +5134,7 @@ def plan_tabletop_task(
     request: TabletopTaskRequest,
     *,
     required_candidate_id: str | None = None,
-    open_planner_cache: ReusableOpenPlanner | None = None,
+    planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopTaskPlan:
     """Plan a complete task while preserving alternate arm IK branches."""
@@ -4535,7 +5143,7 @@ def plan_tabletop_task(
         request,
         required_candidate_id=required_candidate_id,
         pregrasp_only=False,
-        open_planner_cache=open_planner_cache,
+        planner_pool=planner_pool,
         progress=progress,
     )
     if not isinstance(result, TabletopTaskPlan):
@@ -4546,7 +5154,7 @@ def plan_tabletop_task(
 def plan_tabletop_pick_place(
     request: TabletopPickPlaceRequest,
     *,
-    open_planner_cache: ReusableOpenPlanner | None = None,
+    planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopPickPlacePlan:
     """Plan one fixed pick/place sequence without introducing a task graph."""
@@ -4557,7 +5165,7 @@ def plan_tabletop_pick_place(
     report("planning the qualified source grasp and attached lift")
     first_source_task = plan_tabletop_task(
         source,
-        open_planner_cache=open_planner_cache,
+        planner_pool=planner_pool,
         progress=report,
     )
     destination = destination_request_for_pick_place(request)
@@ -4578,7 +5186,7 @@ def plan_tabletop_pick_place(
                 current_source = plan_tabletop_task(
                     source,
                     required_candidate_id=candidate_id,
-                    open_planner_cache=open_planner_cache,
+                    planner_pool=planner_pool,
                     progress=report,
                 )
             except RuntimeError as error:
@@ -4598,7 +5206,7 @@ def plan_tabletop_pick_place(
             current_destination = plan_tabletop_task(
                 destination,
                 required_candidate_id=candidate_id,
-                open_planner_cache=open_planner_cache,
+                planner_pool=planner_pool,
                 progress=report,
             )
             report("planning the attached-payload bridge between validated lifted states")
@@ -4606,6 +5214,7 @@ def plan_tabletop_pick_place(
                 request,
                 current_source,
                 current_destination,
+                planner_pool=planner_pool,
             )
         except RuntimeError as error:
             pick_place_rejections.append(

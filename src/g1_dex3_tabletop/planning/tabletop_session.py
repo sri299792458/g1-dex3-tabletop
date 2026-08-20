@@ -14,12 +14,13 @@ from g1_dex3_tabletop.planning.tabletop_mpc import TabletopPhaseMPC, mpc_phase_s
 from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
     RetentionRouteValidator,
-    ReusableOpenPlanner,
+    TabletopPlannerPool,
     plan_moving_grasp_continuation,
     plan_supported_escape,
     plan_tabletop_pick_place,
     plan_tabletop_pregrasp,
     plan_tabletop_task,
+    prewarm_tabletop_task_models,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
     MovingGraspContinuationRequest,
@@ -60,7 +61,7 @@ class TabletopPlanningSession:
         self._pick_place_retention_validator: PickPlaceRetentionRouteValidator | None = None
         self._phase_mpc: TabletopPhaseMPC | None = None
         self._active_phase_mpc: TabletopPhaseMPC | None = None
-        self._open_planner = ReusableOpenPlanner()
+        self._planner_pool = TabletopPlannerPool()
 
     def plan_lifecycle(
         self,
@@ -71,7 +72,11 @@ class TabletopPlanningSession:
         report = progress or (lambda _message: None)
         escape = plan_supported_escape(request, progress=report)
         clearance_request = request_at_clearance(request, escape)
-        task = plan_tabletop_task(clearance_request, progress=report)
+        task = plan_tabletop_task(
+            clearance_request,
+            planner_pool=self._planner_pool,
+            progress=report,
+        )
         _clearance, execution = assemble_execution_plan(
             loaded_request=request,
             supported_escape=escape,
@@ -84,7 +89,10 @@ class TabletopPlanningSession:
         self._execution = execution
         self._active_task = task
         report("building reusable measured-contact collision checker")
-        self._retention_validator = RetentionRouteValidator(clearance_request, task)
+        self._retention_validator = self._planner_pool.retention_validator(
+            clearance_request,
+            task,
+        )
         report(
             "reusable measured-contact collision checker ready; "
             f"build={self._retention_validator.cache_build_s:.3f}s"
@@ -118,6 +126,34 @@ class TabletopPlanningSession:
         self._pick_place_retention_validator = None
         return escape
 
+    def prewarm_task_at_clearance(
+        self,
+        request: TabletopTaskRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> dict:
+        """Populate every task planner slot before the first arm trajectory."""
+
+        if self._loaded_request is None or self._supported_escape is None:
+            raise RuntimeError("task prewarm requires a supported escape in this worker")
+        expected = request_at_clearance(self._loaded_request, self._supported_escape)
+        if request.content_sha256 != expected.content_sha256:
+            raise ValueError("task prewarm request must be the exact predicted clearance request")
+        report = progress or (lambda _message: None)
+        report(
+            "constructing open-hand, fixed-close, and attached-payload CUDA models "
+            "before the first changing arm target; no task solve is being used as a gate"
+        )
+        result = prewarm_tabletop_task_models(
+            request,
+            planner_pool=self._planner_pool,
+        )
+        report(
+            "pre-motion model warmup complete; fresh boundary observations remain the "
+            "only source of executable task feasibility"
+        )
+        return result
+
     def plan_pick_place(
         self,
         request: TabletopPickPlaceRequest,
@@ -133,7 +169,7 @@ class TabletopPlanningSession:
         self._active_phase_mpc = None
         plan = plan_tabletop_pick_place(
             request,
-            open_planner_cache=self._open_planner,
+            planner_pool=self._planner_pool,
             progress=progress,
         )
         self._pick_place_request = request
@@ -196,7 +232,7 @@ class TabletopPlanningSession:
         report = progress or (lambda _message: None)
         pregrasp = plan_tabletop_pregrasp(
             request,
-            open_planner_cache=self._open_planner,
+            planner_pool=self._planner_pool,
             progress=report,
         )
         controller = self._phase_mpc
@@ -254,8 +290,11 @@ class TabletopPlanningSession:
                 "supported-escape endpoint"
             )
         report = progress or (lambda _message: None)
-        self._open_planner.close()
-        task = plan_tabletop_task(request, progress=report)
+        task = plan_tabletop_task(
+            request,
+            planner_pool=self._planner_pool,
+            progress=report,
+        )
         execution = combine_tabletop_plans(
             loaded_request=self._loaded_request,
             clearance_request=request,
@@ -263,7 +302,7 @@ class TabletopPlanningSession:
             task=task,
         )
         report("rebuilding measured-contact checker for the boundary-corrected task")
-        retention_validator = RetentionRouteValidator(request, task)
+        retention_validator = self._planner_pool.retention_validator(request, task)
         controller = self._phase_mpc
         if controller is not None:
             controller.close()
@@ -309,22 +348,19 @@ class TabletopPlanningSession:
             )
         report = progress or (lambda _message: None)
         selected_candidate_id = self._pregrasp_plan.selected_candidate_id
-        try:
-            task = plan_tabletop_task(
-                request,
-                required_candidate_id=selected_candidate_id,
-                open_planner_cache=self._open_planner,
-                progress=report,
-            )
-        finally:
-            self._open_planner.close()
+        task = plan_tabletop_task(
+            request,
+            required_candidate_id=selected_candidate_id,
+            planner_pool=self._planner_pool,
+            progress=report,
+        )
         remaining = build_pregrasp_remaining_plan(
             prior_pregrasp_plan=self._pregrasp_plan,
             estimated_request=request,
             task=task,
         )
         report("rebuilding measured-contact checker for the pregrasp-corrected task")
-        validator = RetentionRouteValidator(request, task)
+        validator = self._planner_pool.retention_validator(request, task)
         controller = self._phase_mpc
         if controller is not None:
             controller.close()
@@ -353,8 +389,12 @@ class TabletopPlanningSession:
             raise ValueError("moving-grasp continuation uses another clearance request")
         if request.prior_task_plan.content_sha256 != self._execution.task.content_sha256:
             raise ValueError("moving-grasp continuation uses another prior task")
-        task, geometry = plan_moving_grasp_continuation(request, progress=progress)
-        validator = RetentionRouteValidator(
+        task, geometry = plan_moving_grasp_continuation(
+            request,
+            planner_pool=self._planner_pool,
+            progress=progress,
+        )
+        validator = self._planner_pool.retention_validator(
             request.tabletop_request,
             task,
             geometry=geometry,
@@ -500,13 +540,9 @@ class TabletopPlanningSession:
                 reference_T_camera=np.asarray(
                     moving_target.get("reference_T_camera"), dtype=np.float64
                 ),
-                camera_T_object=np.asarray(
-                    moving_target.get("camera_T_object"), dtype=np.float64
-                ),
+                camera_T_object=np.asarray(moving_target.get("camera_T_object"), dtype=np.float64),
                 target_provenance=moving_target,
-                committed_route_progress_index=int(
-                    payload["committed_route_progress_index"]
-                ),
+                committed_route_progress_index=int(payload["committed_route_progress_index"]),
             )
         return self._active_phase_mpc.next_nominal_window(
             handoff_predicted_q_rad=np.asarray(
@@ -532,7 +568,7 @@ class TabletopPlanningSession:
         )
 
     def close(self) -> None:
-        self._open_planner.close()
+        self._planner_pool.close()
         controller = self._phase_mpc
         self._phase_mpc = None
         self._active_phase_mpc = None

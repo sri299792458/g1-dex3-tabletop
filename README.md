@@ -21,10 +21,16 @@ rejected approaches, and remaining physical limits.
   It is started and warmed before SPACE, never imports Unitree transport code,
   and remains alive for the reversible supported escape, clearance-boundary
   pregrasp selection, corrected remaining-task plan, MPC, and measured-contact
-  validation. The default trajectory path retains one fixed-shape open-hand
-  optimizer across the two planning boundaries. ROS/control runs in Python 3.10
-  and keeps publishing through the commissioned fixed-rate Unitree controller
-  while planning is in progress.
+  validation. The default trajectory path retains a small lazy per-arm pool of
+  fixed-shape open-hand and attached-payload optimizers plus their strict and
+  fixed-close checkers. Compatible locked-joint values, scenes, and attachments
+  are updated in place; left/right or open/payload topologies never share a
+  slot. After the supported escape is solved but before its first changing
+  target is published, the worker constructs and exercises the selected arm's
+  open and payload optimizer graphs. This is construction-only warmup: it does
+  not create a nominal task or replace fresh boundary feasibility. ROS/control
+  runs in Python 3.10 and keeps publishing through the
+  commissioned fixed-rate Unitree controller while planning is in progress.
 - Hardware commands require the exact harness/workspace acknowledgement and a
   second interactive SPACE after a read-only live preflight.
 - Standing calibration uses `rt/arm_sdk`, full gravity feedforward, measured
@@ -229,9 +235,10 @@ stationary correction after reaching pregrasp. The original clearance image
 remains the visual anchor; no hand marker or second cube image is required at
 pregrasp. The clearance transaction serializes only the validated
 clearance-to-pregrasp route and its exact reverse; it does not compute a
-provisional payload lifecycle that will be discarded. The warmed open-hand
-CuRobo optimizer is value-updated and reused for the same-grasp corrected
-remainder. If the synchronized waist/IMU inputs, same-grasp replan, post-plan
+provisional payload lifecycle that will be discarded. The warmed per-arm
+CuRobo pool reuses the compatible open-hand, strict, fixed-close, and payload
+objects across planning boundaries and source/destination queries. If the
+synchronized waist/IMU inputs, same-grasp replan, post-plan
 state check, or atomic plan installation fails, the arm exactly reverses the
 already validated pregrasp route and then the supported escape.
 Before that pregrasp route is accepted, the planner holds its exact grasp

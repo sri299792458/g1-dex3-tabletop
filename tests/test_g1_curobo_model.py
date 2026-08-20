@@ -121,6 +121,13 @@ def test_tabletop_model_reserves_attached_payload_spheres(arm: str) -> None:
     assert f"{arm}_hip_yaw_link" not in ignore[f"{arm}_hand_palm_link"]
     opposite = "right" if arm == "left" else "left"
     assert f"{opposite}_hand_palm_link" not in ignore[f"{arm}_hand_palm_link"]
+    # Links outside the selected arm/hand subtree are locked to one measured
+    # snapshot. Their mutual collision state cannot change during planning.
+    assert f"{opposite}_hand_palm_link" in ignore["left_ankle_roll_link"]
+    assert "left_ankle_roll_link" in ignore[f"{opposite}_hand_palm_link"]
+    # Every selected-arm/body and selected-arm/opposite-arm pair stays active.
+    assert "torso_link" not in ignore[f"{arm}_hand_palm_link"]
+    assert f"{opposite}_hand_palm_link" not in ignore[f"{arm}_hand_palm_link"]
     for side in ("left", "right"):
         assert f"{side}_shoulder_roll_link" in ignore["torso_link"]
         assert "torso_link" in ignore[f"{side}_shoulder_roll_link"]
@@ -153,6 +160,10 @@ def test_offline_tabletop_model_can_expose_waist_yaw_with_one_arm(arm: str) -> N
     assert "waist_yaw_joint" not in robot["kinematics"]["lock_joints"]
     opposite = "right" if arm == "left" else "left"
     assert f"{opposite}_shoulder_pitch_joint" in robot["kinematics"]["lock_joints"]
+    # Static-pair pruning is intentionally disabled when waist yaw is active;
+    # the opposite hand can then move relative to the locked legs.
+    ignore = robot["kinematics"]["self_collision_ignore"]
+    assert f"{opposite}_hand_palm_link" not in ignore.get("left_ankle_roll_link", [])
 
 
 def test_graspgenx_g_to_palm_transform_is_side_specific() -> None:

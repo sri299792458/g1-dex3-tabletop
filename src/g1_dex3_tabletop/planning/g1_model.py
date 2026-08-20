@@ -179,6 +179,46 @@ def command_from_model_q(
     )
 
 
+def _ignore_invariant_static_collision_pairs(
+    *,
+    collision_links: list[str],
+    self_collision_ignore: dict[str, list[str]],
+    arm: str,
+) -> None:
+    """Remove collision work that no selected-arm coordinate can change.
+
+    The hardware tabletop planner exposes exactly seven joints from one arm.
+    Every collision link outside that arm/hand subtree is locked to the live
+    measured snapshot, so the relative transform of any two such links is
+    constant throughout IK and trajectory optimization.  Keep every pair with
+    at least one selected-arm link; remove only locked-link/locked-link pairs.
+
+    This optimization is deliberately not used by the offline waist-yaw model:
+    unlocking the waist makes upper-body-to-leg relationships variable.
+    """
+
+    selected = validate_arm_side(arm)
+    collision_link_set = set(collision_links)
+    moving_links = {name.removesuffix("_joint") + "_link" for name in arm_joint_names(selected)}
+    moving_links.update(name for name in collision_links if name.startswith(f"{selected}_hand_"))
+    moving_links.add(attachment_link(selected))
+    missing = sorted(moving_links - collision_link_set)
+    if missing:
+        raise ValueError(f"selected-arm collision subtree is incomplete: {missing}")
+
+    static_links = sorted(collision_link_set - moving_links)
+    for index, link in enumerate(static_links):
+        self_collision_ignore.setdefault(link, [])
+        for other in static_links[index + 1 :]:
+            self_collision_ignore.setdefault(other, [])
+            if other not in self_collision_ignore[link]:
+                self_collision_ignore[link].append(other)
+            if link not in self_collision_ignore[other]:
+                self_collision_ignore[other].append(link)
+    for link in static_links:
+        self_collision_ignore[link] = sorted(set(self_collision_ignore[link]))
+
+
 def build_locked_robot_config(
     *,
     arm: str,
@@ -382,6 +422,12 @@ def build_tabletop_robot_config(
         ignore.setdefault(name, [])
         if selected_attachment_link not in ignore[name]:
             ignore[name].append(selected_attachment_link)
+    if not include_waist_yaw:
+        _ignore_invariant_static_collision_pairs(
+            collision_links=links,
+            self_collision_ignore=ignore,
+            arm=selected,
+        )
     kinematics.setdefault("self_collision_buffer", {})[selected_attachment_link] = 0.0
     return robot, reference
 
