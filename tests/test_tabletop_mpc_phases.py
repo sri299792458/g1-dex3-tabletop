@@ -11,9 +11,11 @@ from g1_dex3_tabletop.planning.tabletop_mpc import (
     MPC_PHASE_ORDER,
     MPCBenchmarkConfig,
     TabletopPhaseMPC,
+    _bounded_route_goal,
     _fixture_excluded_links,
     _nominal_base_T_live_base,
     _payload_link_spheres,
+    _reserved_velocity_constraint_is_safe,
     _simulate_phase,
     _world_collision_buffer_deltas,
     mpc_phase_spec,
@@ -53,30 +55,43 @@ def test_lifecycle_benchmark_preserves_configured_tracking_offset() -> None:
         def next_nominal_window(
             self,
             *,
-            measured_command_q_rad,
-            measured_dq_rad_s,
-            active_command_q_rad,
-            state_monotonic_s,
+            handoff_predicted_q_rad,
+            handoff_predicted_dq_rad_s,
+            handoff_predicted_ddq_rad_s2,
+            handoff_command_q_rad,
+            source_state_monotonic_s,
+            valid_from_monotonic_s,
+            predecessor_sha256,
+            committed_route_progress_index,
             reference_T_camera,
         ):
-            del measured_dq_rad_s, state_monotonic_s, reference_T_camera
+            del (
+                handoff_predicted_dq_rad_s,
+                handoff_predicted_ddq_rad_s2,
+                reference_T_camera,
+            )
             np.testing.assert_allclose(
-                np.asarray(active_command_q_rad) - np.asarray(measured_command_q_rad),
+                np.asarray(handoff_command_q_rad) - np.asarray(handoff_predicted_q_rad),
                 offset,
             )
             return MPCCommandWindow(
                 generation=0,
                 plan_sha256="a" * 64,
-                state_monotonic_s=1.0,
+                source_state_monotonic_s=source_state_monotonic_s,
+                valid_from_monotonic_s=valid_from_monotonic_s,
                 sample_time_s=(0.0, 0.2),
                 command_q_rad=(
-                    tuple(active_command_q_rad),
+                    tuple(handoff_command_q_rad),
                     tuple(terminal + offset),
                 ),
+                predicted_q_rad=(tuple(handoff_predicted_q_rad), tuple(terminal)),
+                predicted_dq_rad_s=(tuple(np.full(7, 0.05)), (0.0,) * 7),
+                predicted_ddq_rad_s2=((0.0,) * 7,) * 2,
+                predecessor_sha256=predecessor_sha256,
                 feasible=True,
                 terminal=True,
                 solve_time_s=0.01,
-                diagnostics={},
+                diagnostics={"proposed_route_progress_index": committed_route_progress_index + 1},
             )
 
     phase, measured, velocity = _simulate_phase(
@@ -95,6 +110,75 @@ def test_lifecycle_benchmark_preserves_configured_tracking_offset() -> None:
     np.testing.assert_allclose(velocity, np.zeros(7))
 
 
+def test_lifecycle_benchmark_retries_without_committing_a_rejected_window() -> None:
+    terminal = np.full(7, 0.03)
+
+    class Controller:
+        names = tuple(f"joint_{index}" for index in range(7))
+        request = SimpleNamespace(joint_position_offsets_rad={})
+        spec = SimpleNamespace(
+            phase="move_to_pregrasp",
+            mode="open_free",
+            reference_fixed_goal=False,
+        )
+        path_model_q = np.stack((np.zeros(7), terminal))
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.committed_progress: list[int] = []
+
+        def next_nominal_window(
+            self,
+            *,
+            handoff_predicted_q_rad,
+            handoff_predicted_dq_rad_s,
+            handoff_predicted_ddq_rad_s2,
+            handoff_command_q_rad,
+            source_state_monotonic_s,
+            valid_from_monotonic_s,
+            predecessor_sha256,
+            committed_route_progress_index,
+            reference_T_camera,
+        ):
+            del handoff_predicted_ddq_rad_s2, reference_T_camera
+            generation = self.calls
+            self.calls += 1
+            self.committed_progress.append(committed_route_progress_index)
+            feasible = generation != 1
+            is_terminal = generation == 2
+            end = terminal if is_terminal else np.full(7, 0.02 + 0.005 * generation)
+            return MPCCommandWindow(
+                generation=generation,
+                plan_sha256="a" * 64,
+                source_state_monotonic_s=source_state_monotonic_s,
+                valid_from_monotonic_s=valid_from_monotonic_s,
+                sample_time_s=(0.0, 0.8),
+                command_q_rad=(tuple(handoff_command_q_rad), tuple(end)),
+                predicted_q_rad=(tuple(handoff_predicted_q_rad), tuple(end)),
+                predicted_dq_rad_s=(tuple(handoff_predicted_dq_rad_s), (0.0,) * 7),
+                predicted_ddq_rad_s2=((0.0,) * 7,) * 2,
+                predecessor_sha256=predecessor_sha256,
+                feasible=feasible,
+                terminal=is_terminal,
+                solve_time_s=0.01,
+                diagnostics={"proposed_route_progress_index": committed_route_progress_index + 1},
+            )
+
+    controller = Controller()
+    phase, measured, _velocity = _simulate_phase(
+        controller,
+        command_q_rad=np.zeros(7),
+        model_dq_rad_s=np.zeros(7),
+        config=MPCBenchmarkConfig(maximum_steps=4),
+    )
+
+    assert phase["reached_terminal"]
+    assert phase["accepted_windows"] == 2
+    assert phase["rejected_windows"] == 1
+    assert controller.committed_progress == [0, 1, 1]
+    np.testing.assert_allclose(measured, terminal)
+
+
 def test_curobo_activation_cost_is_inverted_to_signed_clearance() -> None:
     activation = 0.01
     outside_clearance = 0.004
@@ -108,6 +192,62 @@ def test_curobo_activation_cost_is_inverted_to_signed_clearance() -> None:
     )
 
     np.testing.assert_allclose(clearance, [activation, outside_clearance, -penetration])
+
+
+def test_tightened_velocity_residual_requires_all_real_constraints_to_pass() -> None:
+    summary = [
+        {"name": "cspace", "maximum": 0.001},
+        {"name": "self_collision", "maximum": 0.0},
+        {"name": "scene_collision", "maximum": 0.0},
+    ]
+    cspace = {
+        name: {"maximum_violation": 0.0005 if name == "velocity" else 0.0}
+        for name in ("position", "velocity", "acceleration", "jerk")
+    }
+
+    assert _reserved_velocity_constraint_is_safe(
+        summary,
+        cspace,
+        full_state_peak_velocity_rad_s=0.0955,
+        physical_velocity_limit_rad_s=0.1,
+    )
+    assert not _reserved_velocity_constraint_is_safe(
+        summary,
+        cspace,
+        full_state_peak_velocity_rad_s=0.101,
+        physical_velocity_limit_rad_s=0.1,
+    )
+    summary[1]["maximum"] = 1.0e-9
+    assert not _reserved_velocity_constraint_is_safe(
+        summary,
+        cspace,
+        full_state_peak_velocity_rad_s=0.0955,
+        physical_velocity_limit_rad_s=0.1,
+    )
+
+
+def test_route_lookahead_interpolates_without_leaving_the_frozen_path() -> None:
+    route = np.asarray([[0.0] * 7, [0.02] * 7, [0.04] * 7, [0.07] * 7])
+
+    goal, segment_end, terminal = _bounded_route_goal(
+        route,
+        current_q=np.zeros(7),
+        route_progress_index=0,
+        maximum_distance_rad=0.05,
+    )
+    np.testing.assert_allclose(goal, 0.05)
+    assert segment_end == 3
+    assert not terminal
+
+    goal, segment_end, terminal = _bounded_route_goal(
+        route,
+        current_q=np.zeros(7),
+        route_progress_index=0,
+        maximum_distance_rad=0.08,
+    )
+    np.testing.assert_allclose(goal, 0.07)
+    assert segment_end == 3
+    assert terminal
 
 
 def test_strict_mpc_check_rejects_translated_command_outside_hard_limits() -> None:
@@ -211,10 +351,14 @@ def test_planning_session_forwards_hash_bound_camera_state_correction() -> None:
     actual = session.step_mpc_phase(
         {
             "phase": "move_to_pregrasp",
-            "measured_command_q_rad": [0.0] * 7,
-            "measured_dq_rad_s": [0.0] * 7,
-            "active_command_q_rad": [0.0] * 7,
-            "state_monotonic_s": 1.0,
+            "handoff_predicted_q_rad": [0.0] * 7,
+            "handoff_predicted_dq_rad_s": [0.0] * 7,
+            "handoff_predicted_ddq_rad_s2": [0.0] * 7,
+            "handoff_command_q_rad": [0.0] * 7,
+            "source_state_monotonic_s": 1.0,
+            "valid_from_monotonic_s": 1.2,
+            "predecessor_sha256": None,
+            "committed_route_progress_index": 4,
             "camera_state_correction": correction,
         }
     )
@@ -222,6 +366,8 @@ def test_planning_session_forwards_hash_bound_camera_state_correction() -> None:
     assert actual is result
     np.testing.assert_allclose(received["reference_T_camera"], np.eye(4))
     assert received["camera_state_provenance"] == correction
+    assert received["valid_from_monotonic_s"] == pytest.approx(1.2)
+    assert received["committed_route_progress_index"] == 4
 
 
 def test_supported_routes_remain_frozen_instead_of_entering_mpc() -> None:

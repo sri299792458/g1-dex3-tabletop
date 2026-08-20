@@ -44,6 +44,7 @@ from g1_dex3_tabletop.planning.g1_model import (
 from g1_dex3_tabletop.planning.tabletop_planner import (
     WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M,
     _base_scene,
+    _base_T_detected_object,
     _contact_links,
     _cuboid_cover_spheres,
     _fixture_collision_checker,
@@ -55,19 +56,27 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
 )
 from g1_dex3_tabletop.tabletop_contracts import TabletopExecutionPlan, TabletopTaskRequest
 
-MPC_OPTIMIZATION_DT_S = 0.04
+MPC_COMMAND_DT_S = 0.01
+MPC_KNOT_DT_S = 0.04
+MPC_EXECUTOR_DT_S = 0.004
 MPC_INTERPOLATION_STEPS = 4
-MPC_DOCUMENTED_COMMAND_DT_S = MPC_OPTIMIZATION_DT_S / MPC_INTERPOLATION_STEPS
+# The retained RTX 5090 replay contained one 180 ms solve. Six knots provide
+# 240 ms to the immutable splice (at least 232 ms after the executor's two-tick
+# installation guard) while leaving more than half of CuRobo's 0.8 s complete
+# state rollout available as the certified fallback tail.
+MPC_HANDOFF_INTERVAL_S = 6 * MPC_KNOT_DT_S
+MPC_OPTIMIZER_VELOCITY_SCALE = 0.95
+MPC_FLOAT32_CONSTRAINT_EPSILON = 10.0 * np.finfo(np.float32).eps
+# CuRobo's state horizon is constructed to end at a zero-velocity goal.  Keep
+# only a small numerical tolerance so every accepted full horizon is also a
+# bounded continuation to rest if the next solve cannot be installed.
+MPC_STOP_VELOCITY_TOLERANCE_RAD_S = 1.0e-4
+if MPC_KNOT_DT_S != MPC_COMMAND_DT_S * MPC_INTERPOLATION_STEPS:
+    raise RuntimeError("MPC command, knot, and interpolation timing disagree")
 MPC_COLD_START_ITERATIONS = 200
-# The pinned CuRobo optimizer advances in 25-iteration inner blocks. Use the
-# requested higher-effort rolling solve. Exact fixture checking remains outside
-# the iterative optimizer and still validates every returned window; retained
-# full-lifecycle replay kept the 100-iteration window below the 100 ms limit.
+# The pinned CuRobo optimizer advances in 25-iteration inner blocks. Retained
+# replay keeps the 100-iteration warm solve within the 100 ms worker allowance.
 MPC_WARM_START_ITERATIONS = 100
-# Retain the commissioned rolling window that passed the complete eight-phase
-# command-free lifecycle.  The controller replenishes this window before it
-# expires; it is not executed as an open-loop trajectory.
-MPC_EXPOSED_INTERPOLATION_WINDOWS = 3
 MPC_PHASE_ORDER = (
     "move_to_pregrasp",
     "grasp_approach",
@@ -187,17 +196,184 @@ def _numpy(value) -> np.ndarray:
     return np.asarray(value, dtype=np.float64)
 
 
-def _joint_state(device_cfg, q: np.ndarray, dq: np.ndarray, names: tuple[str, ...]):
-    import torch
+def _mpc_constraint_summary(metrics: Any) -> list[dict[str, Any]]:
+    """Return compact named constraint evidence from one CuRobo rollout."""
+
+    result: list[dict[str, Any]] = []
+    collections = metrics.costs_and_constraints
+    for kind, collection in (
+        ("constraint", collections.constraints),
+        ("hybrid", collections.hybrid_costs_constraints),
+    ):
+        for name, tensor in zip(collection.names, collection.values, strict=True):
+            values = _numpy(tensor)
+            result.append(
+                {
+                    "kind": kind,
+                    "name": name,
+                    "maximum": float(np.max(values)),
+                    "positive_sample_count": int(np.count_nonzero(values > 0.0)),
+                }
+            )
+    return result
+
+
+def _mpc_constraints_numerically_feasible(summary: list[dict[str, Any]]) -> bool:
+    """Ignore only float32-scale cspace residue; never soften collision gates."""
+
+    return all(
+        item["maximum"] <= (MPC_FLOAT32_CONSTRAINT_EPSILON if item["name"] == "cspace" else 0.0)
+        for item in summary
+    )
+
+
+def _cspace_bound_diagnostics(
+    cspace_cost,
+    *,
+    names: tuple[str, ...],
+    position: np.ndarray,
+    velocity: np.ndarray,
+    acceleration: np.ndarray,
+    jerk: np.ndarray,
+) -> dict[str, dict[str, Any]]:
+    """Name the exact joint-state derivative behind a CuRobo cspace failure."""
+
+    cfg = cspace_cost.config
+    activation = _numpy(cfg.activation_distance).reshape(-1)
+    paths = {
+        "position": position,
+        "velocity": velocity,
+        "acceleration": acceleration,
+        "jerk": jerk,
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for component_index, (component, values) in enumerate(paths.items()):
+        path = np.asarray(values, dtype=np.float64)
+        if path.ndim != 2 or path.shape[1] != len(names):
+            raise ValueError(f"CuRobo {component} path has an unexpected shape")
+        limits = _numpy(getattr(cfg.joint_limits, component)).reshape(2, len(names))
+        span = limits[1] - limits[0]
+        lower = limits[0] + activation[component_index] * span
+        upper = limits[1] - activation[component_index] * span
+        violation = np.maximum(np.maximum(lower[None, :] - path, path - upper[None, :]), 0.0)
+        flat_index = int(np.argmax(violation))
+        sample_index, joint_index = np.unravel_index(flat_index, violation.shape)
+        result[component] = {
+            "maximum_violation": float(violation[sample_index, joint_index]),
+            "sample": int(sample_index),
+            "joint": names[joint_index],
+            "value": float(path[sample_index, joint_index]),
+            "active_lower_bound": float(lower[joint_index]),
+            "active_upper_bound": float(upper[joint_index]),
+        }
+    return result
+
+
+def _reserved_velocity_constraint_is_safe(
+    summary: list[dict[str, Any]],
+    cspace: dict[str, dict[str, Any]],
+    *,
+    full_state_peak_velocity_rad_s: float,
+    physical_velocity_limit_rad_s: float,
+) -> bool:
+    """Accept only a tightened velocity-bound residual below the real limit."""
+
+    if any(item["maximum"] > 0.0 for item in summary if item["name"] != "cspace"):
+        return False
+    if cspace["velocity"]["maximum_violation"] <= 0.0:
+        return False
+    if any(
+        cspace[component]["maximum_violation"] > 0.0
+        for component in ("position", "acceleration", "jerk")
+    ):
+        return False
+    return full_state_peak_velocity_rad_s <= physical_velocity_limit_rad_s + 1.0e-6
+
+
+def _bounded_route_goal(
+    route_q: np.ndarray,
+    *,
+    current_q: np.ndarray,
+    route_progress_index: int,
+    maximum_distance_rad: float,
+) -> tuple[np.ndarray, int, bool]:
+    """Interpolate a bounded goal along the existing frozen joint path."""
+
+    route = np.asarray(route_q, dtype=np.float64)
+    current = np.asarray(current_q, dtype=np.float64).reshape(-1)
+    if route.ndim != 2 or route.shape[1:] != current.shape:
+        raise ValueError("MPC route and current state dimensions differ")
+    if route_progress_index < 0 or route_progress_index >= len(route):
+        raise ValueError("MPC route progress is outside the route")
+    if not np.isfinite(maximum_distance_rad) or maximum_distance_rad <= 0.0:
+        raise ValueError("MPC route lookahead must be positive and finite")
+    goal = current.copy()
+    remaining = float(maximum_distance_rad)
+    segment_end_index = route_progress_index
+    for index in range(route_progress_index + 1, len(route)):
+        segment_end = route[index]
+        segment_distance = float(np.max(np.abs(segment_end - goal)))
+        segment_end_index = index
+        if segment_distance > remaining:
+            goal = goal + (remaining / segment_distance) * (segment_end - goal)
+            return goal, segment_end_index, False
+        goal = segment_end.copy()
+        remaining -= segment_distance
+    return goal, len(route) - 1, True
+
+
+def _resample_to_executor_grid(
+    sample_time_s: np.ndarray,
+    *paths: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    """Resample every path onto the maximum 250 Hz validation spacing."""
+
+    times = np.asarray(sample_time_s, dtype=np.float64).reshape(-1)
+    if (
+        len(times) < 2
+        or times[0] != 0.0
+        or not np.all(np.isfinite(times))
+        or not np.all(np.diff(times) > 0.0)
+    ):
+        raise ValueError("coarse MPC times must start at zero and increase")
+    duration = float(times[-1])
+    dense_times = np.arange(0.0, duration + 0.5 * MPC_EXECUTOR_DT_S, MPC_EXECUTOR_DT_S)
+    if dense_times[-1] < duration - 1.0e-12:
+        dense_times = np.append(dense_times, duration)
+    else:
+        dense_times[-1] = duration
+    result: list[np.ndarray] = [dense_times]
+    for path in paths:
+        values = np.asarray(path, dtype=np.float64)
+        if values.shape != (len(times), 7) or not np.all(np.isfinite(values)):
+            raise ValueError("MPC resampling requires finite N x 7 paths")
+        result.append(
+            np.stack(
+                [np.interp(dense_times, times, values[:, index]) for index in range(7)],
+                axis=1,
+            )
+        )
+    return tuple(result)
+
+
+def _joint_state(
+    device_cfg,
+    q: np.ndarray,
+    dq: np.ndarray,
+    ddq: np.ndarray,
+    names: tuple[str, ...],
+):
     from curobo.types import JointState
 
-    state = JointState.from_position(
-        device_cfg.to_device(np.asarray(q, dtype=np.float64)).unsqueeze(0),
+    return JointState.from_numpy(
         joint_names=list(names),
+        position=np.asarray(q, dtype=np.float64)[None, :],
+        velocity=np.asarray(dq, dtype=np.float64)[None, :],
+        acceleration=np.asarray(ddq, dtype=np.float64)[None, :],
+        # The configured cubic B-spline cannot independently constrain jerk.
+        jerk=np.zeros_like(np.asarray(q, dtype=np.float64))[None, :],
+        device_cfg=device_cfg,
     )
-    state.velocity = device_cfg.to_device(np.asarray(dq, dtype=np.float64)).unsqueeze(0)
-    state.acceleration = torch.zeros_like(state.position)
-    return state
 
 
 def _matrix_from_pose_list(value: Any) -> np.ndarray:
@@ -422,7 +598,7 @@ def _world_collision_buffer_deltas(
 class MPCBenchmarkConfig:
     maximum_steps: int = 300
     waypoint_tolerance_rad: float = 0.005
-    replan_lead_s: float = 0.1
+    handoff_interval_s: float = MPC_HANDOFF_INTERVAL_S
     simulated_tracking_offset_rad: tuple[float, ...] | None = None
 
     def __post_init__(self) -> None:
@@ -430,14 +606,21 @@ class MPCBenchmarkConfig:
             raise ValueError("MPC benchmark step count must be positive")
         if not np.isfinite(self.waypoint_tolerance_rad) or self.waypoint_tolerance_rad <= 0.0:
             raise ValueError("MPC waypoint tolerance must be positive and finite")
-        if not np.isfinite(self.replan_lead_s) or self.replan_lead_s <= 0.0:
-            raise ValueError("MPC replan lead must be positive and finite")
+        if (
+            not np.isfinite(self.handoff_interval_s)
+            or self.handoff_interval_s <= 0.0
+            or not np.isclose(
+                self.handoff_interval_s / MPC_KNOT_DT_S,
+                round(self.handoff_interval_s / MPC_KNOT_DT_S),
+                atol=1.0e-9,
+                rtol=0.0,
+            )
+        ):
+            raise ValueError("MPC handoff interval must be a positive whole knot period")
         if self.simulated_tracking_offset_rad is not None:
             offset = np.asarray(self.simulated_tracking_offset_rad, dtype=np.float64)
             if offset.shape != (7,) or not np.all(np.isfinite(offset)):
-                raise ValueError(
-                    "simulated MPC tracking offset must contain seven finite values"
-                )
+                raise ValueError("simulated MPC tracking offset must contain seven finite values")
 
 
 class TabletopPhaseMPC:
@@ -501,6 +684,7 @@ class TabletopPhaseMPC:
             self.device_cfg,
             np.asarray(initial_route.model_q_rad[0], dtype=np.float64),
             np.zeros(7, dtype=np.float64),
+            np.zeros(7, dtype=np.float64),
             self.names,
         )
         base_T_torso = (
@@ -520,7 +704,12 @@ class TabletopPhaseMPC:
         resolved_robot = _resolved_robot_with_velocity_limit(
             robot,
             device_cfg=self.device_cfg,
-            maximum_velocity_rad_s=clearance_request.maximum_arm_velocity_rad_s,
+            # Leave a small numerical reserve inside the independently
+            # enforced controller limit. CuRobo's float32 interpolation can
+            # otherwise exceed an exactly equal limit by a few 1e-4 rad/s.
+            maximum_velocity_rad_s=(
+                clearance_request.maximum_arm_velocity_rad_s * MPC_OPTIMIZER_VELOCITY_SCALE
+            ),
         )
         initial_kinematics = _ResolvedPhaseKinematics(
             params=resolved_robot.kinematics.kinematics_config.clone(),
@@ -545,6 +734,7 @@ class TabletopPhaseMPC:
         self._fixture_checker = _fixture_collision_checker(
             clearance_request,
             base_T_object,
+            _base_T_detected_object(clearance_request, base_T_torso),
             self._down,
             device_cfg=self.device_cfg,
         )
@@ -585,7 +775,10 @@ class TabletopPhaseMPC:
             collision_cache={"cuboid": 4, "mesh": 1},
             device_cfg=self.device_cfg,
             use_cuda_graph=True,
-            optimization_dt=MPC_OPTIMIZATION_DT_S,
+            # In the pinned CuRobo implementation this is the interpolated
+            # state/command period.  The B-spline knot period is four times
+            # this value; retained output proves sequence.dt follows it.
+            optimization_dt=MPC_COMMAND_DT_S,
             interpolation_steps=MPC_INTERPOLATION_STEPS,
             optimizer_collision_activation_distance=COLLISION_ACTIVATION_DISTANCE_M,
             position_tolerance=0.005,
@@ -621,15 +814,10 @@ class TabletopPhaseMPC:
             object_T_grasp=execution.task.object_T_grasp,
         )
         self._payload_sphere_count = 0
-        execution_manager = self.mpc.trajectory_execution_manager
-        execution_manager.command_end_idx = (
-            execution_manager.command_start_idx
-            + MPC_EXPOSED_INTERPOLATION_WINDOWS * MPC_INTERPOLATION_STEPS
-        )
         effective = _numpy(self.mpc.kinematics.get_joint_limits().velocity[1])
         if not np.allclose(
             effective,
-            clearance_request.maximum_arm_velocity_rad_s,
+            clearance_request.maximum_arm_velocity_rad_s * MPC_OPTIMIZER_VELOCITY_SCALE,
             atol=1.0e-7,
             rtol=0.0,
         ):
@@ -643,14 +831,17 @@ class TabletopPhaseMPC:
         self._state_correction_warmed_geometry: set[tuple[str, bytes]] = set()
         self._last_state_correction_prewarm_s = 0.0
         self._generation = 0
-        self._route_progress_index = 0
+        self._last_window_valid_from_s: float | None = None
+        self._last_window_content_sha256: str | None = None
+        self._committed_action_seed = None
         self._active_goal_pose: np.ndarray | None = None
         self._active_goal_model_q: np.ndarray | None = None
         self._active_goal_is_corrected = False
         self._lookahead_rad = (
             clearance_request.maximum_arm_velocity_rad_s
+            * MPC_OPTIMIZER_VELOCITY_SCALE
             * self.mpc.action_horizon
-            * MPC_OPTIMIZATION_DT_S
+            * MPC_KNOT_DT_S
         )
         self.spec = mpc_phase_spec(phase)
         self.request = clearance_request
@@ -906,10 +1097,12 @@ class TabletopPhaseMPC:
         # Resetting here also prevents the preceding phase's scene transform
         # from leaking across a physical-mode switch.
         self._update_live_world(self._reference_T_camera0)
-        self._route_progress_index = 0
         self._active_goal_pose = None
         self._active_goal_model_q = None
         self._active_goal_is_corrected = False
+        self._last_window_valid_from_s = None
+        self._last_window_content_sha256 = None
+        self._committed_action_seed = None
         prewarm_s = 0.0
         state_correction_prewarm_s = 0.0
         if reset_optimizer and self._setup and geometry_changed:
@@ -919,6 +1112,7 @@ class TabletopPhaseMPC:
                 route_start_state = _joint_state(
                     self.device_cfg,
                     route_start,
+                    np.zeros(7, dtype=np.float64),
                     np.zeros(7, dtype=np.float64),
                     self.names,
                 )
@@ -951,6 +1145,10 @@ class TabletopPhaseMPC:
                     f"{strict['strict_failure']}"
                 )
         torch.cuda.synchronize()
+        if self._setup:
+            self._committed_action_seed = (
+                self.mpc.trajectory_execution_manager.get_action_buffer().clone()
+            )
         return {
             "phase": phase,
             "physical_mode": spec.mode,
@@ -1048,9 +1246,7 @@ class TabletopPhaseMPC:
         limits = _numpy(self._strict_checker.kinematics.get_joint_limits().position)
         if limits.shape != (2, 7):
             raise RuntimeError(f"strict MPC joint limits have unexpected shape {limits.shape}")
-        violations = np.argwhere(
-            (values < limits[0][None, :]) | (values > limits[1][None, :])
-        )
+        violations = np.argwhere((values < limits[0][None, :]) | (values > limits[1][None, :]))
         if len(violations):
             sample_index, joint_index = (int(item) for item in violations[0])
             diagnostics.update(
@@ -1221,12 +1417,8 @@ class TabletopPhaseMPC:
                     "minimum_fixture_clearance_m": fixture_clearance,
                     "minimum_fixture_clearance_link": fixture_link,
                     "minimum_fixture_clearance_sample": fixture_sample,
-                    "fixture_clearance_search_distance_m": (
-                        COLLISION_ACTIVATION_DISTANCE_M
-                    ),
-                    "required_fixture_clearance_m": (
-                        required_fixture_clearance
-                    ),
+                    "fixture_clearance_search_distance_m": (COLLISION_ACTIVATION_DISTANCE_M),
+                    "required_fixture_clearance_m": (required_fixture_clearance),
                 }
             )
             if fixture_clearance < required_fixture_clearance:
@@ -1242,7 +1434,13 @@ class TabletopPhaseMPC:
         return diagnostics
 
     def setup(self, *, model_q_rad: np.ndarray, model_dq_rad_s: np.ndarray) -> float:
-        state = _joint_state(self.device_cfg, model_q_rad, model_dq_rad_s, self.names)
+        state = _joint_state(
+            self.device_cfg,
+            model_q_rad,
+            model_dq_rad_s,
+            np.zeros(7, dtype=np.float64),
+            self.names,
+        )
         started = time.perf_counter()
         self.mpc.setup(state)
         # ``setup`` captures/warmups CUDA and then deliberately resets CuRobo's
@@ -1267,6 +1465,9 @@ class TabletopPhaseMPC:
                 f"{strict['strict_failure']}"
             )
         torch.cuda.synchronize()
+        self._committed_action_seed = (
+            self.mpc.trajectory_execution_manager.get_action_buffer().clone()
+        )
         self._setup = True
         return time.perf_counter() - started
 
@@ -1282,6 +1483,7 @@ class TabletopPhaseMPC:
         state = _joint_state(
             self.device_cfg,
             model_q_rad,
+            np.zeros(7, dtype=np.float64),
             np.zeros(7, dtype=np.float64),
             self.names,
         )
@@ -1304,7 +1506,13 @@ class TabletopPhaseMPC:
         q = np.asarray(model_q_rad, dtype=np.float64).reshape(-1)
         if q.shape != (7,) or not np.all(np.isfinite(q)):
             raise ValueError("MPC goal must contain seven finite model coordinates")
-        goal_state = _joint_state(self.device_cfg, q, np.zeros(7), self.names)
+        goal_state = _joint_state(
+            self.device_cfg,
+            q,
+            np.zeros(7),
+            np.zeros(7),
+            self.names,
+        )
         goal_matrix = _rigid_transform(self.tool_pose(q))
         goal_pose = Pose.from_matrix(self.device_cfg.to_device(goal_matrix[None]))
         goals = GoalToolPose.from_poses(
@@ -1340,9 +1548,7 @@ class TabletopPhaseMPC:
             self._base_T_torso0 @ invert_transform(reference_T_torso)
         )
         for name, reference_T_obstacle in self._reference_T_obstacles.items():
-            corrected_base_T_obstacle = _rigid_transform(
-                base_T_reference @ reference_T_obstacle
-            )
+            corrected_base_T_obstacle = _rigid_transform(base_T_reference @ reference_T_obstacle)
             self.mpc.scene_collision_checker.update_obstacle_pose(
                 name,
                 Pose.from_matrix(self.device_cfg.to_device(corrected_base_T_obstacle[None])),
@@ -1357,20 +1563,14 @@ class TabletopPhaseMPC:
         camera_delta = reference_T_camera @ invert_transform(self._reference_T_camera0)
         self._active_world_correction = {
             "camera_translation_from_anchor_m": float(
-                np.linalg.norm(
-                    reference_T_camera[:3, 3] - self._reference_T_camera0[:3, 3]
-                )
+                np.linalg.norm(reference_T_camera[:3, 3] - self._reference_T_camera0[:3, 3])
             ),
             "camera_rotation_from_anchor_deg": float(
                 np.degrees(Rotation.from_matrix(camera_delta[:3, :3]).magnitude())
             ),
-            "strict_scene_frame_translation_m": float(
-                np.linalg.norm(strict_transform[:3, 3])
-            ),
+            "strict_scene_frame_translation_m": float(np.linalg.norm(strict_transform[:3, 3])),
             "strict_scene_frame_rotation_deg": float(
-                np.degrees(
-                    Rotation.from_matrix(strict_transform[:3, :3].copy()).magnitude()
-                )
+                np.degrees(Rotation.from_matrix(strict_transform[:3, :3].copy()).magnitude())
             ),
         }
         return dict(self._active_world_correction)
@@ -1414,6 +1614,7 @@ class TabletopPhaseMPC:
             self.device_cfg,
             np.asarray(model_q_rad, dtype=np.float64),
             np.zeros(7, dtype=np.float64),
+            np.zeros(7, dtype=np.float64),
             self.names,
         )
         ik_result = self.mpc.ik_solver.solve_pose(
@@ -1428,6 +1629,7 @@ class TabletopPhaseMPC:
         corrected_goal_state = _joint_state(
             self.device_cfg,
             corrected_goal_q,
+            np.zeros(7, dtype=np.float64),
             np.zeros(7, dtype=np.float64),
             self.names,
         )
@@ -1451,23 +1653,31 @@ class TabletopPhaseMPC:
     def next_nominal_window(
         self,
         *,
-        measured_command_q_rad: np.ndarray,
-        measured_dq_rad_s: np.ndarray,
-        active_command_q_rad: np.ndarray,
-        state_monotonic_s: float,
+        handoff_predicted_q_rad: np.ndarray,
+        handoff_predicted_dq_rad_s: np.ndarray,
+        handoff_predicted_ddq_rad_s2: np.ndarray,
+        handoff_command_q_rad: np.ndarray,
+        source_state_monotonic_s: float,
+        valid_from_monotonic_s: float,
+        predecessor_sha256: str | None,
+        committed_route_progress_index: int,
         reference_T_camera: np.ndarray | None = None,
         camera_state_provenance: dict[str, Any] | None = None,
     ) -> MPCCommandWindow:
-        """Advance along the current frozen phase by one checked MPC horizon."""
+        """Plan from one immutable future handoff on the frozen phase route."""
 
         window_started = time.perf_counter()
-        measured_command = np.asarray(measured_command_q_rad, dtype=np.float64).reshape(-1)
-        if measured_command.shape != (7,) or not np.all(np.isfinite(measured_command)):
-            raise ValueError("measured MPC arm position must contain seven finite values")
+        predicted_command = np.asarray(handoff_predicted_q_rad, dtype=np.float64).reshape(-1)
+        if predicted_command.shape != (7,) or not np.all(np.isfinite(predicted_command)):
+            raise ValueError("predicted MPC handoff position must contain seven finite values")
+        if committed_route_progress_index < 0 or committed_route_progress_index >= len(
+            self.path_model_q
+        ):
+            raise ValueError("committed MPC route progress is outside the frozen route")
         model_q = np.asarray(
             [
                 value + self.request.joint_position_offsets_rad.get(name, 0.0)
-                for name, value in zip(self.names, measured_command, strict=True)
+                for name, value in zip(self.names, predicted_command, strict=True)
             ],
             dtype=np.float64,
         )
@@ -1475,22 +1685,21 @@ class TabletopPhaseMPC:
         # state selects the nearest remaining sample, and the MPC goal is one
         # action horizon farther along that same route.  This preserves the
         # commissioned IK branch while still replanning every rolling window.
-        remaining = self.path_model_q[self._route_progress_index :]
-        self._route_progress_index += int(
+        route_progress_index = committed_route_progress_index
+        remaining = self.path_model_q[route_progress_index:]
+        route_progress_index += int(
             np.argmin(np.max(np.abs(remaining - model_q[None, :]), axis=1))
         )
-        waypoint_index = len(self.path_model_q) - 1
-        for index in range(self._route_progress_index + 1, len(self.path_model_q)):
-            if float(np.max(np.abs(self.path_model_q[index] - model_q))) >= self._lookahead_rad:
-                waypoint_index = index
-                break
-        goal_q = self.path_model_q[waypoint_index]
+        goal_q, waypoint_index, requested_terminal = _bounded_route_goal(
+            self.path_model_q,
+            current_q=model_q,
+            route_progress_index=route_progress_index,
+            maximum_distance_rad=self._lookahead_rad,
+        )
         if camera_state_provenance is not None:
             if reference_T_camera is None:
                 raise ValueError("camera-state provenance requires a reference camera pose")
-            recorded_pose = _rigid_transform(
-                camera_state_provenance.get("reference_T_camera")
-            )
+            recorded_pose = _rigid_transform(camera_state_provenance.get("reference_T_camera"))
             if not np.allclose(
                 recorded_pose,
                 _rigid_transform(reference_T_camera),
@@ -1522,12 +1731,14 @@ class TabletopPhaseMPC:
                 }
             )
         goal_update_time_s = time.perf_counter() - goal_update_started
-        requested_terminal = waypoint_index == len(self.path_model_q) - 1
         window = self.solve_window(
             model_q_rad=model_q,
-            model_dq_rad_s=np.asarray(measured_dq_rad_s, dtype=np.float64),
-            active_command_q_rad=np.asarray(active_command_q_rad, dtype=np.float64),
-            state_monotonic_s=state_monotonic_s,
+            model_dq_rad_s=np.asarray(handoff_predicted_dq_rad_s, dtype=np.float64),
+            model_ddq_rad_s2=np.asarray(handoff_predicted_ddq_rad_s2, dtype=np.float64),
+            active_command_q_rad=np.asarray(handoff_command_q_rad, dtype=np.float64),
+            source_state_monotonic_s=source_state_monotonic_s,
+            valid_from_monotonic_s=valid_from_monotonic_s,
+            predecessor_sha256=predecessor_sha256,
             terminal=requested_terminal,
         )
         if requested_terminal:
@@ -1583,7 +1794,9 @@ class TabletopPhaseMPC:
         diagnostics = dict(window.diagnostics)
         diagnostics.update(
             {
-                "route_progress_index": self._route_progress_index,
+                "committed_route_progress_index": committed_route_progress_index,
+                "proposed_route_progress_index": route_progress_index,
+                "route_progress_index": route_progress_index,
                 "route_waypoint_index": waypoint_index,
                 "route_waypoint_model_q_rad": goal_q.tolist(),
             }
@@ -1595,44 +1808,141 @@ class TabletopPhaseMPC:
         values["diagnostics"] = diagnostics
         values["solve_time_s"] = total_window_time_s
         window = MPCCommandWindow.from_dict(values)
+        if window.feasible:
+            self._last_window_valid_from_s = window.valid_from_monotonic_s
+            self._last_window_content_sha256 = window.content_sha256
+            self._committed_action_seed = (
+                self.mpc.trajectory_execution_manager.get_action_buffer().clone()
+            )
+        elif self._committed_action_seed is not None:
+            # CuRobo installs every optimizer result in its execution manager,
+            # including an infeasible one.  Keep the warm start tied to the
+            # last trajectory that the controller actually accepted so a
+            # retry cannot be seeded from a rejected path.
+            self.mpc.update_seed_trajectory(self._committed_action_seed)
         return window
+
+    def _align_warm_start_to_handoff(
+        self,
+        *,
+        valid_from_monotonic_s: float,
+        predecessor_sha256: str | None,
+    ) -> int:
+        """Shift CuRobo's retained knot seed by the committed handoff interval."""
+
+        if predecessor_sha256 is None:
+            if self._last_window_content_sha256 is not None:
+                raise RuntimeError("MPC predecessor chain restarted inside one phase")
+            return 1
+        if predecessor_sha256 != self._last_window_content_sha256:
+            raise RuntimeError("MPC worker predecessor does not match its retained warm seed")
+        assert self._last_window_valid_from_s is not None
+        knot_delta = (
+            float(valid_from_monotonic_s) - self._last_window_valid_from_s
+        ) / MPC_KNOT_DT_S
+        elapsed_knots = round(knot_delta)
+        if elapsed_knots < 1 or not np.isclose(
+            knot_delta,
+            elapsed_knots,
+            atol=1.0e-6,
+            rtol=0.0,
+        ):
+            raise RuntimeError(
+                "successive MPC handoffs are not separated by whole positive knot periods"
+            )
+        # warm_start_solve() always rolls its seed and optimizer history by one
+        # knot. Pre-shift only the additional elapsed knots here.
+        additional_shift = elapsed_knots - 1
+        if additional_shift:
+            seed = self.mpc.trajectory_execution_manager.get_action_buffer().clone()
+            if additional_shift >= seed.shape[-2]:
+                seed[..., :, :] = seed[..., -1:, :]
+            else:
+                seed = seed.roll(-additional_shift, dims=-2)
+                seed[..., -additional_shift:, :] = seed[
+                    ..., -additional_shift - 1 : -additional_shift, :
+                ]
+            self.mpc.update_seed_trajectory(seed)
+        return elapsed_knots
 
     def solve_window(
         self,
         *,
         model_q_rad: np.ndarray,
         model_dq_rad_s: np.ndarray,
+        model_ddq_rad_s2: np.ndarray,
         active_command_q_rad: np.ndarray,
-        state_monotonic_s: float,
+        source_state_monotonic_s: float,
+        valid_from_monotonic_s: float,
+        predecessor_sha256: str | None,
         terminal: bool,
     ) -> MPCCommandWindow:
-        """Optimize one window and reject, rather than expose, infeasible output."""
+        """Optimize and certify the exact dense trajectory exposed to control."""
 
         import torch
 
         if not self._setup:
             raise RuntimeError("MPC must be set up before solving")
-        current = _joint_state(self.device_cfg, model_q_rad, model_dq_rad_s, self.names)
+        current = _joint_state(
+            self.device_cfg,
+            model_q_rad,
+            model_dq_rad_s,
+            model_ddq_rad_s2,
+            self.names,
+        )
+        elapsed_warm_start_knots = self._align_warm_start_to_handoff(
+            valid_from_monotonic_s=valid_from_monotonic_s,
+            predecessor_sha256=predecessor_sha256,
+        )
         started = time.perf_counter()
         result = self.mpc.optimize_action_sequence(current)
         torch.cuda.synchronize()
         optimizer_wall_s = time.perf_counter() - started
         sequence = result.action_sequence
-        if sequence is None:
-            model_commands = np.asarray(model_q_rad, dtype=np.float64)[None, :]
-            returned_state_dt_s = MPC_OPTIMIZATION_DT_S
-        else:
-            model_commands = _numpy(sequence.position).reshape(-1, 7)
-            returned_dt = _numpy(sequence.dt).reshape(-1)
-            if len(returned_dt) == 0 or not np.all(np.isfinite(returned_dt)):
-                raise RuntimeError("CuRobo MPC returned no finite JointState dt")
-            if not np.allclose(returned_dt, returned_dt[0], atol=1.0e-9, rtol=0.0):
-                raise RuntimeError(
-                    f"CuRobo MPC returned nonuniform JointState dt {returned_dt.tolist()}"
-                )
-            returned_state_dt_s = float(returned_dt[0])
-            if returned_state_dt_s <= 0.0:
-                raise RuntimeError("CuRobo MPC returned a non-positive JointState dt")
+        full_robot_sequence = result.robot_state_sequence
+        if sequence is None or full_robot_sequence is None:
+            raise RuntimeError("CuRobo MPC returned no complete predicted state trajectory")
+        full_sequence = full_robot_sequence.joint_state
+        returned_dt = _numpy(full_sequence.dt).reshape(-1)
+        if len(returned_dt) == 0 or not np.all(np.isfinite(returned_dt)):
+            raise RuntimeError("CuRobo MPC returned no finite JointState dt")
+        if not np.allclose(returned_dt, returned_dt[0], atol=1.0e-9, rtol=0.0):
+            raise RuntimeError(
+                f"CuRobo MPC returned nonuniform JointState dt {returned_dt.tolist()}"
+            )
+        returned_state_dt_s = float(returned_dt[0])
+        if not np.isclose(
+            returned_state_dt_s,
+            MPC_COMMAND_DT_S,
+            atol=1.0e-9,
+            rtol=0.0,
+        ):
+            raise RuntimeError(
+                "CuRobo MPC returned command dt "
+                f"{returned_state_dt_s:.12f}s; expected {MPC_COMMAND_DT_S:.12f}s"
+            )
+        full_model_positions = _numpy(full_sequence.position).reshape(-1, 7)
+        full_model_velocities = _numpy(full_sequence.velocity).reshape(-1, 7)
+        full_model_accelerations = _numpy(full_sequence.acceleration).reshape(-1, 7)
+        full_model_jerks = _numpy(full_sequence.jerk).reshape(-1, 7)
+        # Use the complete state rollout, including CuRobo's terminal support
+        # samples.  The B-spline command slice omits both the exact boundary
+        # state and the natural deceleration tail; neither omission is valid
+        # for an asynchronous future handoff.
+        model_commands = full_model_positions
+        derivative_fields = {
+            "velocity": full_sequence.velocity,
+            "acceleration": full_sequence.acceleration,
+            "jerk": full_sequence.jerk,
+        }
+        missing_derivatives = [name for name, value in derivative_fields.items() if value is None]
+        if missing_derivatives:
+            raise RuntimeError(
+                "CuRobo MPC full state trajectory omitted required boundary derivatives: "
+                + ", ".join(missing_derivatives)
+            )
+        model_velocities = full_model_velocities
+        model_accelerations = full_model_accelerations
         command_start = np.asarray(active_command_q_rad, dtype=np.float64).reshape(-1)
         if command_start.shape != (7,) or not np.all(np.isfinite(command_start)):
             raise ValueError("active MPC command must contain seven finite values")
@@ -1651,60 +1961,134 @@ class TabletopPhaseMPC:
                 for row in model_commands
             ]
         )
-        first_command_index = self.mpc.trajectory_execution_manager.command_start_idx
-        times = np.concatenate(
-            (
-                np.asarray([0.0], dtype=np.float64),
-                (
-                    first_command_index
-                    + np.arange(len(measured_plan_sequence), dtype=np.float64)
-                )
-                * returned_state_dt_s,
+        boundary_position_error = float(
+            np.max(np.abs(measured_plan_sequence[0] - measured_command))
+        )
+        if boundary_position_error > 1.0e-6:
+            raise RuntimeError(
+                "CuRobo full predicted trajectory does not begin at its supplied "
+                f"handoff state: error={boundary_position_error:.9f}rad"
             )
+        boundary_derivative_errors = {
+            "velocity_rad_s": float(
+                np.max(np.abs(model_velocities[0] - np.asarray(model_dq_rad_s, dtype=np.float64)))
+            ),
+            "acceleration_rad_s2": float(
+                np.max(
+                    np.abs(model_accelerations[0] - np.asarray(model_ddq_rad_s2, dtype=np.float64))
+                )
+            ),
+        }
+        if (
+            boundary_derivative_errors["velocity_rad_s"] > 1.0e-5
+            or boundary_derivative_errors["acceleration_rad_s2"] > 1.0e-4
+        ):
+            raise RuntimeError(
+                "CuRobo full predicted trajectory does not preserve its supplied "
+                f"handoff derivatives: {boundary_derivative_errors}"
+            )
+        coarse_times = (
+            np.arange(len(measured_plan_sequence), dtype=np.float64) * returned_state_dt_s
         )
         command_sequence, tracking_offset = command_sequence_from_measured_plan(
-            measured_plan_sequence,
+            measured_plan_sequence[1:],
             measured_q_rad=measured_command,
             active_command_q_rad=command_start,
-            future_sample_time_s=times[1:],
+            future_sample_time_s=coarse_times[1:],
         )
-        commands = np.concatenate((command_start[None, :], command_sequence), axis=0)
-        feasible = bool(result.success is not None and bool(result.success.reshape(-1)[0].item()))
-        curobo_feasible = feasible
-        planned_measured_commands = np.concatenate(
-            (measured_command[None, :], measured_plan_sequence), axis=0
+        coarse_commands = np.concatenate((command_start[None, :], command_sequence), axis=0)
+        coarse_predicted = np.concatenate(
+            (measured_command[None, :], measured_plan_sequence[1:]), axis=0
         )
-        uncompensated_commands = np.concatenate(
-            (command_start[None, :], measured_plan_sequence), axis=0
+        coarse_predicted_dq = model_velocities
+        coarse_predicted_ddq = model_accelerations
+        (
+            times,
+            commands,
+            predicted_commands,
+            predicted_dq,
+            predicted_ddq,
+        ) = _resample_to_executor_grid(
+            coarse_times,
+            coarse_commands,
+            coarse_predicted,
+            coarse_predicted_dq,
+            coarse_predicted_ddq,
+        )
+        curobo_feasible = bool(
+            result.success is not None and bool(result.success.reshape(-1)[0].item())
+        )
+        curobo_constraints = _mpc_constraint_summary(
+            self.mpc.trajectory_execution_manager.get_current_metrics()
+        )
+        cspace_bound_diagnostics = _cspace_bound_diagnostics(
+            self.mpc.metrics_rollout.constraint_manager.get_cost("cspace"),
+            names=self.names,
+            position=full_model_positions,
+            velocity=full_model_velocities,
+            acceleration=full_model_accelerations,
+            jerk=full_model_jerks,
+        )
+        full_state_peak_velocity = float(np.max(np.abs(full_model_velocities)))
+        curobo_numerically_feasible = _mpc_constraints_numerically_feasible(curobo_constraints)
+        curobo_reserved_velocity_feasible = _reserved_velocity_constraint_is_safe(
+            curobo_constraints,
+            cspace_bound_diagnostics,
+            full_state_peak_velocity_rad_s=full_state_peak_velocity,
+            physical_velocity_limit_rad_s=self.request.maximum_arm_velocity_rad_s,
+        )
+        feasible = (
+            curobo_feasible or curobo_numerically_feasible or curobo_reserved_velocity_feasible
+        )
+        uncompensated_coarse_commands = np.concatenate(
+            (command_start[None, :], measured_plan_sequence[1:]), axis=0
         )
         planned_measured_peak_velocity = float(
-            np.max(
-                np.abs(np.diff(planned_measured_commands, axis=0))
-                / np.diff(times)[:, None]
-            )
+            np.max(np.abs(np.diff(coarse_predicted, axis=0)) / np.diff(coarse_times)[:, None])
         )
         uncompensated_peak_velocity = float(
             np.max(
-                np.abs(np.diff(uncompensated_commands, axis=0))
-                / np.diff(times)[:, None]
+                np.abs(np.diff(uncompensated_coarse_commands, axis=0))
+                / np.diff(coarse_times)[:, None]
             )
         )
-        peak_velocity = float(
-            np.max(np.abs(np.diff(commands, axis=0)) / np.diff(times)[:, None])
-        )
+        peak_velocity = float(np.max(np.abs(np.diff(commands, axis=0)) / np.diff(times)[:, None]))
+        terminal_predicted_velocity = float(np.max(np.abs(predicted_dq[-1])))
         if peak_velocity > self.request.maximum_arm_velocity_rad_s + 1.0e-6:
+            feasible = False
+        if terminal_predicted_velocity > MPC_STOP_VELOCITY_TOLERANCE_RAD_S:
             feasible = False
         diagnostics = {
             "phase": self.spec.phase,
             "physical_mode": self.spec.mode,
             "curobo_feasible": curobo_feasible,
+            "curobo_numerically_feasible": curobo_numerically_feasible,
+            "curobo_reserved_velocity_feasible": (curobo_reserved_velocity_feasible),
+            "curobo_float32_constraint_epsilon": MPC_FLOAT32_CONSTRAINT_EPSILON,
+            "curobo_constraints": curobo_constraints,
+            "curobo_cspace_bound_diagnostics": cspace_bound_diagnostics,
+            "curobo_full_state_peak_velocity_rad_s": full_state_peak_velocity,
             "optimizer_wall_time_s": optimizer_wall_s,
             "curobo_reported_solve_time_s": float(result.solve_time),
             "peak_velocity_rad_s": peak_velocity,
+            "terminal_predicted_velocity_rad_s": terminal_predicted_velocity,
+            "terminal_velocity_tolerance_rad_s": (MPC_STOP_VELOCITY_TOLERANCE_RAD_S),
             "planned_measured_peak_velocity_rad_s": planned_measured_peak_velocity,
             "uncompensated_peak_velocity_rad_s": uncompensated_peak_velocity,
             "command_tracking_offset_rad": tracking_offset.tolist(),
             "command_tracking_offset_policy": "hold_complete_window_remeasure_each_update",
+            "command_dt_s": MPC_COMMAND_DT_S,
+            "knot_dt_s": MPC_KNOT_DT_S,
+            "executor_validation_dt_s": MPC_EXECUTOR_DT_S,
+            "coarse_sample_count": len(coarse_times),
+            "dense_sample_count": len(times),
+            "curobo_full_state_boundary_error_rad": boundary_position_error,
+            "curobo_full_state_boundary_derivative_errors": (boundary_derivative_errors),
+            "curobo_command_start_index": (
+                self.mpc.trajectory_execution_manager.command_start_idx
+            ),
+            "curobo_state_source": "full_robot_state_sequence_including_support",
+            "warm_start_elapsed_knots": elapsed_warm_start_knots,
             "maximum_command_tracking_offset_rad": float(np.max(np.abs(tracking_offset))),
             "maximum_command_tracking_offset_joint": self.names[
                 int(np.argmax(np.abs(tracking_offset)))
@@ -1745,9 +2129,17 @@ class TabletopPhaseMPC:
             ]
         )
         strict_started = time.perf_counter()
-        predicted_model_route = np.concatenate(
-            (np.asarray(model_q_rad, dtype=np.float64)[None, :], model_commands),
-            axis=0,
+        predicted_model_route = np.stack(
+            [
+                np.asarray(
+                    [
+                        value + self.request.joint_position_offsets_rad.get(name, 0.0)
+                        for name, value in zip(self.names, row, strict=True)
+                    ],
+                    dtype=np.float64,
+                )
+                for row in predicted_commands
+            ]
         )
         predicted_strict_diagnostics = self._strict_window_diagnostics(predicted_model_route)
         command_strict_diagnostics = self._strict_window_diagnostics(strict_model_commands)
@@ -1755,9 +2147,8 @@ class TabletopPhaseMPC:
         diagnostics.update(command_strict_diagnostics)
         diagnostics["predicted_state_strict_validation"] = predicted_strict_diagnostics
         diagnostics["command_target_strict_validation"] = command_strict_diagnostics
-        if (
-            bool(command_strict_diagnostics["strict_valid"])
-            and not bool(predicted_strict_diagnostics["strict_valid"])
+        if bool(command_strict_diagnostics["strict_valid"]) and not bool(
+            predicted_strict_diagnostics["strict_valid"]
         ):
             diagnostics.update(predicted_strict_diagnostics)
         diagnostics["strict_validation_time_s"] = strict_validation_s
@@ -1771,9 +2162,18 @@ class TabletopPhaseMPC:
         window = MPCCommandWindow(
             generation=self._generation,
             plan_sha256=self.execution.content_sha256,
-            state_monotonic_s=state_monotonic_s,
+            source_state_monotonic_s=source_state_monotonic_s,
+            valid_from_monotonic_s=valid_from_monotonic_s,
             sample_time_s=tuple(times),
             command_q_rad=tuple(tuple(float(value) for value in row) for row in commands),
+            predicted_q_rad=tuple(
+                tuple(float(value) for value in row) for row in predicted_commands
+            ),
+            predicted_dq_rad_s=tuple(tuple(float(value) for value in row) for row in predicted_dq),
+            predicted_ddq_rad_s2=tuple(
+                tuple(float(value) for value in row) for row in predicted_ddq
+            ),
+            predecessor_sha256=predecessor_sha256,
             feasible=feasible,
             terminal=bool(terminal and feasible),
             solve_time_s=wall_s,
@@ -1807,6 +2207,7 @@ def benchmark_open_approach_mpc(
     route_q = controller.path_model_q
     q = route_q[0].copy()
     dq = np.zeros(7, dtype=np.float64)
+    ddq = np.zeros(7, dtype=np.float64)
     command_q = command_from_model_q(
         q,
         arm=request.arm,
@@ -1819,13 +2220,21 @@ def benchmark_open_approach_mpc(
     peak_velocities: list[float] = []
     first_rejection: dict[str, Any] | None = None
     simulated_time_s = 0.0
+    predecessor_sha256: str | None = None
+    committed_route_progress_index = 0
+    benchmark_origin_s = time.monotonic()
     try:
         for _step in range(config.maximum_steps):
+            source_time = benchmark_origin_s + simulated_time_s
             window = controller.next_nominal_window(
-                measured_command_q_rad=command_q,
-                measured_dq_rad_s=dq,
-                active_command_q_rad=command_q,
-                state_monotonic_s=time.monotonic(),
+                handoff_predicted_q_rad=command_q,
+                handoff_predicted_dq_rad_s=dq,
+                handoff_predicted_ddq_rad_s2=ddq,
+                handoff_command_q_rad=command_q,
+                source_state_monotonic_s=source_time,
+                valid_from_monotonic_s=(source_time + config.handoff_interval_s),
+                predecessor_sha256=predecessor_sha256,
+                committed_route_progress_index=committed_route_progress_index,
             )
             latencies.append(window.solve_time_s)
             peak_velocities.append(window.peak_velocity_rad_s())
@@ -1835,13 +2244,16 @@ def benchmark_open_approach_mpc(
                     first_rejection = window.to_dict()
                 break
             accepted += 1
-            execution_time_s = (
-                window.duration_s
-                if window.terminal
-                else max(window.duration_s - config.replan_lead_s, 0.0)
+            predecessor_sha256 = window.content_sha256
+            committed_route_progress_index = int(
+                window.diagnostics["proposed_route_progress_index"]
             )
+            execution_time_s = window.duration_s if window.terminal else config.handoff_interval_s
             window_times = np.asarray(window.sample_time_s, dtype=np.float64)
             window_commands = np.asarray(window.command_q_rad, dtype=np.float64)
+            window_predicted = np.asarray(window.predicted_q_rad, dtype=np.float64)
+            window_predicted_dq = np.asarray(window.predicted_dq_rad_s, dtype=np.float64)
+            window_predicted_ddq = np.asarray(window.predicted_ddq_rad_s2, dtype=np.float64)
             command_q = np.asarray(
                 [
                     np.interp(execution_time_s, window_times, window_commands[:, index])
@@ -1849,18 +2261,41 @@ def benchmark_open_approach_mpc(
                 ],
                 dtype=np.float64,
             )
-            q = np.asarray(
+            predicted_q = np.asarray(
                 [
-                    value + request.joint_position_offsets_rad.get(name, 0.0)
-                    for name, value in zip(controller.names, command_q, strict=True)
+                    np.interp(execution_time_s, window_times, window_predicted[:, index])
+                    for index in range(7)
                 ],
                 dtype=np.float64,
             )
-            upper = int(np.searchsorted(window_times, execution_time_s, side="right"))
-            upper = min(max(upper, 1), len(window_times) - 1)
-            lower = upper - 1
-            dq = (window_commands[upper] - window_commands[lower]) / (
-                window_times[upper] - window_times[lower]
+            q = np.asarray(
+                [
+                    value + request.joint_position_offsets_rad.get(name, 0.0)
+                    for name, value in zip(controller.names, predicted_q, strict=True)
+                ],
+                dtype=np.float64,
+            )
+            dq = np.asarray(
+                [
+                    np.interp(
+                        execution_time_s,
+                        window_times,
+                        window_predicted_dq[:, index],
+                    )
+                    for index in range(7)
+                ],
+                dtype=np.float64,
+            )
+            ddq = np.asarray(
+                [
+                    np.interp(
+                        execution_time_s,
+                        window_times,
+                        window_predicted_ddq[:, index],
+                    )
+                    for index in range(7)
+                ],
+                dtype=np.float64,
             )
             simulated_time_s += execution_time_s
             if window.terminal:
@@ -1896,15 +2331,16 @@ def benchmark_open_approach_mpc(
             float(np.max(peak_velocities)) if peak_velocities else None
         ),
         "configuration": {
-            "optimization_dt_s": MPC_OPTIMIZATION_DT_S,
+            "command_dt_s": MPC_COMMAND_DT_S,
+            "knot_dt_s": MPC_KNOT_DT_S,
             "interpolation_steps": MPC_INTERPOLATION_STEPS,
-            "exposed_interpolation_windows": MPC_EXPOSED_INTERPOLATION_WINDOWS,
-            "documented_command_dt_s": MPC_DOCUMENTED_COMMAND_DT_S,
+            "certified_horizon_source": "complete_curobo_robot_state_sequence",
+            "executor_validation_dt_s": MPC_EXECUTOR_DT_S,
             "cold_start_iterations": MPC_COLD_START_ITERATIONS,
             "warm_start_iterations": MPC_WARM_START_ITERATIONS,
             "maximum_steps": config.maximum_steps,
             "waypoint_tolerance_rad": config.waypoint_tolerance_rad,
-            "replan_lead_s": config.replan_lead_s,
+            "handoff_interval_s": config.handoff_interval_s,
             "maximum_arm_velocity_rad_s": request.maximum_arm_velocity_rad_s,
             "route_tracking": "monotonic_frozen_route_lookahead",
             "route_lookahead_rad": controller._lookahead_rad,
@@ -1927,6 +2363,7 @@ def _simulate_phase(
 
     measured_q = np.asarray(command_q_rad, dtype=np.float64).copy()
     dq = np.asarray(model_dq_rad_s, dtype=np.float64).copy()
+    ddq = np.zeros(7, dtype=np.float64)
     tracking_offset = (
         np.zeros(7, dtype=np.float64)
         if config.simulated_tracking_offset_rad is None
@@ -1945,48 +2382,112 @@ def _simulate_phase(
     windows: list[dict[str, Any]] = []
     simulated_time_s = 0.0
     terminal_received = False
+    stopped_at_certified_horizon = False
+    install_rejection: str | None = None
+    predecessor_sha256: str | None = None
+    committed_route_progress_index = 0
+    benchmark_origin_s = time.monotonic()
+    now_s = benchmark_origin_s
+    active_window: MPCCommandWindow | None = None
+
+    def sample_active(at_s: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        assert active_window is not None
+        return (
+            active_window.sample_command(monotonic_s=at_s),
+            active_window.sample_predicted_q(monotonic_s=at_s),
+            active_window.sample_predicted_dq(monotonic_s=at_s),
+            active_window.sample_predicted_ddq(monotonic_s=at_s),
+        )
+
     for _step in range(config.maximum_steps):
+        if active_window is None:
+            valid_from_s = now_s + config.handoff_interval_s
+            boundary_command = measured_q + tracking_offset
+            boundary_q = measured_q
+            boundary_dq = dq
+            boundary_ddq = ddq
+        else:
+            relative_s = max(
+                now_s + config.handoff_interval_s - active_window.valid_from_monotonic_s,
+                0.0,
+            )
+            handoff_knots = int(np.ceil((relative_s - 1.0e-12) / MPC_KNOT_DT_S))
+            valid_from_s = active_window.valid_from_monotonic_s + handoff_knots * MPC_KNOT_DT_S
+            if valid_from_s > active_window.expiration_monotonic_s + 1.0e-12:
+                stop_s = active_window.expiration_monotonic_s
+                command_q, measured_q, dq, ddq = sample_active(stop_s)
+                simulated_time_s += max(stop_s - now_s, 0.0)
+                now_s = stop_s
+                stopped_at_certified_horizon = True
+                break
+            boundary_command, boundary_q, boundary_dq, boundary_ddq = sample_active(valid_from_s)
         window = controller.next_nominal_window(
-            measured_command_q_rad=measured_q,
-            measured_dq_rad_s=dq,
-            active_command_q_rad=measured_q + tracking_offset,
-            state_monotonic_s=time.monotonic(),
+            handoff_predicted_q_rad=boundary_q,
+            handoff_predicted_dq_rad_s=boundary_dq,
+            handoff_predicted_ddq_rad_s2=boundary_ddq,
+            handoff_command_q_rad=boundary_command,
+            source_state_monotonic_s=now_s,
+            valid_from_monotonic_s=valid_from_s,
+            predecessor_sha256=predecessor_sha256,
+            committed_route_progress_index=committed_route_progress_index,
             reference_T_camera=reference_T_camera,
         )
         windows.append(window.to_dict())
         if not window.feasible:
             rejected += 1
+            if active_window is None:
+                break
+            solve_end_s = min(
+                now_s + window.solve_time_s,
+                active_window.expiration_monotonic_s,
+            )
+            command_q, measured_q, dq, ddq = sample_active(solve_end_s)
+            simulated_time_s += max(solve_end_s - now_s, 0.0)
+            now_s = solve_end_s
+            if now_s >= active_window.expiration_monotonic_s - 1.0e-12:
+                stopped_at_certified_horizon = True
+                break
+            continue
+        if now_s + window.solve_time_s >= valid_from_s:
+            rejected += 1
+            install_rejection = "future handoff deadline missed"
+            if active_window is not None:
+                stop_s = active_window.expiration_monotonic_s
+                command_q, measured_q, dq, ddq = sample_active(stop_s)
+                simulated_time_s += max(stop_s - now_s, 0.0)
+                now_s = stop_s
+                stopped_at_certified_horizon = True
             break
         accepted += 1
-        execution_time_s = (
-            window.duration_s
-            if window.terminal
-            else max(window.duration_s - config.replan_lead_s, 0.0)
+        if active_window is not None:
+            simulated_time_s += max(valid_from_s - now_s, 0.0)
+        now_s = valid_from_s
+        active_window = window
+        command_q, measured_q, dq, ddq = sample_active(now_s)
+        predecessor_sha256 = active_window.content_sha256
+        committed_route_progress_index = int(
+            active_window.diagnostics["proposed_route_progress_index"]
         )
-        window_times = np.asarray(window.sample_time_s, dtype=np.float64)
-        window_commands = np.asarray(window.command_q_rad, dtype=np.float64)
-        active_command_q = np.asarray(
-            [
-                np.interp(execution_time_s, window_times, window_commands[:, index])
-                for index in range(7)
-            ],
-            dtype=np.float64,
-        )
-        # The benchmark plant may preserve a fixed gravity/load tracking
-        # offset. This exposes controllers that pass one first-window join but
-        # erase the same holding effort on every subsequent replan.
-        measured_q = active_command_q - tracking_offset
-        upper = int(np.searchsorted(window_times, execution_time_s, side="right"))
-        upper = min(max(upper, 1), len(window_times) - 1)
-        lower = upper - 1
-        dq = (window_commands[upper] - window_commands[lower]) / (
-            window_times[upper] - window_times[lower]
-        )
-        simulated_time_s += execution_time_s
-        if window.terminal:
-            dq = np.zeros(7, dtype=np.float64)
+        if not np.allclose(
+            command_q - measured_q,
+            tracking_offset,
+            atol=1.0e-7,
+            rtol=0.0,
+        ):
+            raise RuntimeError("simulated MPC command/model offset changed inside a window")
+        if active_window.terminal:
+            stop_s = active_window.expiration_monotonic_s
+            command_q, measured_q, dq, ddq = sample_active(stop_s)
+            simulated_time_s += stop_s - now_s
+            now_s = stop_s
             terminal_received = True
             break
+    else:
+        if active_window is not None:
+            stop_s = active_window.expiration_monotonic_s
+            command_q, measured_q, dq, ddq = sample_active(stop_s)
+            simulated_time_s += max(stop_s - now_s, 0.0)
+            stopped_at_certified_horizon = True
     terminal_model = np.asarray(
         [
             value + controller.request.joint_position_offsets_rad.get(name, 0.0)
@@ -2013,7 +2514,9 @@ def _simulate_phase(
         terminal_translation_error_m = None
         terminal_rotation_error_rad = None
     solve_times = np.asarray([item["solve_time_s"] for item in windows], dtype=np.float64)
-    slowest_window = max(windows, key=lambda item: float(item["solve_time_s"])) if windows else None
+    slowest_window = (
+        max(windows, key=lambda item: float(item["solve_time_s"])) if windows else None
+    )
     fixture_windows = [
         item
         for item in windows
@@ -2044,6 +2547,7 @@ def _simulate_phase(
             "maximum": float(values[maximum_index]),
             "maximum_generation": samples[maximum_index][0],
         }
+
     return (
         {
             "phase": controller.spec.phase,
@@ -2051,6 +2555,8 @@ def _simulate_phase(
             "reached_terminal": reached,
             "accepted_windows": accepted,
             "rejected_windows": rejected,
+            "stopped_at_certified_horizon": stopped_at_certified_horizon,
+            "install_rejection": install_rejection,
             "first_rejection": next(
                 (item for item in windows if not bool(item["feasible"])),
                 None,
@@ -2088,15 +2594,9 @@ def _simulate_phase(
                 else {
                     "generation": slowest_window["generation"],
                     "total_s": slowest_window["solve_time_s"],
-                    "goal_update_s": slowest_window["diagnostics"].get(
-                        "goal_update_time_s"
-                    ),
-                    "mpc_core_s": slowest_window["diagnostics"].get(
-                        "mpc_core_window_time_s"
-                    ),
-                    "optimizer_s": slowest_window["diagnostics"].get(
-                        "optimizer_wall_time_s"
-                    ),
+                    "goal_update_s": slowest_window["diagnostics"].get("goal_update_time_s"),
+                    "mpc_core_s": slowest_window["diagnostics"].get("mpc_core_window_time_s"),
+                    "optimizer_s": slowest_window["diagnostics"].get("optimizer_wall_time_s"),
                     "strict_validation_s": slowest_window["diagnostics"].get(
                         "strict_validation_time_s"
                     ),
@@ -2274,14 +2774,15 @@ def benchmark_tabletop_lifecycle_mpc(
         "total_rejected_windows": sum(item["rejected_windows"] for item in phase_results),
         "benchmark_wall_time_s": time.perf_counter() - started,
         "configuration": {
-            "optimization_dt_s": MPC_OPTIMIZATION_DT_S,
+            "command_dt_s": MPC_COMMAND_DT_S,
+            "knot_dt_s": MPC_KNOT_DT_S,
             "interpolation_steps": MPC_INTERPOLATION_STEPS,
-            "exposed_interpolation_windows": MPC_EXPOSED_INTERPOLATION_WINDOWS,
+            "certified_horizon_source": "complete_curobo_robot_state_sequence",
             "cold_start_iterations": MPC_COLD_START_ITERATIONS,
             "warm_start_iterations": MPC_WARM_START_ITERATIONS,
             "maximum_steps_per_phase": config.maximum_steps,
             "waypoint_tolerance_rad": config.waypoint_tolerance_rad,
-            "replan_lead_s": config.replan_lead_s,
+            "handoff_interval_s": config.handoff_interval_s,
             "simulated_tracking_offset_rad": (
                 None
                 if config.simulated_tracking_offset_rad is None

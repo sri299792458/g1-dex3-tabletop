@@ -333,22 +333,37 @@ def mpc_window(
     end_q: np.ndarray,
     terminal: bool,
     feasible: bool = True,
+    valid_from_s: float | None = None,
+    predecessor_sha256: str | None = None,
+    predicted_dq_rad_s: np.ndarray | None = None,
 ) -> MPCCommandWindow:
     midpoint = (start_q + end_q) / 2.0
+    source_s = clock.monotonic()
+    valid_from_s = source_s + 0.04 if valid_from_s is None else valid_from_s
+    velocity = (
+        (end_q - start_q) / 0.2
+        if predicted_dq_rad_s is None
+        else np.asarray(predicted_dq_rad_s, dtype=np.float64)
+    )
     return MPCCommandWindow(
         generation=generation,
         plan_sha256=REPORT_HASH,
-        state_monotonic_s=clock.monotonic(),
+        source_state_monotonic_s=source_s,
+        valid_from_monotonic_s=valid_from_s,
         sample_time_s=(0.0, 0.1, 0.2),
         command_q_rad=(tuple(start_q), tuple(midpoint), tuple(end_q)),
+        predicted_q_rad=(tuple(start_q), tuple(midpoint), tuple(end_q)),
+        predicted_dq_rad_s=(tuple(velocity), tuple(velocity), tuple(velocity)),
+        predicted_ddq_rad_s2=((0.0,) * 7,) * 3,
+        predecessor_sha256=predecessor_sha256,
         feasible=feasible,
         terminal=terminal,
         solve_time_s=0.01,
-        diagnostics={"source": "executor-test"},
+        diagnostics={"source": "executor-test", "proposed_route_progress_index": generation},
     )
 
 
-def test_executor_streams_rebased_mpc_windows_then_settles_terminal_window() -> None:
+def test_executor_streams_exact_future_handoff_then_settles_terminal_window() -> None:
     clock, transport, executor = subject()
     executor.acquire(operator_confirmed=True)
     advance_until(transport, executor, ExecutorState.READY)
@@ -367,23 +382,30 @@ def test_executor_streams_rebased_mpc_windows_then_settles_terminal_window() -> 
         plan_sha256=REPORT_HASH,
         operator_confirmed=True,
     )
-    for _ in range(5):
+    for _ in range(6):
         transport.step(0.02)
         executor.tick()
     active = executor.calibration_command_q
-    assert np.allclose(active, 0.005)
+    assert np.allclose(active, 0.004)
 
-    # The worker solved from the older zero command. Installation rebases its
-    # t=0 sample atomically to the command that is now active.
+    boundary = executor.prepare_streaming_handoff(
+        minimum_lead_s=0.04,
+        handoff_quantum_s=0.02,
+    )
     terminal = mpc_window(
         clock,
         generation=1,
-        start_q=np.zeros(7),
+        start_q=np.asarray(boundary.command_q_rad),
         end_q=np.full(7, 0.02),
         terminal=True,
+        valid_from_s=boundary.valid_from_monotonic_s,
+        predecessor_sha256=boundary.predecessor_sha256,
+        predicted_dq_rad_s=np.asarray(boundary.predicted_dq_rad_s),
     )
     accepted = executor.update_streaming_trajectory(window=terminal)
-    np.testing.assert_allclose(accepted.command_q_rad[0], active)
+    assert accepted is terminal
+    np.testing.assert_allclose(accepted.command_q_rad[0], boundary.command_q_rad)
+    assert accepted.predecessor_sha256 == first.content_sha256
     advance_until(transport, executor, ExecutorState.READY)
 
     assert executor.current_pose_id == "pose_001"
@@ -408,14 +430,43 @@ def test_executor_faults_when_nonterminal_mpc_window_is_not_replenished() -> Non
         operator_confirmed=True,
     )
 
-    for _ in range(24):
+    for _ in range(26):
         transport.step(0.02)
         executor.tick()
         if executor.state is ExecutorState.FAULT:
             break
 
     assert executor.state is ExecutorState.FAULT
-    assert "MPC command window expired" in (executor.fault_reason or "")
+    assert "MPC command trajectory expired" in (executor.fault_reason or "")
+
+
+def test_executor_can_finish_a_nonterminal_certified_window_and_settle() -> None:
+    clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    executor.start_streaming_trajectory(
+        from_pose_id=HANDOFF_POSE_ID,
+        to_pose_id="pose_001",
+        window=mpc_window(
+            clock,
+            generation=0,
+            start_q=np.zeros(7),
+            end_q=np.full(7, 0.01),
+            terminal=False,
+        ),
+        plan_sha256=REPORT_HASH,
+        operator_confirmed=True,
+    )
+    for _ in range(4):
+        transport.step(0.02)
+        executor.tick()
+
+    executor.finish_streaming_trajectory()
+    assert executor.streaming_trajectory_status()["stop_requested"]
+    advance_until(transport, executor, ExecutorState.READY)
+
+    assert executor.current_pose_id is None
+    np.testing.assert_allclose(executor.calibration_command_q, 0.01)
 
 
 def test_executor_rejects_infeasible_mpc_window_before_motion() -> None:

@@ -25,6 +25,7 @@ from g1_aprilcube_calibration.pose_schema import HANDOFF_POSE_ID, PoseSet
 from g1_aprilcube_calibration.transports.base import ArmCommand, ArmTransport
 from g1_dex3_tabletop.mpc_command_buffer import (
     MPCCommandWindow,
+    MPCHandoffBoundary,
     RollingMPCCommandBuffer,
 )
 
@@ -182,9 +183,48 @@ class PoseExecutor:
         return {
             "generation": self._mpc_command_buffer.last_generation,
             "terminal": self._mpc_command_buffer.terminal,
+            "terminal_pending": self._mpc_command_buffer.terminal_pending,
+            "stop_requested": self._mpc_command_buffer.stop_requested,
+            "active": self._mpc_command_buffer.active,
+            "queued": self._mpc_command_buffer.has_queued,
             "remaining_s": self._mpc_command_buffer.remaining_s(now_s=now),
             "duration_s": self._mpc_command_buffer.duration_s,
         }
+
+    def prepare_streaming_handoff(
+        self,
+        *,
+        minimum_lead_s: float,
+        handoff_quantum_s: float,
+    ) -> MPCHandoffBoundary:
+        """Freeze one future MPC splice before the worker starts solving."""
+
+        lead = float(minimum_lead_s)
+        quantum = float(handoff_quantum_s)
+        if not np.isfinite(lead) or lead <= 0.0:
+            raise ValueError("MPC handoff lead must be positive and finite")
+        if not np.isfinite(quantum) or quantum <= 0.0:
+            raise ValueError("MPC handoff quantum must be positive and finite")
+        now = self.clock.monotonic()
+        if self._mpc_command_buffer is not None:
+            return self._mpc_command_buffer.handoff_boundary(
+                now_s=now,
+                minimum_lead_s=lead,
+                handoff_quantum_s=quantum,
+            )
+        if self.state not in {ExecutorState.HOLDING, ExecutorState.READY}:
+            raise RuntimeError("initial MPC handoff requires a stationary held state")
+        sample = self.observe_state()
+        valid_from = np.ceil((now + lead) / quantum) * quantum
+        return MPCHandoffBoundary(
+            valid_from_monotonic_s=float(valid_from),
+            command_q_rad=tuple(self.calibration_command_q),
+            predicted_q_rad=tuple(sample.arm_q(self.pose_set.calibration_arm)),
+            predicted_dq_rad_s=tuple(sample.arm_dq(self.pose_set.calibration_arm)),
+            predicted_ddq_rad_s2=(0.0,) * 7,
+            predecessor_sha256=None,
+            committed_route_progress_index=0,
+        )
 
     def acquire(
         self,
@@ -455,17 +495,18 @@ class PoseExecutor:
         buffer = RollingMPCCommandBuffer(
             plan_sha256=plan_sha256,
             maximum_velocity_rad_s=self.config.maximum_joint_velocity_rad_s,
-            maximum_state_age_s=self.config.state_freshness_timeout_s,
             maximum_window_gap_s=self.config.control_gap_fault_s,
+            maximum_handoff_position_error_rad=self.config.motion_position_tolerance_rad,
+            maximum_handoff_velocity_error_rad_s=self.config.maximum_joint_velocity_rad_s,
+            activation_lateness_s=2.0 * self.config.nominal_tick_period_s,
         )
-        accepted = window.rebase_start(self.calibration_command_q)
-        buffer.accept(
-            accepted,
+        buffer.install(
+            window,
             now_s=now,
             active_command_q_rad=self.calibration_command_q,
         )
         self._mpc_command_buffer = buffer
-        self._calibration_goal_q = np.asarray(accepted.command_q_rad[-1], dtype=np.float64)
+        self._calibration_goal_q = np.asarray(window.predicted_q_rad[-1], dtype=np.float64)
         self._goal_q14 = self._compose_command(self._calibration_goal_q)
         self._pending_pose_id = to_pose_id
         self._phase_started_s = now
@@ -484,27 +525,33 @@ class PoseExecutor:
             f"approved streaming MPC trajectory {from_pose_id}->{to_pose_id}",
             now,
         )
-        return accepted
+        return window
 
     def update_streaming_trajectory(
         self,
         *,
         window: MPCCommandWindow,
     ) -> MPCCommandWindow:
-        """Atomically install the next MPC window at the current command."""
+        """Queue the next worker-certified window without modifying it."""
 
         if self.state is not ExecutorState.MOVING or self._mpc_command_buffer is None:
             raise RuntimeError("no streaming MPC trajectory is active")
         now = self.clock.monotonic()
-        accepted = window.rebase_start(self.calibration_command_q)
-        self._mpc_command_buffer.accept(
-            accepted,
+        self._mpc_command_buffer.install(
+            window,
             now_s=now,
             active_command_q_rad=self.calibration_command_q,
         )
-        self._calibration_goal_q = np.asarray(accepted.command_q_rad[-1], dtype=np.float64)
+        self._calibration_goal_q = np.asarray(window.predicted_q_rad[-1], dtype=np.float64)
         self._goal_q14 = self._compose_command(self._calibration_goal_q)
-        return accepted
+        return window
+
+    def finish_streaming_trajectory(self) -> None:
+        """Finish the active certified horizon without installing another one."""
+
+        if self.state is not ExecutorState.MOVING or self._mpc_command_buffer is None:
+            raise RuntimeError("no streaming MPC trajectory is active")
+        self._mpc_command_buffer.finish_active_horizon()
 
     def install_validated_plan(
         self,
@@ -854,7 +901,11 @@ class PoseExecutor:
         assert self._goal_q14 is not None
         if self._mpc_command_buffer is not None:
             try:
-                calibration_command = self._mpc_command_buffer.command(now_s=now)
+                calibration_command = self._mpc_command_buffer.command(
+                    now_s=now,
+                    measured_q_rad=sample.arm_q(self.pose_set.calibration_arm),
+                    measured_dq_rad_s=sample.arm_dq(self.pose_set.calibration_arm),
+                )
             except (TypeError, ValueError, RuntimeError) as error:
                 self._enter_fault(str(error), now)
                 return self.state
@@ -921,7 +972,10 @@ class PoseExecutor:
                     "gate and target error is diagnostic only",
                     now,
                 )
-        elif self._last_command_remaining_rad > _COMMAND_COMPLETION_EPSILON_RAD:
+        elif (
+            self._mpc_command_buffer is None
+            and self._last_command_remaining_rad > _COMMAND_COMPLETION_EPSILON_RAD
+        ):
             self._reset_settle_window()
             self._transition(
                 ExecutorState.MOVING,
@@ -947,8 +1001,12 @@ class PoseExecutor:
                 self._settle_max_q = measured_q.copy()
                 self._last_settle_elapsed_s = 0.0
             elif now - self._settle_started_s >= self.config.settle_dwell_s:
-                if (
+                endpoint_required = (
                     self.config.require_motion_endpoint_tolerance
+                    or self._mpc_command_buffer is not None
+                )
+                if (
+                    endpoint_required
                     and position_error > self.config.motion_position_tolerance_rad
                 ):
                     self._enter_fault(
@@ -961,7 +1019,11 @@ class PoseExecutor:
                         now,
                     )
                 else:
-                    self.current_pose_id = self._pending_pose_id
+                    streaming_stopped = (
+                        self._mpc_command_buffer is not None
+                        and self._mpc_command_buffer.stop_requested
+                    )
+                    self.current_pose_id = None if streaming_stopped else self._pending_pose_id
                     self._pending_pose_id = None
                     self._trajectory_time_s = None
                     self._trajectory_command_q = None
@@ -969,7 +1031,7 @@ class PoseExecutor:
                     self._active_motion_timeout_s = self.config.motion_timeout_s
                     endpoint_evidence = (
                         f"endpoint error {position_error:.4f}rad passed"
-                        if self.config.require_motion_endpoint_tolerance
+                        if endpoint_required
                         else (
                             f"endpoint error {position_error:.4f}rad recorded; "
                             "endpoint tolerance disabled"
@@ -977,7 +1039,13 @@ class PoseExecutor:
                     )
                     self._transition(
                         ExecutorState.READY,
-                        "continuous measured position-spread settle passed; " + endpoint_evidence,
+                        (
+                            "active certified MPC horizon finished after a planning "
+                            "failure; pose identity cleared; "
+                            if streaming_stopped
+                            else "continuous measured position-spread settle passed; "
+                        )
+                        + endpoint_evidence,
                         now,
                     )
         if self.state in {ExecutorState.MOVING, ExecutorState.SETTLING}:

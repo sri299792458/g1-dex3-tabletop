@@ -79,6 +79,10 @@ from g1_dex3_tabletop.planning.dex3_handedness import (
     dex3_empty_close_reference,
     dex3_execution_profile,
 )
+from g1_dex3_tabletop.planning.tabletop_mpc import (
+    MPC_HANDOFF_INTERVAL_S,
+    MPC_KNOT_DT_S,
+)
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
 from g1_dex3_tabletop.state_estimation import (
     AnchoredCameraPoseEstimators,
@@ -580,11 +584,13 @@ def _execute_mpc_phase(
         flush=True,
     )
 
+    handoff_lead_s = MPC_HANDOFF_INTERVAL_S
+
     def request_window() -> MPCCommandWindow:
         camera_state = None
         if camera_state_provider is not None:
             synchronized_input, estimate = camera_state_provider()
-        state, active_command = synchronized.observe_control_input()
+        state = synchronized.observe_state()
         state_source_monotonic_s = float(state.receipt_monotonic_s)
         if camera_state_provider is not None:
             camera_state = _mpc_camera_state_record(
@@ -594,18 +600,40 @@ def _execute_mpc_phase(
                 maximum_time_difference_s=(control_config.state_freshness_timeout_s),
             )
             state_source_monotonic_s = camera_state["source_monotonic_s"]
+        # Freeze the splice only after acquiring the observations needed for
+        # this solve. The complete handoff lead is then available to the CUDA
+        # worker, rather than being consumed by camera/state collection.
+        boundary = synchronized.prepare_streaming_handoff(
+            minimum_lead_s=handoff_lead_s,
+            handoff_quantum_s=MPC_KNOT_DT_S,
+        )
+        # The returned trajectory is valid only at this frozen future splice.
+        # Stop waiting before that instant, leaving two controller ticks for
+        # IPC and installation.  The active certified horizon continues in
+        # the executor throughout this wait.
+        request_timeout_s = (
+            boundary.valid_from_monotonic_s
+            - time.monotonic()
+            - 2.0 * control_config.nominal_tick_period_s
+        )
+        if request_timeout_s <= 0.0:
+            raise RuntimeError("CuRobo MPC handoff deadline passed before the solve was submitted")
         event = planner.request_payload(
             "step-mpc-phase",
             payload={
                 "phase": phase,
-                "measured_command_q_rad": state.arm_q(arm).tolist(),
-                "measured_dq_rad_s": state.arm_dq(arm).tolist(),
-                "active_command_q_rad": active_command.tolist(),
-                "state_monotonic_s": state_source_monotonic_s,
+                "handoff_predicted_q_rad": list(boundary.predicted_q_rad),
+                "handoff_predicted_dq_rad_s": list(boundary.predicted_dq_rad_s),
+                "handoff_predicted_ddq_rad_s2": list(boundary.predicted_ddq_rad_s2),
+                "handoff_command_q_rad": list(boundary.command_q_rad),
+                "source_state_monotonic_s": state_source_monotonic_s,
+                "valid_from_monotonic_s": boundary.valid_from_monotonic_s,
+                "predecessor_sha256": boundary.predecessor_sha256,
+                "committed_route_progress_index": (boundary.committed_route_progress_index),
                 "camera_state_correction": camera_state,
             },
             control_check=driver.check,
-            timeout_s=max(1.0, control_config.state_freshness_timeout_s * 10.0),
+            timeout_s=request_timeout_s,
         )
         window = MPCCommandWindow.from_dict(event["payload"])
         if camera_state is not None:
@@ -619,6 +647,13 @@ def _execute_mpc_phase(
 
     windows: list[dict] = []
     first = request_window()
+    if not first.feasible:
+        if phase_record is not None:
+            phase_record.setdefault("rejected_windows", []).append(first.to_dict())
+        raise RuntimeError(
+            f"CuRobo MPC produced no feasible initial window for {phase}; "
+            "no streaming motion was started"
+        )
     try:
         accepted = synchronized.start_streaming_trajectory(
             from_pose_id=trajectory.from_pose_id,
@@ -634,22 +669,53 @@ def _execute_mpc_phase(
     windows.append(accepted.to_dict())
     if phase_record is not None:
         phase_record["windows"].append(accepted.to_dict())
-    replan_lead_s = control_config.state_freshness_timeout_s
+
+    def finish_active_after_failure(error: BaseException) -> None:
+        """Finish the untouched active horizon before surfacing a planner fault."""
+
+        synchronized.finish_streaming_trajectory()
+        _wait_ready(
+            synchronized,
+            driver,
+            timeout_s=control_config.motion_timeout_s,
+            label=f"{phase} certified MPC fallback settle",
+        )
+        raise RuntimeError(
+            f"CuRobo MPC stopped {phase} at the endpoint of its last certified "
+            f"horizon after planning failed: {error}"
+        ) from error
+
     while synchronized.state is ExecutorState.MOVING:
         driver.check()
         status = synchronized.streaming_trajectory_status()
         if bool(status["terminal"]):
             break
-        if float(status["remaining_s"]) > replan_lead_s:
+        if (
+            not bool(status["active"])
+            or bool(status["queued"])
+            or bool(status["terminal_pending"])
+        ):
             time.sleep(0.01)
             continue
-        window = request_window()
+        try:
+            window = request_window()
+        except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+            finish_active_after_failure(error)
+        if not window.feasible:
+            if phase_record is not None:
+                phase_record.setdefault("rejected_windows", []).append(window.to_dict())
+            print(
+                "CuRobo MPC rejected one replacement window; continuing the "
+                "unchanged active certified horizon and retrying",
+                flush=True,
+            )
+            continue
         try:
             accepted = synchronized.update_streaming_trajectory(window=window)
-        except BaseException:
+        except (TypeError, ValueError, RuntimeError) as error:
             if phase_record is not None:
-                phase_record["rejected_window"] = window.to_dict()
-            raise
+                phase_record.setdefault("rejected_windows", []).append(window.to_dict())
+            finish_active_after_failure(error)
         windows.append(accepted.to_dict())
         if phase_record is not None:
             phase_record["windows"].append(accepted.to_dict())
@@ -1381,6 +1447,7 @@ def run_tabletop(args) -> int:
                         "completed": False,
                         "preparation": None,
                         "windows": [],
+                        "rejected_windows": [],
                         "camera_state_corrections": [],
                     }
                     mpc_phases[name] = phase_record

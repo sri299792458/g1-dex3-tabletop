@@ -4430,3 +4430,75 @@ Primary references:
   retention evidence, PC2 watchdog/handback, raw MCAP recording, and frozen
   rejection routes. No new robot command was sent while implementing or
   testing this coordinator.
+
+## 2026-08-20 — MPC diagnosis, branch isolation, and immutable handoffs
+
+- The planner-lifecycle performance work is isolated from correctness work on
+  branch `perf/persistent-curobo-planner-pool`, commit `ee8c54f`. The original
+  `feature/curobo-tabletop` branch remains at `d0d3701`. The timing and handoff
+  repair is being developed separately on
+  `fix/immutable-curobo-mpc-handoffs`.
+- The supplied external diagnosis was substantially correct: the old wrapper
+  overloaded CuRobo timing semantics, rewrote sample zero after strict
+  validation, restarted a relative clock when an asynchronous result arrived,
+  advanced route state before the window was executed, and treated a predicted
+  terminal result too directly. A proposed six-class rewrite was not required;
+  the existing worker, command buffer, and executor boundaries can enforce the
+  invariant directly.
+- One diagnosis detail was incorrect for the pinned B-spline backend. With a
+  10 ms returned state period and four interpolation samples per knot, the
+  sliced `action_sequence` begins at the internal sample-four offset, 40 ms
+  after the boundary, not 10 ms. The repaired adapter uses the complete
+  `robot_state_sequence` instead. Its first sample exactly preserves supplied
+  position, velocity, and acceleration at the future handoff.
+- `MPCCommandWindow` now carries separate source and absolute activation times,
+  predicted q/dq/ddq, the exact desired command path, predecessor hash, and
+  proposed route progress. No `rebase_start()` operation remains. The worker
+  resamples and strictly checks both predicted and desired paths at no more than
+  4 ms spacing before hashing the window. The executor schedules it unchanged.
+- Rolling handoffs are frozen before the GPU solve. A replacement must match
+  the active trajectory's command and predicted q/dq/ddq at that exact future
+  time, arrive before that time, name the active window hash, and pass live q/dq
+  activation gates. Route progress becomes committed only after activation.
+- CuRobo can install an infeasible optimizer result into its internal execution
+  manager. The wrapper now retains the last controller-accepted action seed and
+  restores it after an infeasible solve. The controller keeps executing the
+  unchanged prior trajectory and retries; it never installs or executes the
+  rejected result.
+- A direct command-free GPU probe found that the complete CuRobo rollout has 81
+  states over 0.8 s. The previously selected 0.64 s prefix still ended at
+  0.03705 rad/s. CuRobo's existing terminal support reduced velocity to zero by
+  sample 76 and held it through sample 80. The complete rollout is now the
+  certified fallback tail. No hand-authored braking spline and no CuRobo fork
+  were introduced.
+- If no new trajectory can be installed, the executor finishes that unchanged
+  full rollout, holds and verifies measured endpoint settling, clears the
+  uncompleted phase identity, and only then surfaces the planner failure. A
+  nominal terminal window still records its phase endpoint. These two outcomes
+  have separate tests.
+- The retained RTX 5090 replay contained one 180 ms solve, so the former 120 ms
+  future handoff was not robust. The handoff is now six 40 ms knots (240 ms),
+  leaving at least 232 ms after the two-tick installation guard and more than
+  half of the 0.8 s certified rollout after activation. In a later 334-window
+  replay the worst complete window was 217.61 ms and no install deadline was
+  missed.
+- The offline benchmark was changed to use the same future-boundary,
+  predecessor, retry, and fallback semantics as hardware. It no longer rebases
+  a solve from the current state or stops at the first infeasible optimizer
+  result.
+- The honest replay exposed a separate unresolved problem. The wrapper chooses
+  a monotonic local endpoint from the frozen route, but CuRobo MPC receives only
+  that point goal—not the intervening frozen route segment as a reference. The
+  current retained lifecycle completed `move_to_pregrasp` in 36 accepted
+  windows, then remained around grasp-approach route index 26 despite continuing
+  to return constraint-feasible windows. The older tripod regression similarly
+  remained around move-to-pregrasp route index 33. A direct grasp-phase replay
+  from its exact frozen start reproduced the same index-26 stall. Raising the
+  solve count is not a fix.
+- Therefore the correctness branch is offline-only and must not be presented as
+  hardware-ready. Exact timing and failure containment are improved, but the
+  point-goal MPC wrapper still lacks a reliable way to follow collision-critical
+  bends in a frozen route. That question should be answered at the CuRobo goal/
+  reference interface, not with a collision exception, a larger iteration cap,
+  or another task-specific state machine.
+- No robot command was sent during this diagnosis or any replay above.

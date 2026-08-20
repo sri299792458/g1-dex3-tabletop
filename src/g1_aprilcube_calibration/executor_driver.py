@@ -61,6 +61,9 @@ class SynchronizedPoseExecutor:
     def streaming_trajectory_status(self):
         return self._call("streaming_trajectory_status")
 
+    def prepare_streaming_handoff(self, **kwargs):
+        return self._call("prepare_streaming_handoff", **kwargs)
+
     def observe(self):
         """Expose the transport-style observation API under the same lock."""
 
@@ -90,6 +93,9 @@ class SynchronizedPoseExecutor:
 
     def update_streaming_trajectory(self, **kwargs):
         return self._call("update_streaming_trajectory", **kwargs)
+
+    def finish_streaming_trajectory(self) -> None:
+        self._call("finish_streaming_trajectory")
 
     def install_validated_plan(self, **kwargs) -> None:
         self._call("install_validated_plan", **kwargs)

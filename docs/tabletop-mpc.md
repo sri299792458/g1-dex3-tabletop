@@ -5,14 +5,47 @@ tabletop workflow can execute every remaining normal arm motion with CuRobo MPC
 instead of replaying each frozen trajectory verbatim. The boundary-corrected
 frozen lifecycle supplies the selected grasp, a complete collision-checked
 route, exact phase boundaries, and reverse recovery trajectories. MPC uses that
-route as its local reference and replans short arm-command windows from fresh
-measured joint states. The outbound supported escape and its final exact reverse
+route as its local goal source and replans short arm-command trajectories from
+future states predicted by the trajectory already executing. The outbound
+supported escape and its final exact reverse
 remain frozen trajectories because both touch the physically supported handoff.
 
 The isolated CUDA worker never publishes robot commands. Each returned window
-is hash-bound to the frozen execution plan and then installed atomically in the
-existing 250 Hz controller. That controller alone interpolates and publishes
-the complete low-level command.
+is hash-bound to the frozen execution plan, resampled and strictly checked on
+the 250 Hz grid, and scheduled at an absolute future monotonic time. The
+controller publishes that exact immutable command path; it never changes sample
+zero or restarts the trajectory clock when a result arrives.
+
+## Absolute-time handoff contract
+
+The pinned CuRobo B-spline configuration has three distinct periods:
+
+- 4 ms Unitree executor period;
+- 10 ms returned CuRobo state period; and
+- 40 ms B-spline knot period.
+
+`optimization_dt` is the 10 ms returned-state period in this CuRobo revision;
+it is not the 40 ms knot period. CuRobo's sliced `action_sequence` begins after
+its four-sample B-spline support offset. The worker instead consumes the
+complete `robot_state_sequence`: its first sample is the exact supplied
+handoff boundary and its terminal support samples form CuRobo's own
+constraint-evaluated deceleration/hold tail.
+
+Every rolling request freezes a handoff 240 ms in the future. The active
+trajectory supplies command position and predicted position, velocity, and
+acceleration at that exact time. The worker builds and validates the complete
+replacement before the handoff. A returned trajectory is accepted only if its
+predecessor hash and boundary values still match. At activation, fresh measured
+position and velocity must also match the predicted boundary within the
+commissioned controller gates.
+
+The old receipt-time `rebase_start()` behavior is gone. If a solve is
+infeasible, the executor continues the unchanged active trajectory and retries
+from a later boundary; route progress is committed only when a replacement
+actually activates. If a solve is late or no further boundary fits, the
+executor finishes the active CuRobo tail, holds and settles at its endpoint,
+clears the uncompleted phase identity, and then reports the failure. Phase
+completion still requires measured endpoint tolerance and stationary dwell.
 
 ## Physical phase model
 
@@ -183,8 +216,7 @@ The controller retains one simple separation of responsibilities:
 
 - the boundary planner supplies a collision-validated joint route and its IK
   branch;
-- MPC follows a monotonic one-horizon lookahead on that route from each fresh
-  measured arm state;
+- MPC receives a monotonic one-horizon endpoint chosen from that route;
 - the command boundary receives the simultaneously active arm command and
   preserves that desired-to-measured tracking offset for the complete returned
   window, then remeasures it on the next rolling update; and
@@ -234,6 +266,39 @@ path crossed the same strict pair by `0.045 mm`. This distinction is important:
 desired-state continuity fixes the observed no-progress loop, but does not turn
 a near-zero-clearance frozen route into a robust physical route. The strict
 collision boundary remains unchanged and fails closed.
+
+## 2026-08-20 immutable-handoff replay status
+
+The external MPC diagnosis was correct about the overloaded timing constant,
+post-validation sample-zero rewrite, receipt-time clock reset, uncommitted route
+progress, and predicted-only terminal completion. One detail was wrong for the
+pinned B-spline backend: the already-sliced action sequence begins 40 ms after
+the boundary, not 10 ms. The implementation avoids that ambiguity by using the
+complete returned robot-state sequence with the supplied boundary at time zero.
+
+A direct GPU probe returned 81 states over 0.8 s. Truncating at the former
+0.64 s boundary would have left 0.03705 rad/s of predicted motion. CuRobo's own
+remaining support samples reduced that to zero by sample 76 and held zero
+through sample 80. Every accepted window now retains and strictly validates
+that complete tail; no locally invented braking polynomial or CuRobo source
+patch is used.
+
+Retained replay also measured one 180 ms window, proving the former 120 ms
+handoff deadline was too short. A 240 ms, six-knot handoff left at least 232 ms
+after the executor's installation guard. Across the subsequent 334-window
+replay, the largest worker time was 217.61 ms and no result missed its handoff.
+
+The same replay then exposed a separate structural limitation: this wrapper
+does not supply the frozen route segment as a tracking reference. It supplies
+only a local point goal. The current retained lifecycle completed
+`move_to_pregrasp` in 36 accepted windows, then remained around grasp-approach
+route index 26 while returning constraint-feasible windows. Replaying the older
+tripod lifecycle from its exact phase start similarly remained around
+move-to-pregrasp route index 33. Increasing the solve count did not solve either
+case. This branch is therefore **not cleared for another robot MPC run**. The
+immutable timing/execution repair is validated, but route-following semantics
+must be resolved without hiding the failure behind a larger iteration limit or
+another collision exception.
 
 The camera-state input is deliberately a generic `reference_T_camera`
 transform; the MPC controller does not know which visual target produced it.

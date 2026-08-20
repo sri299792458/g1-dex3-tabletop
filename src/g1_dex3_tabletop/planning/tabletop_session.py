@@ -423,7 +423,7 @@ class TabletopPlanningSession:
         }
 
     def step_mpc_phase(self, payload: dict) -> MPCCommandWindow:
-        """Optimize one window from a fresh measured state and active command."""
+        """Optimize one window from an immutable future handoff boundary."""
 
         if self._active_phase_mpc is None:
             raise RuntimeError("tabletop phase MPC has not been prepared")
@@ -437,10 +437,20 @@ class TabletopPlanningSession:
         if camera_state is not None and not isinstance(camera_state, dict):
             raise TypeError("MPC camera-state correction must be a dictionary")
         return self._active_phase_mpc.next_nominal_window(
-            measured_command_q_rad=np.asarray(payload["measured_command_q_rad"], dtype=np.float64),
-            measured_dq_rad_s=np.asarray(payload["measured_dq_rad_s"], dtype=np.float64),
-            active_command_q_rad=np.asarray(payload["active_command_q_rad"], dtype=np.float64),
-            state_monotonic_s=float(payload["state_monotonic_s"]),
+            handoff_predicted_q_rad=np.asarray(
+                payload["handoff_predicted_q_rad"], dtype=np.float64
+            ),
+            handoff_predicted_dq_rad_s=np.asarray(
+                payload["handoff_predicted_dq_rad_s"], dtype=np.float64
+            ),
+            handoff_predicted_ddq_rad_s2=np.asarray(
+                payload["handoff_predicted_ddq_rad_s2"], dtype=np.float64
+            ),
+            handoff_command_q_rad=np.asarray(payload["handoff_command_q_rad"], dtype=np.float64),
+            source_state_monotonic_s=float(payload["source_state_monotonic_s"]),
+            valid_from_monotonic_s=float(payload["valid_from_monotonic_s"]),
+            predecessor_sha256=payload.get("predecessor_sha256"),
+            committed_route_progress_index=int(payload["committed_route_progress_index"]),
             reference_T_camera=(
                 None
                 if camera_state is None
