@@ -66,7 +66,7 @@ from g1_dex3_tabletop.tabletop_perception import (
 )
 from g1_dex3_tabletop.tabletop_workflow import (
     build_tabletop_request,
-    destination_request_for_pick_place,
+    destination_requests_for_pick_place,
     request_at_clearance,
     request_at_clearance_observation,
 )
@@ -868,10 +868,10 @@ def test_pick_place_destination_reexpresses_world_and_marks_only_support() -> No
     source_T_destination = np.eye(4)
     source_T_destination[0, 3] = 0.2
     source_T_destination[2, 3] = 0.05
-    destination = destination_request_for_pick_place(
+    (destination,) = destination_requests_for_pick_place(
         TabletopPickPlaceRequest(
             source_request=source,
-            source_T_destination_object=source_T_destination,
+            source_T_destination_objects=(source_T_destination,),
             destination_support_object_id="cube60",
         )
     )
@@ -1562,6 +1562,37 @@ def test_pregrasp_enumeration_gives_each_candidate_independent_seeds(monkeypatch
     np.testing.assert_allclose(branches[3].model_q_rad, [0.4] * 7)
 
 
+def test_pregrasp_enumeration_preserves_curobo_goalset_choice(monkeypatch) -> None:
+    class Result:
+        success = np.asarray([[True, True]])
+        solution = np.asarray([[[0.1] * 7, [0.2] * 7]], dtype=np.float64)
+        position_error = np.asarray([[0.001, 0.001]])
+        rotation_error = np.asarray([[0.01, 0.01]])
+        goalset_index = np.asarray([[[2], [1]]])
+
+    class Solver:
+        @staticmethod
+        def solve_pose(_goals, *, return_seeds, current_state):
+            assert return_seeds > 0
+            assert current_state == "batched-start"
+            return Result()
+
+    state = SimpleNamespace(position=np.zeros((1, 7)))
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.planning.tabletop_planner._repeat_joint_state",
+        lambda current, count: "batched-start" if current is state and count == 1 else None,
+    )
+    branches, _result = _enumerate_pregrasp_branches(
+        Solver(),
+        "goals",
+        state,
+        candidate_count=1,
+        goalset_count=4,
+    )
+
+    assert [branch.goalset_index for branch in branches] == [2, 1]
+
+
 def test_complete_branch_search_does_not_discard_candidate_after_first_failure() -> None:
     branches = [
         _PregraspBranch(0, 2, np.asarray([0.1] * 7), 0.001, 0.01),
@@ -1592,6 +1623,7 @@ def test_complete_branch_search_does_not_discard_candidate_after_first_failure()
             "pool_branch_index": 1,
             "candidate_branch_index": 1,
             "candidate_branch_count": 2,
+            "goalset_index": 0,
             "solver_seed_index": 2,
             "stage": "attached_payload_lift",
             "reason": "first branch cannot lift",

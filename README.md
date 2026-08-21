@@ -472,7 +472,11 @@ globally nearest cube/arm pair. The controller then plans and executes only that
 arm's supported escape and opens only that Dex3 hand. The unused arm and hand
 remain at their exact supported initial commands. At clearance, the planner
 first checks all source/destination grasp endpoints, then performs expensive
-route planning only for a grasp that is viable at both endpoints.
+route planning only for a grasp that is viable at both endpoints. Common
+candidates are tried in ascending order of their best source-plus-destination
+IK joint distance from the measured clearance state. This reuses the existing
+IK solutions; it does not add route solves, a wrist-specific weight, or a new
+acceptance threshold.
 
 CuRobo launches as soon as `run-stack` starts. After the read-only two-cube
 observation, the persistent CUDA worker warms only the selected arm's open-hand
@@ -494,12 +498,14 @@ table cuboid because the unused arm is deliberately supported on that table.
 The already-established local table-plane check independently validates every
 sample of the moving wrist/hand and attached cube.
 
-The planner may test four upright quarter-turn wrist targets because redundant
-arm IK and hand clearance depend on wrist orientation. This is only a nominal
+The direct-stack request supplies the four upright quarter-turn wrist targets
+to CuRobo as one goal set because redundant arm IK and hand clearance depend on
+wrist orientation. CuRobo returns the selected goal-set index; the coordinator
+does not run four yaw-specific planning pipelines. This remains only a nominal
 path choice. The software does not assume that the physical cube retains an
 exact yaw inside Dex3. Placement targets the moving cube's nominal center over
-the observed support-cube center; unavoidable in-hand rotation therefore does
-not create a false exact-yaw success claim.
+the observed support-cube center, so unavoidable in-hand rotation does not
+create a false exact-yaw success claim.
 
 Destination planning carries the original on-table cube observation as explicit
 evidence for the unchanged real table plane. It does not infer a new plane under

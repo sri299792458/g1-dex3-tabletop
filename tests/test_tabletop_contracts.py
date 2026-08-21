@@ -204,7 +204,7 @@ def test_pick_place_request_binds_relative_destination_and_support(tmp_path: Pat
     destination[0][3] = 0.1
     pick_place = TabletopPickPlaceRequest(
         source_request=source,
-        source_T_destination_object=destination,
+        source_T_destination_objects=(destination,),
         destination_support_object_id="cube60",
         excluded_candidate_ids=("failed_grasp",),
     )
@@ -257,6 +257,7 @@ def test_pick_place_plan_has_one_fixed_continuous_sequence() -> None:
         request_sha256="b" * 64,
         arm="right",
         selected_candidate_id="candidate",
+        selected_destination_index=0,
         source_task=task,
         destination_task=task,
         trajectories=tuple(pick_place_trajectories),
@@ -272,6 +273,7 @@ def test_pick_place_plan_has_one_fixed_continuous_sequence() -> None:
             request_sha256="b" * 64,
             arm="right",
             selected_candidate_id="candidate",
+            selected_destination_index=0,
             source_task=task,
             destination_task=task,
             trajectories=tuple(discontinuous),

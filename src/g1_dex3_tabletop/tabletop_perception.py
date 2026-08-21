@@ -176,35 +176,31 @@ def observe_resting_cube_pair(
     maximum_rotation_spread_deg: float = 2.0,
     minimum_tag_short_side_px: float = 25.0,
     maximum_reprojection_error_px: float = 3.0,
+    first_label: str = "first cube",
+    second_label: str = "second cube",
 ) -> tuple[TabletopObservation, TabletopObservation]:
     """Observe both uniquely tagged cubes from the same accepted image frames."""
 
-    common = set(
-        observe_resting_cube(
-            images_bgr,
-            camera_info=camera_info,
-            detector=first_detector,
-            snapshot=snapshot,
-            minimum_frames=minimum_frames,
-            maximum_translation_spread_mm=maximum_translation_spread_mm,
-            maximum_rotation_spread_deg=maximum_rotation_spread_deg,
-            minimum_tag_short_side_px=minimum_tag_short_side_px,
-            maximum_reprojection_error_px=maximum_reprojection_error_px,
-        ).source_frame_sha256
-    )
-    common.intersection_update(
-        observe_resting_cube(
-            images_bgr,
-            camera_info=camera_info,
-            detector=second_detector,
-            snapshot=snapshot,
-            minimum_frames=minimum_frames,
-            maximum_translation_spread_mm=maximum_translation_spread_mm,
-            maximum_rotation_spread_deg=maximum_rotation_spread_deg,
-            minimum_tag_short_side_px=minimum_tag_short_side_px,
-            maximum_reprojection_error_px=maximum_reprojection_error_px,
-        ).source_frame_sha256
-    )
+    arguments = {
+        "camera_info": camera_info,
+        "snapshot": snapshot,
+        "minimum_frames": minimum_frames,
+        "maximum_translation_spread_mm": maximum_translation_spread_mm,
+        "maximum_rotation_spread_deg": maximum_rotation_spread_deg,
+        "minimum_tag_short_side_px": minimum_tag_short_side_px,
+        "maximum_reprojection_error_px": maximum_reprojection_error_px,
+    }
+
+    def observe_labeled(images, detector, label: str) -> TabletopObservation:
+        try:
+            return observe_resting_cube(images, detector=detector, **arguments)
+        except ValueError as error:
+            raise ValueError(f"{label}: {error}") from error
+
+    first = observe_labeled(images_bgr, first_detector, first_label)
+    second = observe_labeled(images_bgr, second_detector, second_label)
+    common = set(first.source_frame_sha256)
+    common.intersection_update(second.source_frame_sha256)
     paired_images = tuple(
         image
         for image in images_bgr
@@ -215,24 +211,7 @@ def observe_resting_cube_pair(
             "the two cubes were not jointly detected in enough frames: "
             f"{len(paired_images)}/{len(images_bgr)} common, need {minimum_frames}"
         )
-    arguments = {
-        "camera_info": camera_info,
-        "snapshot": snapshot,
-        "minimum_frames": minimum_frames,
-        "maximum_translation_spread_mm": maximum_translation_spread_mm,
-        "maximum_rotation_spread_deg": maximum_rotation_spread_deg,
-        "minimum_tag_short_side_px": minimum_tag_short_side_px,
-        "maximum_reprojection_error_px": maximum_reprojection_error_px,
-    }
     return (
-        observe_resting_cube(
-            paired_images,
-            detector=first_detector,
-            **arguments,
-        ),
-        observe_resting_cube(
-            paired_images,
-            detector=second_detector,
-            **arguments,
-        ),
+        observe_labeled(paired_images, first_detector, first_label),
+        observe_labeled(paired_images, second_detector, second_label),
     )

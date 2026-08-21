@@ -62,7 +62,10 @@ from g1_dex3_tabletop.tabletop_contracts import (
     TabletopTaskRequest,
 )
 from g1_dex3_tabletop.tabletop_geometry import canonical_resting_cube_pose
-from g1_dex3_tabletop.tabletop_workflow import destination_request_for_pick_place
+from g1_dex3_tabletop.tabletop_workflow import (
+    destination_requests_for_pick_place,
+    select_pick_place_destination,
+)
 
 ROOT = Path(__file__).resolve().parents[3]
 WORLD_COLLISION_DISABLE_RADIUS_EPSILON_M = 1.0e-6
@@ -82,6 +85,7 @@ class _PregraspBranch:
     model_q_rad: np.ndarray
     position_error_m: float
     rotation_error_rad: float
+    goalset_index: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +93,7 @@ class _EndpointFeasibility:
     """Strict batched endpoint results without any route planning."""
 
     candidate_branch_counts: dict[str, int]
+    candidate_best_joint_distance_rad: dict[str, float]
     fixed_close_viable_candidate_count: int
     rejections: tuple[dict[str, Any], ...]
     elapsed_s: float
@@ -112,6 +117,33 @@ class _PickPlaceEndpointAnalysis:
     def common_candidate_ids(self) -> tuple[str, ...]:
         common = self.source.viable_candidate_ids & self.destination.viable_candidate_ids
         return tuple(value for value in self.candidate_ids if value in common)
+
+    @property
+    def common_candidate_joint_distance_rad(self) -> dict[str, dict[str, float]]:
+        """Best route-free source/destination IK distance for each common grasp."""
+
+        result: dict[str, dict[str, float]] = {}
+        for candidate_id in self.common_candidate_ids:
+            source = self.source.candidate_best_joint_distance_rad[candidate_id]
+            destination = self.destination.candidate_best_joint_distance_rad[candidate_id]
+            result[candidate_id] = {
+                "source": source,
+                "destination": destination,
+                "total": source + destination,
+            }
+        return result
+
+    @property
+    def ranked_common_candidate_ids(self) -> tuple[str, ...]:
+        """Common grasps ordered by existing IK joint-distance cost."""
+
+        costs = self.common_candidate_joint_distance_rad
+        return tuple(
+            sorted(
+                self.common_candidate_ids,
+                key=lambda candidate_id: costs[candidate_id]["total"],
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1814,6 +1846,7 @@ def _batched_pregrasp_ik_solver(
     scene: dict[str, Any],
     *,
     candidate_count: int,
+    goalset_count: int = 1,
     seed: int,
     device_cfg,
 ):
@@ -1823,6 +1856,8 @@ def _batched_pregrasp_ik_solver(
 
     if candidate_count <= 0:
         raise ValueError("batched pregrasp IK requires at least one candidate")
+    if goalset_count <= 0:
+        raise ValueError("batched pregrasp IK requires at least one goal")
     config = InverseKinematicsCfg.create(
         robot=robot,
         optimizer_configs=["ik/lbfgs_ik.yml"],
@@ -1834,7 +1869,7 @@ def _batched_pregrasp_ik_solver(
         orientation_tolerance=PREGRASP_IK_ORIENTATION_TOLERANCE_RAD,
         self_collision_check=True,
         max_batch_size=candidate_count,
-        max_goalset=1,
+        max_goalset=goalset_count,
         use_cuda_graph=True,
         random_seed=seed,
         optimizer_collision_activation_distance=COLLISION_ACTIVATION_DISTANCE_M,
@@ -2116,6 +2151,39 @@ def _batched_pose_goals(matrices: list[np.ndarray], device_cfg, *, arm: str):
     )
 
 
+def _batched_goalset_pose_goals(
+    matrices: list[list[np.ndarray]],
+    device_cfg,
+    *,
+    arm: str,
+):
+    """Return one CuRobo goal set per independent grasp candidate."""
+
+    import torch
+    from curobo.types import GoalToolPose
+
+    values = np.asarray(matrices, dtype=np.float64)
+    if values.ndim != 4 or values.shape[2:] != (4, 4):
+        raise ValueError("batched goal-set poses require a B x G x 4 x 4 array")
+    if values.shape[0] == 0 or values.shape[1] == 0:
+        raise ValueError("batched goal-set poses require non-empty batches and goals")
+    positions = device_cfg.to_device(values[:, :, :3, 3])[:, None, None]
+    rotations = values[:, :, :3, :3]
+    quaternion_xyzw = (
+        Rotation.from_matrix(rotations.reshape(-1, 3, 3))
+        .as_quat()
+        .reshape(*rotations.shape[:2], 4)
+    )
+    quaternion_wxyz = np.concatenate(
+        (quaternion_xyzw[..., 3:4], quaternion_xyzw[..., :3]),
+        axis=-1,
+    )
+    quaternions = device_cfg.to_device(quaternion_wxyz)[:, None, None]
+    if not isinstance(positions, torch.Tensor) or not isinstance(quaternions, torch.Tensor):
+        raise TypeError("CuRobo device conversion did not return tensors")
+    return GoalToolPose([grasp_frame(arm)], positions, quaternions)
+
+
 def _as_numpy(value) -> np.ndarray:
     if hasattr(value, "detach"):
         value = value.detach().cpu().numpy()
@@ -2143,11 +2211,14 @@ def _enumerate_pregrasp_branches(
     state,
     *,
     candidate_count: int,
+    goalset_count: int = 1,
 ) -> tuple[list[_PregraspBranch], Any]:
     """Return up to 16 dedicated collision-valid IK branches per candidate."""
 
     if candidate_count <= 0:
         raise ValueError("pregrasp IK candidate count must be positive")
+    if goalset_count <= 0:
+        raise ValueError("pregrasp IK goal-set count must be positive")
     batch_state = _repeat_joint_state(state, candidate_count)
     result = solver.solve_pose(
         goals,
@@ -2160,6 +2231,20 @@ def _enumerate_pregrasp_branches(
         raise RuntimeError(f"CuRobo pregrasp IK returned invalid success shape {success.shape}")
     if solutions.shape != (*success.shape, 7):
         raise RuntimeError(f"CuRobo pregrasp IK returned invalid solution shape {solutions.shape}")
+    result_goalset_index = getattr(result, "goalset_index", None)
+    if result_goalset_index is None:
+        if goalset_count != 1:
+            raise RuntimeError("CuRobo omitted the selected goal-set index")
+        goalset_indices = np.zeros(success.shape, dtype=np.int64)
+    else:
+        goalset_indices = _as_numpy(result_goalset_index).astype(np.int64)
+        if goalset_indices.size != success.size:
+            raise RuntimeError(
+                f"CuRobo pregrasp IK returned invalid goal-set index shape {goalset_indices.shape}"
+            )
+        goalset_indices = goalset_indices.reshape(success.shape)
+    if np.any(goalset_indices < 0) or np.any(goalset_indices >= goalset_count):
+        raise RuntimeError("CuRobo pregrasp IK selected a goal outside the supplied goal set")
     position_error = _as_numpy(result.position_error).reshape(*success.shape, -1).max(axis=2)
     rotation_error = _as_numpy(result.rotation_error).reshape(*success.shape, -1).max(axis=2)
     reference = _as_numpy(state.position).reshape(-1)
@@ -2188,6 +2273,7 @@ def _enumerate_pregrasp_branches(
             branches.append(
                 _PregraspBranch(
                     candidate_local_index=candidate_local_index,
+                    goalset_index=int(goalset_indices[candidate_local_index, solver_seed_index]),
                     solver_seed_index=solver_seed_index,
                     model_q_rad=solution,
                     position_error_m=float(
@@ -2230,7 +2316,7 @@ def _try_branch_pool(
         report(
             f"trying {candidate_id} IK branch "
             f"{candidate_branch_index}/{candidate_branch_count} "
-            f"(solver seed {branch.solver_seed_index})"
+            f"(goal {branch.goalset_index}, solver seed {branch.solver_seed_index})"
         )
         try:
             result = attempt(branch)
@@ -2240,6 +2326,7 @@ def _try_branch_pool(
                 "pool_branch_index": pool_index,
                 "candidate_branch_index": candidate_branch_index,
                 "candidate_branch_count": candidate_branch_count,
+                "goalset_index": branch.goalset_index,
                 "solver_seed_index": branch.solver_seed_index,
                 "stage": rejection.stage,
                 "reason": rejection.reason,
@@ -2248,7 +2335,7 @@ def _try_branch_pool(
             report(
                 f"rejected {candidate_id} IK branch "
                 f"{candidate_branch_index}/{candidate_branch_count} "
-                f"at {rejection.stage}: {rejection.reason}"
+                f"for goal {branch.goalset_index} at {rejection.stage}: {rejection.reason}"
             )
             continue
         return branch, result, failures
@@ -4009,6 +4096,27 @@ def _pick_place_payload_route(plan: TabletopPickPlacePlan) -> np.ndarray:
     )
 
 
+def _validate_equivalent_task_goalset(
+    requests: tuple[TabletopTaskRequest, ...],
+) -> None:
+    """Require one physical task whose object pose is the only free goal value."""
+
+    if not requests:
+        raise ValueError("tabletop task goal set must not be empty")
+    reference = requests[0].to_dict(include_hash=False)
+    for key in ("observation", "environment_cuboids"):
+        reference.pop(key)
+    for index, request in enumerate(requests[1:], start=1):
+        current = request.to_dict(include_hash=False)
+        for key in ("observation", "environment_cuboids"):
+            current.pop(key)
+        if current != reference:
+            raise ValueError(
+                "tabletop destination goal set changes task configuration outside "
+                f"object/world pose at index {index}"
+            )
+
+
 class PickPlaceRetentionRouteValidator:
     """Recheck the complete transfer using the actual contact-stopped Dex3 posture."""
 
@@ -4171,6 +4279,7 @@ def validate_retention_route(
 def _plan_tabletop(
     request: TabletopTaskRequest,
     *,
+    alternative_goal_requests: tuple[TabletopTaskRequest, ...] = (),
     required_candidate_id: str | None = None,
     excluded_candidate_ids: tuple[str, ...] = (),
     pregrasp_only: bool,
@@ -4181,6 +4290,9 @@ def _plan_tabletop(
     """Plan either the first boundary route or one complete task."""
 
     report = progress or (lambda _message: None)
+    goal_requests = (request, *tuple(alternative_goal_requests))
+    _validate_equivalent_task_goalset(goal_requests)
+    goalset_count = len(goal_requests)
     arm = request.arm
     open_planner_cache = None if planner_pool is None else planner_pool.motion("open", arm)
     attached_planner_cache = None if planner_pool is None else planner_pool.motion("attached", arm)
@@ -4282,7 +4394,20 @@ def _plan_tabletop(
         kinematics = strict_open_checker.kinematics.compute_kinematics(state)
         base_T_torso = kinematics.tool_poses["torso_link"].get_matrix()[0].detach().cpu().numpy()
 
-        plane_point, base_T_object, down = _table_from_resting_object(request, base_T_torso)
+        goal_geometry = tuple(
+            _table_from_resting_object(current, base_T_torso) for current in goal_requests
+        )
+        plane_point, base_T_object, down = goal_geometry[0]
+        for goal_index, (current_plane, _current_object, current_down) in enumerate(
+            goal_geometry[1:], start=1
+        ):
+            if not np.allclose(current_plane, plane_point, atol=1.0e-8) or not np.allclose(
+                current_down, down, atol=1.0e-8
+            ):
+                raise ValueError(
+                    "tabletop destination goal set changes the physical table plane at "
+                    f"index {goal_index}"
+                )
         fixed_close_arguments = {
             "request": request,
             "base_T_object": base_T_object,
@@ -4301,7 +4426,10 @@ def _plan_tabletop(
                 **fixed_close_arguments,
             )
             fixed_close_validator_reused = bool(fixed_close_event["reused"])
-        grasp_matrices = [base_T_object @ _candidate_transform(item) for item in candidates]
+        grasp_matrices = [
+            [geometry[1] @ _candidate_transform(item) for geometry in goal_geometry]
+            for item in candidates
+        ]
         approach_distance_m = _request_pregrasp_distance_m(request, shortlist)
         branch_rejections: list[dict[str, Any]] = []
         stage_started = time.monotonic()
@@ -4313,33 +4441,44 @@ def _plan_tabletop(
                 link_name = str(evidence["fixed_close_sweep_minimum_link"])
                 if arm == "left":
                     link_name = link_name.replace("right_", "left_", 1)
-                exact_table_evidence.append(
-                    (
-                        float(evidence["fixed_close_sweep_table_clearance_m"]),
-                        link_name,
-                        int(evidence["fixed_close_sweep_minimum_sample"]),
-                    )
+                exact_table_evidence.extend(
+                    [
+                        (
+                            float(evidence["fixed_close_sweep_table_clearance_m"]),
+                            link_name,
+                            int(evidence["fixed_close_sweep_minimum_sample"]),
+                        )
+                    ]
+                    * goalset_count
                 )
-        candidate_rejections = fixed_close_validator.batch_candidate_rejections(
-            grasp_matrices,
+        fixed_close_pair_rejections = fixed_close_validator.batch_candidate_rejections(
+            [matrix for candidate_matrices in grasp_matrices for matrix in candidate_matrices],
             exact_table_evidence=exact_table_evidence,
         )
         batched_fixed_close_s = time.monotonic() - stage_started
         remaining_indices = [
-            index for index in range(len(candidates)) if index not in candidate_rejections
+            candidate_index
+            for candidate_index in range(len(candidates))
+            if any(
+                candidate_index * goalset_count + goal_index not in fixed_close_pair_rejections
+                for goal_index in range(goalset_count)
+            )
         ]
-        for index, (stage, reason) in candidate_rejections.items():
+        for flat_index, (stage, reason) in fixed_close_pair_rejections.items():
+            candidate_index, goal_index = divmod(flat_index, goalset_count)
             branch_rejections.append(
                 {
-                    "candidate_id": str(candidates[index]["candidate_id"]),
+                    "candidate_id": str(candidates[candidate_index]["candidate_id"]),
+                    "goalset_index": goal_index,
                     "stage": stage,
                     "reason": reason,
                 }
             )
-        if candidate_rejections:
+        if fixed_close_pair_rejections:
             report(
                 "batched fixed-close GPU pruning removed "
-                f"{len(candidate_rejections)}/{len(candidates)} candidates; "
+                f"{len(fixed_close_pair_rejections)}/"
+                f"{len(candidates) * goalset_count} candidate/goal pairs; "
                 f"{len(remaining_indices)} remain for arm IK"
             )
         if not remaining_indices and endpoint_feasibility_only:
@@ -4347,6 +4486,7 @@ def _plan_tabletop(
                 candidate_branch_counts={
                     str(candidate["candidate_id"]): 0 for candidate in candidates
                 },
+                candidate_best_joint_distance_rad={},
                 fixed_close_viable_candidate_count=0,
                 rejections=tuple(branch_rejections),
                 elapsed_s=time.monotonic() - started,
@@ -4391,7 +4531,8 @@ def _plan_tabletop(
             subset_matrices = [grasp_matrices[index] for index in subset_indices]
             candidate_ids = [str(item["candidate_id"]) for item in subset_candidates]
             pregrasp_matrices = [
-                _pregrasp_matrix(matrix, approach_distance_m) for matrix in subset_matrices
+                [_pregrasp_matrix(matrix, approach_distance_m) for matrix in goal_matrices]
+                for goal_matrices in subset_matrices
             ]
 
             def create_open_planner(
@@ -4437,11 +4578,16 @@ def _plan_tabletop(
                 resolved_transit_robot,
                 scene,
                 candidate_count=len(subset_candidates),
+                goalset_count=goalset_count,
                 seed=request.random_seed,
                 device_cfg=device_cfg,
             )
             batched_ik_setup_s += time.monotonic() - stage_started
-            pregrasp_goals = _batched_pose_goals(pregrasp_matrices, device_cfg, arm=arm)
+            pregrasp_goals = _batched_goalset_pose_goals(
+                pregrasp_matrices,
+                device_cfg,
+                arm=arm,
+            )
             stage_started = time.monotonic()
             try:
                 branches, ik_result = _enumerate_pregrasp_branches(
@@ -4449,7 +4595,15 @@ def _plan_tabletop(
                     pregrasp_goals,
                     state,
                     candidate_count=len(subset_candidates),
+                    goalset_count=goalset_count,
                 )
+                branches = [
+                    branch
+                    for branch in branches
+                    if subset_indices[branch.candidate_local_index] * goalset_count
+                    + branch.goalset_index
+                    not in fixed_close_pair_rejections
+                ]
                 batched_ik_s += time.monotonic() - stage_started
                 diagnostic = (
                     None
@@ -4492,6 +4646,7 @@ def _plan_tabletop(
                 branch_rejections.append(
                     {
                         "candidate_id": candidate_ids[branch.candidate_local_index],
+                        "goalset_index": branch.goalset_index,
                         "solver_seed_index": branch.solver_seed_index,
                         "stage": "pregrasp_endpoint_strict_self_collision",
                         "reason": reason,
@@ -4525,8 +4680,18 @@ def _plan_tabletop(
                         for index in range(len(candidate_ids))
                     }
                 )
+                best_joint_distance_by_candidate = {
+                    candidate_ids[local_index]: min(
+                        float(np.linalg.norm(branch.model_q_rad - reference_model))
+                        for branch in branches
+                        if branch.candidate_local_index == local_index
+                    )
+                    for local_index in range(len(subset_candidates))
+                    if branch_counts[local_index] > 0
+                }
                 return _EndpointFeasibility(
                     candidate_branch_counts=counts_by_candidate,
+                    candidate_best_joint_distance_rad=(best_joint_distance_by_candidate),
                     fixed_close_viable_candidate_count=len(remaining_indices),
                     rejections=tuple(branch_rejections),
                     elapsed_s=time.monotonic() - started,
@@ -4559,6 +4724,8 @@ def _plan_tabletop(
                 )
                 selected_local = branch.candidate_local_index
                 candidate = current_candidates[selected_local]
+                branch_request = goal_requests[branch.goalset_index]
+                branch_grasp_matrix = current_matrices[selected_local][branch.goalset_index]
                 branch_started = time.monotonic()
                 if pregrasp_only:
                     try:
@@ -4569,10 +4736,10 @@ def _plan_tabletop(
                             reference_command_q=reference,
                             reference_model_q=reference_model,
                             pregrasp_model_q=branch.model_q_rad,
-                            grasp_matrix=current_matrices[selected_local],
+                            grasp_matrix=branch_grasp_matrix,
                             open_robot=current_open_robot,
                             strict_checker=current_strict_checker,
-                            request=request,
+                            request=branch_request,
                             base_T_torso=base_T_torso,
                             plane_point=plane_point,
                             down=down,
@@ -4603,10 +4770,10 @@ def _plan_tabletop(
                         reference_command_q=reference,
                         reference_model_q=reference_model,
                         pregrasp_model_q=branch.model_q_rad,
-                        grasp_matrix=current_matrices[selected_local],
+                        grasp_matrix=branch_grasp_matrix,
                         open_robot=current_open_robot,
                         strict_checker=current_strict_checker,
-                        request=request,
+                        request=branch_request,
                         base_T_torso=base_T_torso,
                         plane_point=plane_point,
                         down=down,
@@ -4628,7 +4795,7 @@ def _plan_tabletop(
                 lift_started = time.monotonic()
                 try:
                     branch_lift = _plan_attached_lift(
-                        request=request,
+                        request=branch_request,
                         selected=candidate,
                         close_target_q=close_target_q,
                         contact_command_q=branch_open.grasp.command_q_rad[-1],
@@ -4694,6 +4861,7 @@ def _plan_tabletop(
                 "all qualified cube grasp IK branches failed route validation: "
                 f"{branch_rejections}"
             )
+        selected_request = goal_requests[selected_branch.goalset_index]
 
         if pregrasp_only:
             if approach_plan is None:
@@ -4713,7 +4881,7 @@ def _plan_tabletop(
                 "clearance-to-pregrasp boundary route"
             )
             return TabletopPregraspPlan(
-                request_sha256=request.content_sha256,
+                request_sha256=selected_request.content_sha256,
                 arm=arm,
                 selected_candidate_id=str(selected["candidate_id"]),
                 object_T_grasp=tuple(
@@ -4762,6 +4930,12 @@ def _plan_tabletop(
                     },
                     "pregrasp_ik_branches_tested": branch_attempt_count,
                     "selected_pregrasp_solver_seed_index": selected_branch.solver_seed_index,
+                    "selected_goalset_index": selected_branch.goalset_index,
+                    "goalset_size": goalset_count,
+                    "goalset_selection_policy": (
+                        "curobo-goalset-ik-then-existing-joint-distance-ordered-"
+                        "complete-route-validation"
+                    ),
                     "selected_pregrasp_position_error_m": selected_branch.position_error_m,
                     "selected_pregrasp_rotation_error_rad": selected_branch.rotation_error_rad,
                     "rejected_grasp_branches": branch_rejections,
@@ -4858,7 +5032,7 @@ def _plan_tabletop(
         )
         report(f"selected {selected['candidate_id']}; planned complete pick/lift/replace/return")
         return TabletopTaskPlan(
-            request_sha256=request.content_sha256,
+            request_sha256=selected_request.content_sha256,
             arm=arm,
             selected_candidate_id=str(selected["candidate_id"]),
             object_T_grasp=tuple(tuple(float(v) for v in row) for row in object_T_grasp),
@@ -4929,6 +5103,12 @@ def _plan_tabletop(
                 },
                 "pregrasp_ik_branches_tested": branch_attempt_count,
                 "selected_pregrasp_solver_seed_index": (selected_branch.solver_seed_index),
+                "selected_goalset_index": selected_branch.goalset_index,
+                "goalset_size": goalset_count,
+                "goalset_selection_policy": (
+                    "curobo-goalset-ik-then-existing-joint-distance-ordered-"
+                    "complete-route-validation"
+                ),
                 "selected_pregrasp_position_error_m": (selected_branch.position_error_m),
                 "selected_pregrasp_rotation_error_rad": (selected_branch.rotation_error_rad),
                 "rejected_grasp_branches": branch_rejections,
@@ -5217,9 +5397,34 @@ def plan_tabletop_task(
     return result
 
 
+def _plan_tabletop_task_goalset(
+    requests: tuple[TabletopTaskRequest, ...],
+    *,
+    required_candidate_id: str,
+    planner_pool: TabletopPlannerPool | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> TabletopTaskPlan:
+    """Plan one task while CuRobo chooses among equivalent object destinations."""
+
+    if not requests:
+        raise ValueError("destination task goal set must not be empty")
+    result = _plan_tabletop(
+        requests[0],
+        alternative_goal_requests=requests[1:],
+        required_candidate_id=required_candidate_id,
+        pregrasp_only=False,
+        planner_pool=planner_pool,
+        progress=progress,
+    )
+    if not isinstance(result, TabletopTaskPlan):
+        raise TypeError("destination goal-set planner returned an incomplete task")
+    return result
+
+
 def _tabletop_endpoint_feasibility(
     request: TabletopTaskRequest,
     *,
+    alternative_goal_requests: tuple[TabletopTaskRequest, ...] = (),
     excluded_candidate_ids: tuple[str, ...] = (),
     planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
@@ -5228,6 +5433,7 @@ def _tabletop_endpoint_feasibility(
 
     result = _plan_tabletop(
         request,
+        alternative_goal_requests=alternative_goal_requests,
         excluded_candidate_ids=excluded_candidate_ids,
         pregrasp_only=False,
         endpoint_feasibility_only=True,
@@ -5249,7 +5455,7 @@ def _pick_place_endpoint_analysis(
 
     report = progress or (lambda _message: None)
     source = request.source_request
-    destination = destination_request_for_pick_place(request)
+    destinations = destination_requests_for_pick_place(request)
     report("batching source endpoint feasibility without route planning")
     source_feasibility = _tabletop_endpoint_feasibility(
         source,
@@ -5259,7 +5465,8 @@ def _pick_place_endpoint_analysis(
     )
     report("batching destination endpoint feasibility without route planning")
     destination_feasibility = _tabletop_endpoint_feasibility(
-        destination,
+        destinations[0],
+        alternative_goal_requests=destinations[1:],
         excluded_candidate_ids=request.excluded_candidate_ids,
         planner_pool=planner_pool,
         progress=report,
@@ -5303,6 +5510,8 @@ def analyze_tabletop_pick_place_endpoints(
         "source_viable_candidate_count": len(analysis.source.viable_candidate_ids),
         "destination_viable_candidate_count": len(analysis.destination.viable_candidate_ids),
         "common_candidate_ids": list(analysis.common_candidate_ids),
+        "ranked_common_candidate_ids": list(analysis.ranked_common_candidate_ids),
+        "common_candidate_joint_distance_rad": (analysis.common_candidate_joint_distance_rad),
         "common_candidate_count": len(analysis.common_candidate_ids),
         "source_elapsed_s": analysis.source.elapsed_s,
         "destination_elapsed_s": analysis.destination.elapsed_s,
@@ -5322,7 +5531,7 @@ def plan_tabletop_pick_place(
     report = progress or (lambda _message: None)
     started = time.monotonic()
     source = request.source_request
-    destination = destination_request_for_pick_place(request)
+    destinations = destination_requests_for_pick_place(request)
     endpoint_analysis = _pick_place_endpoint_analysis(
         request,
         planner_pool=planner_pool,
@@ -5330,7 +5539,6 @@ def plan_tabletop_pick_place(
     )
     source_feasibility = endpoint_analysis.source
     destination_feasibility = endpoint_analysis.destination
-    candidate_ids = endpoint_analysis.candidate_ids
     source_endpoint_viable = source_feasibility.viable_candidate_ids
     destination_endpoint_viable = destination_feasibility.viable_candidate_ids
     common_endpoint_viable = set(endpoint_analysis.common_candidate_ids)
@@ -5340,17 +5548,28 @@ def plan_tabletop_pick_place(
             "the source and destination"
         )
 
-    candidate_order = [value for value in candidate_ids if value in common_endpoint_viable]
+    candidate_order = list(endpoint_analysis.ranked_common_candidate_ids)
+    candidate_joint_distances = endpoint_analysis.common_candidate_joint_distance_rad
+    if candidate_order:
+        first_candidate = candidate_order[0]
+        first_cost = candidate_joint_distances[first_candidate]
+        report(
+            "ordered common endpoint-valid grasps by existing IK joint distance; "
+            f"first={first_candidate}, source={first_cost['source']:.4f}rad, "
+            f"destination={first_cost['destination']:.4f}rad, "
+            f"total={first_cost['total']:.4f}rad"
+        )
     pick_place_rejections: list[dict[str, str]] = []
     source_task = destination_task = transfer = transfer_provenance = None
+    selected_destination_index: int | None = None
     for candidate_id in candidate_order:
         report(
             f"trying common endpoint-valid grasp {candidate_id}; planning the "
             "more restrictive destination lifecycle first"
         )
         try:
-            current_destination = plan_tabletop_task(
-                destination,
+            current_destination = _plan_tabletop_task_goalset(
+                destinations,
                 required_candidate_id=candidate_id,
                 planner_pool=planner_pool,
                 progress=report,
@@ -5382,9 +5601,18 @@ def plan_tabletop_pick_place(
             )
             continue
         report("planning the attached-payload bridge between validated lifted states")
+        current_destination_index = int(
+            current_destination.planner_provenance["selected_goalset_index"]
+        )
+        if not 0 <= current_destination_index < len(destinations):
+            raise RuntimeError("CuRobo selected an invalid destination goal-set index")
+        selected_request = select_pick_place_destination(
+            request,
+            current_destination_index,
+        )
         try:
             current_transfer, current_transfer_provenance = _plan_attached_transfer(
-                request,
+                selected_request,
                 current_source,
                 current_destination,
                 planner_pool=planner_pool,
@@ -5402,12 +5630,14 @@ def plan_tabletop_pick_place(
         destination_task = current_destination
         transfer = current_transfer
         transfer_provenance = current_transfer_provenance
+        selected_destination_index = current_destination_index
         break
     if (
         source_task is None
         or destination_task is None
         or transfer is None
         or transfer_provenance is None
+        or selected_destination_index is None
     ):
         raise RuntimeError(
             "no qualified grasp passed the complete source, destination, and attached "
@@ -5449,6 +5679,7 @@ def plan_tabletop_pick_place(
         request_sha256=request.content_sha256,
         arm=source.arm,
         selected_candidate_id=source_task.selected_candidate_id,
+        selected_destination_index=selected_destination_index,
         source_task=source_task,
         destination_task=destination_task,
         trajectories=trajectories,
@@ -5460,11 +5691,16 @@ def plan_tabletop_pick_place(
             "source_task_sha256": source_task.content_sha256,
             "destination_task_sha256": destination_task.content_sha256,
             "transfer": transfer_provenance,
+            "selected_destination_index": selected_destination_index,
+            "destination_goalset_size": len(destinations),
             "rejected_pick_place_grasps": pick_place_rejections,
             "selection_policy": (
-                "batched-source-destination-endpoint-intersection-then-first-"
-                "grasp-passing-complete-routes-and-attached-transfer"
+                "batched-source-destination-goalset-endpoint-intersection-then-"
+                "best-summed-endpoint-joint-distance-first-then-curobo-selected-"
+                "destination-and-complete-transfer"
             ),
+            "ranked_common_candidate_ids": candidate_order,
+            "common_candidate_joint_distance_rad": candidate_joint_distances,
             "source_endpoint_viable_candidate_count": len(source_endpoint_viable),
             "destination_endpoint_viable_candidate_count": len(destination_endpoint_viable),
             "common_endpoint_viable_candidate_count": len(common_endpoint_viable),

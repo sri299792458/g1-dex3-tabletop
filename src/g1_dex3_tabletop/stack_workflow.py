@@ -18,6 +18,8 @@ from g1_dex3_tabletop.tabletop_contracts import (
 )
 from g1_dex3_tabletop.tabletop_geometry import canonical_resting_cube_pose
 
+DIRECT_STACK_YAW_QUARTER_TURNS = (0, 1, 3, 2)
+
 
 def _tuple_transform(value: np.ndarray) -> tuple[tuple[float, ...], ...]:
     transform = validate_transform(np.asarray(value, dtype=np.float64))
@@ -86,20 +88,18 @@ def build_direct_stack_request(
     moving_request: TabletopTaskRequest,
     support_cube: TabletopObservation,
     base_T_camera: np.ndarray,
-    yaw_quarter_turns: int = 0,
     excluded_candidate_ids: tuple[str, ...] = (),
 ) -> TabletopPickPlaceRequest:
     """Place one observed 60 mm cube directly on the other observed cube.
 
-    The quarter-turn is a nominal hand-path choice among the cube's four
-    upright symmetries.  It is not evidence that the physical cube retains an
+    The four destinations are the cube's upright quarter-turn symmetries.
+    CuRobo chooses among them as one goal set; their order is not a wrapper
+    planning priority.  They do not assert that the physical cube retains an
     exact yaw inside the Dex3 grasp.
     """
 
     if tuple(moving_request.object_dimensions_m) != (0.060, 0.060, 0.060):
         raise ValueError("the moving direct-stack cube must use a 60 mm profile")
-    if yaw_quarter_turns not in (0, 1, 2, 3):
-        raise ValueError("direct-stack yaw quarter-turns must be 0, 1, 2, or 3")
     raw_moving, raw_support, canonical_moving, canonical_support = _base_poses(
         upper_cube=moving_request.observation,
         bottom_cube=support_cube,
@@ -110,11 +110,15 @@ def build_direct_stack_request(
     if normal_norm <= 1.0e-9:
         raise ValueError("the two observed cubes imply opposite tabletop normals")
     up = normal / normal_norm
-    destination = np.eye(4, dtype=np.float64)
-    destination[:3, :3] = (
-        Rotation.from_rotvec(yaw_quarter_turns * 0.5 * np.pi * up).as_matrix() @ raw_moving[:3, :3]
-    )
-    destination[:3, 3] = raw_support[:3, 3] + 0.060 * up
+    destinations = []
+    for yaw_quarter_turns in DIRECT_STACK_YAW_QUARTER_TURNS:
+        destination = np.eye(4, dtype=np.float64)
+        destination[:3, :3] = (
+            Rotation.from_rotvec(yaw_quarter_turns * 0.5 * np.pi * up).as_matrix()
+            @ raw_moving[:3, :3]
+        )
+        destination[:3, 3] = raw_support[:3, 3] + 0.060 * up
+        destinations.append(_tuple_transform(invert_transform(raw_moving) @ destination))
     moving_T_support = invert_transform(raw_moving) @ raw_support
     source = replace(
         moving_request,
@@ -128,7 +132,7 @@ def build_direct_stack_request(
     )
     return TabletopPickPlaceRequest(
         source_request=source,
-        source_T_destination_object=_tuple_transform(invert_transform(raw_moving) @ destination),
+        source_T_destination_objects=tuple(destinations),
         destination_support_object_id="support_cube",
         excluded_candidate_ids=excluded_candidate_ids,
     )

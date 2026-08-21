@@ -5129,3 +5129,77 @@ Primary references:
   absent. Verification passed Ruff, `427 passed, 7 skipped` in the control
   environment, and `427 passed, 1 skipped` in the planner environment. No
   robot command was sent.
+
+## 2026-08-21 — Clearance perception rejection returns through the supported route
+
+- Retained run `stack_20260821T164205Z` reached the validated left-arm
+  clearance normally. Its open index finger then occluded every decodable
+  primary-cube marker: offline replay detects primary IDs `10`, `13`, and `15`
+  in all preflight frames and zero primary IDs in all five clearance frames;
+  the secondary cube remained detected.
+- The perception rejection was a normal `ValueError`, but the stack workflow
+  allowed it to enter generic emergency cleanup. That cleanup correctly
+  requested AI zero torque, yet it was the wrong policy for a healthy
+  controller holding a known clearance endpoint with a frozen reverse route.
+- Post-clearance camera-capture and cube-detection failures now become
+  `TabletopTaskRejected` only after `driver.check()` confirms control remains
+  healthy. The existing rejection path restores the initial finger postures,
+  reverses the validated supported escape, and restores seated FSM 3. A real
+  controller, transport, watchdog, state-observer, or unexpected software
+  fault still enters the zero-torque cleanup path.
+- Pair-observation errors now identify the uniquely tagged cube explicitly:
+  secondary IDs `20-25` or primary IDs `10-15`.
+- Verification passed Ruff over maintained `src` and `tests`, `429 passed,
+  7 skipped` in the control environment, and `429 passed, 1 skipped` in the
+  CUDA planner environment. The retained failed images were replayed through
+  the updated detector path; no robot command was sent.
+
+## 2026-08-21 — Direct-stack yaw is one CuRobo goal set
+
+- The four upright cube symmetries were introduced as equivalent wrist goals,
+  but the coordinator had implemented them as four separate endpoint analyses
+  and up to four complete pick/place searches. That made a task-level symmetry
+  a sequential Python planning policy.
+- A pick/place request now carries a non-empty tuple of destination transforms.
+  Ordinary transfers carry one transform. Direct stacking carries the upright
+  quarter turns `(0, 1, 3, 2)` in one request.
+- Destination endpoint IK is one CuRobo batch with one four-entry goal set per
+  grasp candidate. CuRobo's returned `goalset_index` stays attached to each IK
+  branch, the lowest-joint-travel branches enter the unchanged strict route
+  checks first, and the selected destination index is hash-bound into the final
+  nine-phase plan and feasibility artifacts. The coordinator submits one
+  endpoint request and one complete planning request; it no longer orders four
+  yaw-specific planners.
+- Command-free replay merged the four retained requests from successful run
+  `stack_20260821T174330Z`. The joint source/destination endpoint pass retained
+  `17/57` grasp candidates. Full planning produced a valid nine-phase plan in
+  `35.126 s`, selected candidate
+  `cube_head__seed_0000000059__sample_162`, and CuRobo selected goal-set index
+  `0` (nominal yaw `0`). No robot command was created or published.
+- Verification passed Ruff, `430 passed, 7 skipped` in the control environment,
+  and `430 passed, 1 skipped` in the CUDA planner environment.
+
+## 2026-08-21 — Direct-stack grasp order retains endpoint joint distance
+
+- The batched endpoint pass already produced up to 16 strict IK branches per
+  grasp and ordered branches by Euclidean joint distance from the measured
+  clearance state. The stack wrapper retained only branch counts, reconstructed
+  the original GraspGenX shortlist order, and therefore did not compare that
+  existing motion cost across common source/destination grasp candidates.
+- Endpoint feasibility now retains each candidate's minimum joint distance.
+  Common candidates are ordered by the sum of their best source and destination
+  distances before unchanged full destination, source, transfer, collision,
+  and table-plane validation. Ties preserve shortlist order. No wrist-specific
+  weight, hard rotation gate, or additional route solve was introduced.
+- Command-free replay of retained physical run `stack_20260821T181848Z`
+  changed the first candidate from the physically rejected
+  `cube_head__seed_0000000089__sample_168` to the later physically successful
+  `cube_head__seed_0000000149__sample_155`. The rejected plan's
+  clearance-to-pregrasp wrist changes were `+128.2/-14.3/+71.1 deg`; the newly
+  selected plan uses approximately `+21.4/-17.8/+13.9 deg`. Its route-free
+  source/destination joint distances were `0.8409/1.9171 rad`, versus
+  `3.0871/2.9254 rad` for the rejected candidate.
+- The replay planned the complete nine-phase route in `20.582 s` and selected
+  destination goal-set index `2`. It created no robot command. Ruff passed;
+  the control environment passed `431` tests with `7` skipped and the CUDA
+  planner environment passed `431` tests with `1` skipped.

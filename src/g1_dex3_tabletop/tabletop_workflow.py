@@ -224,15 +224,27 @@ def request_at_estimated_pregrasp(
     return replace(clearance_request, estimated_planning_state=state)
 
 
-def destination_request_for_pick_place(
+def destination_requests_for_pick_place(
     request: TabletopPickPlaceRequest,
+) -> tuple[TabletopTaskRequest, ...]:
+    """Express the same fixed world in every acceptable destination frame."""
+
+    return tuple(
+        _destination_request_for_transform(request, transform)
+        for transform in request.source_T_destination_objects
+    )
+
+
+def _destination_request_for_transform(
+    request: TabletopPickPlaceRequest,
+    source_T_destination_object,
 ) -> TabletopTaskRequest:
-    """Express the same fixed world in the destination object's frame."""
+    """Express the fixed world in one destination object's frame."""
 
     source = request.source_request
     if source.estimated_planning_state is not None:
         raise ValueError("pick-place destination synthesis requires a visual boundary request")
-    source_T_destination = np.asarray(request.source_T_destination_object, dtype=np.float64)
+    source_T_destination = np.asarray(source_T_destination_object, dtype=np.float64)
     destination_T_source = np.linalg.inv(source_T_destination)
     camera_T_destination = (
         np.asarray(source.observation.camera_T_object, dtype=np.float64) @ source_T_destination
@@ -272,6 +284,22 @@ def destination_request_for_pick_place(
         environment_cuboids=tuple(destination_environment),
         table_reference_camera_T_object=table_reference_pose,
         table_reference_object_dimensions_m=table_reference_dimensions,
+    )
+
+
+def select_pick_place_destination(
+    request: TabletopPickPlaceRequest,
+    destination_index: int,
+) -> TabletopPickPlaceRequest:
+    """Bind a goal-set request to the destination selected by CuRobo."""
+
+    if not 0 <= destination_index < len(request.source_T_destination_objects):
+        raise IndexError("pick-place destination index is outside the goal set")
+    return replace(
+        request,
+        source_T_destination_objects=(
+            request.source_T_destination_objects[destination_index],
+        ),
     )
 
 

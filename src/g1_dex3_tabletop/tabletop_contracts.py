@@ -897,15 +897,16 @@ PICK_PLACE_PHASE_ORDER = (
 
 @dataclass(frozen=True, slots=True)
 class TabletopPickPlaceRequest:
-    """One fixed source-to-destination cube transfer using a single arm.
+    """One fixed-source cube transfer to one of several equivalent destinations.
 
-    ``source_T_destination_object`` uses detector-defined physical object
-    frames. It deliberately excludes the planner's private face-up cube-axis
-    permutation.
+    ``source_T_destination_objects`` uses detector-defined physical object
+    frames. Each entry is a physically acceptable task goal; CuRobo chooses
+    among them. They deliberately exclude the planner's private face-up
+    cube-axis permutation.
     """
 
     source_request: TabletopTaskRequest
-    source_T_destination_object: tuple[tuple[float, ...], ...]
+    source_T_destination_objects: tuple[tuple[tuple[float, ...], ...], ...]
     destination_support_object_id: str | None = None
     excluded_candidate_ids: tuple[str, ...] = ()
     schema_version: int = PLANNER_SCHEMA_VERSION
@@ -922,14 +923,13 @@ class TabletopPickPlaceRequest:
                 "source_request",
                 TabletopTaskRequest.from_dict(self.source_request),
             )
-        object.__setattr__(
-            self,
-            "source_T_destination_object",
-            _finite_transform(
-                self.source_T_destination_object,
-                "source_T_destination_object",
-            ),
+        destinations = tuple(
+            _finite_transform(value, f"source_T_destination_objects[{index}]")
+            for index, value in enumerate(self.source_T_destination_objects)
         )
+        if not destinations:
+            raise ValueError("pick-place request requires at least one destination")
+        object.__setattr__(self, "source_T_destination_objects", destinations)
         support = self.destination_support_object_id
         if support is not None:
             support = str(support).strip()
@@ -957,7 +957,10 @@ class TabletopPickPlaceRequest:
             "schema_version": self.schema_version,
             "operation": self.operation,
             "source_request": self.source_request.to_dict(),
-            "source_T_destination_object": [list(row) for row in self.source_T_destination_object],
+            "source_T_destination_objects": [
+                [list(row) for row in transform]
+                for transform in self.source_T_destination_objects
+            ],
             "destination_support_object_id": self.destination_support_object_id,
             "excluded_candidate_ids": list(self.excluded_candidate_ids),
         }
@@ -989,6 +992,7 @@ class TabletopPickPlacePlan:
     request_sha256: str
     arm: str
     selected_candidate_id: str
+    selected_destination_index: int
     source_task: TabletopTaskPlan
     destination_task: TabletopTaskPlan
     trajectories: tuple[PlannedTrajectory, ...]
@@ -1001,6 +1005,10 @@ class TabletopPickPlacePlan:
         if len(self.request_sha256) != 64:
             raise ValueError("request SHA-256 must contain 64 characters")
         object.__setattr__(self, "arm", validate_arm_side(self.arm))
+        if not isinstance(self.selected_destination_index, int):
+            raise TypeError("selected destination index must be an integer")
+        if self.selected_destination_index < 0:
+            raise ValueError("selected destination index must be non-negative")
         for name in ("source_task", "destination_task"):
             value = getattr(self, name)
             if not isinstance(value, TabletopTaskPlan):
@@ -1055,6 +1063,7 @@ class TabletopPickPlacePlan:
             "request_sha256": self.request_sha256,
             "arm": self.arm,
             "selected_candidate_id": self.selected_candidate_id,
+            "selected_destination_index": self.selected_destination_index,
             "source_task": self.source_task.to_dict(),
             "destination_task": self.destination_task.to_dict(),
             "trajectories": [value.to_dict() for value in self.trajectories],

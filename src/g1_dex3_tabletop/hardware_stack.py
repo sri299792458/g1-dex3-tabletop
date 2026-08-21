@@ -81,6 +81,7 @@ from g1_dex3_tabletop.planning.dex3_handedness import (
 )
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
 from g1_dex3_tabletop.stack_workflow import (
+    DIRECT_STACK_YAW_QUARTER_TURNS,
     build_direct_stack_request,
     request_base_T_camera,
     request_hand_positions,
@@ -169,6 +170,17 @@ def _observe_pair(
         snapshot=snapshot,
         minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
         maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
+        first_label="secondary cube (tag IDs 20-25)",
+        second_label="primary cube (tag IDs 10-15)",
+    )
+
+
+def _clearance_perception_rejection(driver, error: Exception) -> TabletopTaskRejected:
+    """Classify perception as recoverable only while robot control remains healthy."""
+
+    driver.check()
+    return TabletopTaskRejected(
+        "post-clearance cube observation failed before task planning: " + str(error)
     )
 
 
@@ -348,6 +360,8 @@ def _plan_pick_place(
     plan = TabletopPickPlacePlan.from_json(plan_path)
     if plan.request_sha256 != request.content_sha256:
         raise RuntimeError("pick-place plan belongs to another request")
+    if plan.selected_destination_index >= len(request.source_T_destination_objects):
+        raise RuntimeError("pick-place plan selected a destination outside its goal set")
     return plan
 
 
@@ -355,80 +369,60 @@ def _find_direct_stack_plan(
     *,
     planner,
     driver,
-    options: tuple[tuple[dict[str, object], TabletopPickPlaceRequest], ...],
+    metadata: dict[str, object],
+    request: TabletopPickPlaceRequest,
     directory: Path,
 ):
-    """Return the first complete direct cube-on-cube plan."""
+    """Plan one direct cube-on-cube task with a CuRobo yaw goal set."""
 
     attempts: list[dict[str, object]] = []
-    endpoint_viable: list[
-        tuple[
-            dict[str, object],
-            TabletopPickPlaceRequest,
-            Path,
-            dict[str, object],
-        ]
-    ] = []
-    for metadata, request in options:
-        option_directory = (
-            directory
-            / f"move_{metadata['moving_cube']}_with_{metadata['arm']}_arm"
-            / f"yaw_quarter_turns_{metadata['yaw_quarter_turns']}"
+    option_directory = directory / f"move_{metadata['moving_cube']}_with_{metadata['arm']}_arm"
+    option_directory.mkdir(parents=True, exist_ok=True)
+    request_path = option_directory / "request.json"
+    request.write_json(request_path)
+    attempt = dict(metadata)
+    try:
+        event = planner.request_payload(
+            "analyze-pick-place-endpoints",
+            payload={"request": str(request_path.resolve())},
+            control_check=driver.check,
+            timeout_s=60.0,
         )
-        option_directory.mkdir(parents=True, exist_ok=True)
-        request_path = option_directory / "request.json"
-        request.write_json(request_path)
-        attempt = dict(metadata)
-        try:
-            event = planner.request_payload(
-                "analyze-pick-place-endpoints",
-                payload={"request": str(request_path.resolve())},
-                control_check=driver.check,
-                timeout_s=60.0,
-            )
-            endpoint = event["payload"]
-            if endpoint.get("request_sha256") != request.content_sha256:
-                raise RuntimeError("endpoint analysis belongs to another request")
-            atomic_write_json(option_directory / "endpoint_feasibility.json", endpoint)
-        except (PlannerRequestRejected, RuntimeError, ValueError) as error:
-            driver.check()
-            attempt.update({"passed": False, "reason": str(error)})
-            attempts.append(attempt)
-            continue
+        endpoint = event["payload"]
+        if endpoint.get("request_sha256") != request.content_sha256:
+            raise RuntimeError("endpoint analysis belongs to another request")
+        atomic_write_json(option_directory / "endpoint_feasibility.json", endpoint)
         attempt["endpoint_feasibility"] = endpoint
         if int(endpoint["common_candidate_count"]) == 0:
-            attempt.update(
-                {
-                    "passed": False,
-                    "reason": "no common strict endpoint-valid grasp candidate",
-                }
-            )
-            attempts.append(attempt)
-            continue
-        attempts.append(attempt)
-        endpoint_viable.append((metadata, request, option_directory, attempt))
-
-    for metadata, request, option_directory, attempt in endpoint_viable:
-        try:
-            plan = _plan_pick_place(
-                planner,
-                request=request,
-                directory=option_directory,
-                driver=driver,
-            )
-        except (PlannerRequestRejected, RuntimeError, ValueError) as error:
-            driver.check()
-            attempt.update({"passed": False, "reason": str(error)})
-            continue
-        attempt.update(
-            {
-                "passed": True,
-                "request_sha256": request.content_sha256,
-                "plan_sha256": plan.content_sha256,
-            }
+            raise RuntimeError("no common strict endpoint-valid grasp candidate")
+        plan = _plan_pick_place(
+            planner,
+            request=request,
+            directory=option_directory,
+            driver=driver,
         )
-        return (metadata, request, plan, option_directory), attempts
-    return None, attempts
+    except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+        driver.check()
+        attempt.update({"passed": False, "reason": str(error)})
+        attempts.append(attempt)
+        return None, attempts
+    attempt.update(
+        {
+            "passed": True,
+            "request_sha256": request.content_sha256,
+            "plan_sha256": plan.content_sha256,
+            "selected_destination_index": plan.selected_destination_index,
+        }
+    )
+    attempts.append(attempt)
+    selected_metadata = {
+        **metadata,
+        "selected_destination_index": plan.selected_destination_index,
+        "selected_yaw_quarter_turns": DIRECT_STACK_YAW_QUARTER_TURNS[
+            plan.selected_destination_index
+        ],
+    }
+    return (selected_metadata, request, plan, option_directory), attempts
 
 
 def _execute_pick_place(
@@ -1067,14 +1061,17 @@ def run_stack(args) -> int:
                 "right_measured_q_rad": measured_open_right.tolist(),
             },
         )
-        frame_sets["active_clearance"] = _collect_frames(
-            rclpy,
-            node,
-            camera,
-            count=args.observation_frames,
-            timeout_s=10.0,
-            control_check=driver.check,
-        )
+        try:
+            frame_sets["active_clearance"] = _collect_frames(
+                rclpy,
+                node,
+                camera,
+                count=args.observation_frames,
+                timeout_s=10.0,
+                control_check=driver.check,
+            )
+        except (RuntimeError, ValueError) as error:
+            raise _clearance_perception_rejection(driver, error) from error
         clearance_state = synchronized.observe_state()
         clearance_hands = dex_controller.observer.observe()
         clearance_snapshot = _active_clearance_snapshot(
@@ -1084,21 +1081,24 @@ def run_stack(args) -> int:
             escape=active_escape,
             inactive_command_q_rad=inactive_command_q_rad,
         )
-        clearance_upper, clearance_bottom = _observe_pair(
-            frame_sets["active_clearance"],
-            expected_camera=expected_camera,
-            upper_detector=upper_detector,
-            bottom_detector=bottom_detector,
-            snapshot=clearance_snapshot,
-            quality=quality,
-        )
+        try:
+            clearance_upper, clearance_bottom = _observe_pair(
+                frame_sets["active_clearance"],
+                expected_camera=expected_camera,
+                upper_detector=upper_detector,
+                bottom_detector=bottom_detector,
+                snapshot=clearance_snapshot,
+                quality=quality,
+            )
+        except ValueError as error:
+            raise _clearance_perception_rejection(driver, error) from error
 
-        def direct_options(
+        def direct_request(
             observed_upper: TabletopObservation,
             observed_bottom: TabletopObservation,
             *,
             excluded_candidate_ids: tuple[str, ...] = (),
-        ) -> tuple[tuple[dict[str, object], TabletopPickPlaceRequest], ...]:
+        ) -> tuple[dict[str, object], TabletopPickPlaceRequest]:
             reference = build_request(selected_arm, observed_upper, upper_profile)
             current_base_T_camera = request_base_T_camera(reference, model)
             left_hand, right_hand = request_hand_positions(reference, model)
@@ -1118,33 +1118,30 @@ def run_stack(args) -> int:
                 np.linalg.norm(hand_positions[selected_arm] - cube_positions[moving_cube])
             )
             moving_request = build_request(selected_arm, moving_observation, moving_profile)
-            options = []
-            for yaw_quarter_turns in (0, 1, 3, 2):
-                options.append(
-                    (
-                        {
-                            "moving_cube": moving_cube,
-                            "support_cube": support_cube,
-                            "arm": selected_arm,
-                            "source_hand_distance_m": distance,
-                            "yaw_quarter_turns": yaw_quarter_turns,
-                            "yaw_is_nominal_only": True,
-                        },
-                        build_direct_stack_request(
-                            moving_request=moving_request,
-                            support_cube=support_observation,
-                            base_T_camera=current_base_T_camera,
-                            yaw_quarter_turns=yaw_quarter_turns,
-                            excluded_candidate_ids=excluded_candidate_ids,
-                        ),
-                    )
-                )
-            return tuple(options)
+            return (
+                {
+                    "moving_cube": moving_cube,
+                    "support_cube": support_cube,
+                    "arm": selected_arm,
+                    "source_hand_distance_m": distance,
+                    "yaw_goalset_quarter_turns": list(DIRECT_STACK_YAW_QUARTER_TURNS),
+                    "yaw_selected_by": "curobo_goalset",
+                    "yaw_is_nominal_only": True,
+                },
+                build_direct_stack_request(
+                    moving_request=moving_request,
+                    support_cube=support_observation,
+                    base_T_camera=current_base_T_camera,
+                    excluded_candidate_ids=excluded_candidate_ids,
+                ),
+            )
 
+        stack_metadata, stack_request = direct_request(clearance_upper, clearance_bottom)
         selected, search_results = _find_direct_stack_plan(
             planner=planner,
             driver=driver,
-            options=direct_options(clearance_upper, clearance_bottom),
+            metadata=stack_metadata,
+            request=stack_request,
             directory=run_directory / "feasibility_search",
         )
         atomic_write_json(
@@ -1160,11 +1157,14 @@ def run_stack(args) -> int:
                 "no complete plan"
             )
         selected_metadata, stack_request, stack_plan, selected_dir = selected
+        selected_yaw_quarter_turns = DIRECT_STACK_YAW_QUARTER_TURNS[
+            stack_plan.selected_destination_index
+        ]
         print(
             "DIRECT STACK PLAN SELECTED — "
             f"{selected_arm} arm picks the {moving_cube} cube and places it directly "
-            f"on the {selected_metadata['support_cube']} cube; nominal yaw quarter-turns="
-            f"{selected_metadata['yaw_quarter_turns']}",
+            f"on the {selected_metadata['support_cube']} cube; CuRobo selected nominal "
+            f"yaw quarter-turns={selected_yaw_quarter_turns}",
             flush=True,
         )
         failed_candidates: list[str] = []
@@ -1239,14 +1239,16 @@ def run_stack(args) -> int:
                         snapshot=retry_snapshot,
                         quality=quality,
                     )
+                    retry_metadata, retry_request = direct_request(
+                        retry_upper,
+                        retry_bottom,
+                        excluded_candidate_ids=tuple(failed_candidates),
+                    )
                     retry_selected, retry_search = _find_direct_stack_plan(
                         planner=planner,
                         driver=driver,
-                        options=direct_options(
-                            retry_upper,
-                            retry_bottom,
-                            excluded_candidate_ids=tuple(failed_candidates),
-                        ),
+                        metadata=retry_metadata,
+                        request=retry_request,
                         directory=(run_directory / "retries" / f"attempt_{task_attempt:02d}"),
                     )
                     atomic_write_json(
