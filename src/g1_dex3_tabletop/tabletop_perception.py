@@ -168,8 +168,8 @@ def observe_resting_cube_pair(
     images_bgr: Sequence[np.ndarray],
     *,
     camera_info: RectifiedCameraInfo,
-    cube40_detector: CorrespondenceDetector,
-    cube60_detector: CorrespondenceDetector,
+    first_detector: CorrespondenceDetector,
+    second_detector: CorrespondenceDetector,
     snapshot: RobotSnapshot,
     minimum_frames: int = 3,
     maximum_translation_spread_mm: float = 5.0,
@@ -183,7 +183,7 @@ def observe_resting_cube_pair(
         observe_resting_cube(
             images_bgr,
             camera_info=camera_info,
-            detector=cube40_detector,
+            detector=first_detector,
             snapshot=snapshot,
             minimum_frames=minimum_frames,
             maximum_translation_spread_mm=maximum_translation_spread_mm,
@@ -196,7 +196,7 @@ def observe_resting_cube_pair(
         observe_resting_cube(
             images_bgr,
             camera_info=camera_info,
-            detector=cube60_detector,
+            detector=second_detector,
             snapshot=snapshot,
             minimum_frames=minimum_frames,
             maximum_translation_spread_mm=maximum_translation_spread_mm,
@@ -227,12 +227,12 @@ def observe_resting_cube_pair(
     return (
         observe_resting_cube(
             paired_images,
-            detector=cube40_detector,
+            detector=first_detector,
             **arguments,
         ),
         observe_resting_cube(
             paired_images,
-            detector=cube60_detector,
+            detector=second_detector,
             **arguments,
         ),
     )

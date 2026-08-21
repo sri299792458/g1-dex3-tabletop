@@ -60,6 +60,7 @@ def build_tabletop_request(
     task_config_path: str | Path,
     object_dimensions_m: tuple[float, float, float],
     maximum_arm_velocity_rad_s: float | None = None,
+    pregrasp_distance_m: float | None = None,
     presentation_id: str = "direct",
     fixture: TabletopFixture | None = None,
     environment_cuboids: tuple[TabletopCuboid, ...] = (),
@@ -80,6 +81,18 @@ def build_tabletop_request(
         configured_velocity
         if maximum_arm_velocity_rad_s is None
         else float(maximum_arm_velocity_rad_s)
+    )
+    shortlist_document = yaml.safe_load(shortlist.read_text(encoding="utf-8"))
+    try:
+        configured_pregrasp_distance = float(
+            shortlist_document["execution_contract"]["approach_distance_m"]
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("grasp shortlist lacks a valid approach distance") from error
+    selected_pregrasp_distance = (
+        configured_pregrasp_distance
+        if pregrasp_distance_m is None
+        else float(pregrasp_distance_m)
     )
     return TabletopTaskRequest(
         observation=observation,
@@ -103,6 +116,7 @@ def build_tabletop_request(
         retention_test_lift_m=float(task["motion"]["retention_test_lift_m"]),
         lift_m=float(task["motion"]["payload_lift_m"]),
         maximum_arm_velocity_rad_s=selected_velocity,
+        pregrasp_distance_m=selected_pregrasp_distance,
     )
 
 

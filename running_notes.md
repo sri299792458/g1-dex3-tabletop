@@ -4835,3 +4835,297 @@ Primary references:
 - Verification passed Ruff and `418 passed, 7 skipped` in the control
   environment; the CUDA planner environment passed `418 passed, 1 skipped`.
   No robot command was sent.
+
+## 2026-08-20 — MPC handoffs now perform the documented live remeasurement
+
+- Review of physical run `tabletop_20260820T235231Z` found a concrete mismatch
+  between the August 19 controller decision and production. The run installed
+  seven windows and rejected 197; after early transients, its recorded
+  `command_tracking_offset_rad` remained byte-for-byte constant even though a
+  fresh LowState sample was collected for every request.
+- The live state was used for camera/body synchronization, but
+  `prepare_streaming_handoff()` obtained both the next command and the next
+  predicted position from the previously active window. The planner therefore
+  calculated `command - predicted` from two old-window samples. It did not
+  remeasure `active command - actual measured position` as the notes claimed.
+- The executor now atomically pairs one fresh arm state with the exact active
+  arm command on every replacement request. The already-certified future
+  command splice remains unchanged. Its predicted physical position is
+  reanchored with the newly measured offset before CuRobo plans the replacement
+  window.
+- Replacement installation now receives the exact frozen handoff object and
+  verifies its predecessor hash, absolute time, command, reanchored predicted
+  position, velocity, and acceleration. This permits the predicted physical
+  state to be corrected while retaining a mathematically continuous command
+  stream. It does not add a torque controller, change PD/gravity feedforward,
+  alter any collision margin, or return to one-step MPC.
+- A focused regression proves that a newly observed `+0.010 rad` tracking
+  offset keeps an immutable `0.016 rad` future command while reanchoring the
+  predicted physical handoff from `0.016` to `0.006 rad`; a stale worker result
+  is rejected, and the correctly reanchored replacement installs at the exact
+  command boundary.
+- Verification passed Ruff and `419 passed, 7 skipped` in the control
+  environment; the CUDA planner environment passed `419 passed, 1 skipped`.
+  The 60 mm print artifact was generated separately with `DICT_4X4_100` IDs
+  20--25 and geometry identical to the existing commissioned 60 mm R3 cube.
+  No robot command was sent.
+
+## 2026-08-21 — Offset-aware table tightening was tested and rejected
+
+- Physical run `tabletop_20260821T100244Z` used the live-remeasured handoff
+  implementation. That fix worked: 191 distinct tracking offsets appeared
+  across 194 results, and the final measured arm error was only `0.0012 rad`.
+  The run nevertheless accepted only four windows; all 190 rejections were the
+  desired-command hand path falling below the unchanged `5.000 mm` table gate.
+- A bounded command-free experiment raised only CuRobo's internal table proxy
+  by the geometric clearance loss caused by the live command-minus-measured
+  offset. The real plane and both strict post-checks stayed unchanged. A replay
+  of all 194 retained targets and offset samples then made all 194 generated
+  windows strict-valid and advanced the frozen route from index 14 to 38.
+- The experiment also proved why it cannot finish this grasp. At the final live
+  Cartesian goal, the predicted physical configuration has `7.074 mm` table
+  clearance, but adding the measured command offset puts the desired-command
+  configuration at `-1.588 mm`. Meeting the `5.000 mm` desired-command rule
+  therefore needs `6.588 mm` of displacement away from the exact goal. The
+  offset-aware replay converged `6.270 mm` from the goal, outside the unchanged
+  `5.000 mm` terminal tolerance, and never became terminal.
+- This is a geometric incompatibility at the endpoint, not another route-search
+  or scheduling failure. The table-tightening experiment was removed rather
+  than committed as a production workaround. The independent live-handoff fix
+  remains valid. Do not retry the same MPC/table-padding strategy physically;
+  use the commissioned boundary-replanning workflow, or separately change the
+  grasp/control assumptions so the goal itself has a safe desired-command
+  configuration.
+- Command-free evidence is retained at
+  `work/mpc_replay_20260821T100244Z_robust_sequence.json`. No robot command was
+  sent during the experiment.
+
+## 2026-08-21 — Two-60-mm stacking and bounded physical grasp retry
+
+- The fixed stack coordinator now uses the two physically distinct 60 mm R3
+  cubes. The lower-cube profile keeps `DICT_4X4_100` IDs 10--15. A second
+  hash-bound profile uses the newly printed cube's IDs 20--25 and shares the
+  same commissioned bilateral 60 mm grasp shortlist because its geometry is
+  identical.
+- This remains one explicit operation, not a task graph: move the original
+  60 mm cube to a feasible point on the observed table segment, reobserve both
+  cubes, then place the second 60 mm cube on the first. Both centers are 30 mm
+  above the table, the stacked upper center is 60 mm above the lower center,
+  and equal 60 mm footprint radii are used when proposing non-overlapping
+  lower-cube destinations.
+- A physical grasp rejection is now a typed, recoverable result only after the
+  existing code has opened the active Dex3 hand and followed the frozen retreat
+  and return-to-clearance trajectories. With the default `--grasp-retries 1`,
+  the coordinator then captures fresh synchronized images and robot state,
+  redetects both cubes, excludes the failed grasp candidate, and runs the same
+  complete CuRobo pick/place planner again. It never repeats a stale route.
+- Stage-one retry recomputes both the lower placement and the nominal upper
+  placement proof from the new scene. Stage-two retry uses the reobserved upper
+  and lower cube poses directly. If the fresh scene cannot be detected or
+  planned, or the one retry is also physically rejected, the task returns both
+  arms through their supported routes and restores seated control.
+- Planner, controller, transport, DDS, camera, and watchdog faults are not
+  retries. They retain the established fail-closed handling. Retry count,
+  excluded candidate IDs, each reason, recovery completion, requests, plans,
+  images, and MCAP remain recorded in the run directory.
+- Verification passed Ruff and `421 passed, 7 skipped` in the control
+  environment; the CUDA planner environment passed `421 passed, 1 skipped`.
+  No robot command was sent while implementing or testing this change.
+
+## 2026-08-21 — Stack planner startup moved entirely before ownership
+
+- Review found that the single-cube path launched its isolated CUDA worker at
+  command start and warmed reusable MotionGen models during the read-only
+  preview, but the new stack path synchronously waited for only basic CUDA
+  readiness after camera preflight. This was an implementation-parity gap, not
+  an unavoidable two-cube planning cost.
+- `run-stack` now launches the same persistent worker before ROS/camera
+  preflight. Once both cubes are detected, one aggregate command warms the
+  left and right open-hand and attached-60-mm-cube planner topologies inside
+  the same CUDA context while the operator preview remains active. Pressing
+  Space cannot create a robot publisher until that warmup has completed.
+- The aggregate request is intentionally sequential inside one GPU worker.
+  Running two planner processes would duplicate the G1/Dex3 models and GPU
+  memory; the useful concurrency is between CUDA work and the independent
+  camera/operator preflight.
+- No executable route is accepted from preflight data. Supported escapes,
+  cube observations at clearance, and complete task feasibility remain bound
+  to the live post-ownership state. The additional single-cube trajectory
+  mode pregrasp state-correction replan was deliberately not added to the
+  stack path in this change.
+- The real RTX 5090 command-free probe warmed all four retained planner roles
+  in `18.28 s`; the exact asynchronous worker-protocol repetition took
+  `13.98 s`. Both completed within the 24 GB GPU and reported
+  `robot_command_authorized=false`. Verification passed Ruff,
+  `422 passed, 7 skipped` in the control environment, and
+  `422 passed, 1 skipped` in the planner environment. No robot command was
+  sent while implementing or testing this lifecycle change.
+
+## 2026-08-21 — First stack run exposed a measured/command boundary regression
+
+- Physical run `stack_20260821T112912Z` completed the left supported escape,
+  then stopped before any right-arm motion with `trajectory start differs from
+  the current command by 0.020277314rad`. Cleanup completed without a reported
+  error and the MCAP was retained.
+- The new dual-arm coordinator had planned the right supported escape from the
+  measured right-arm LowState after the left arm moved. The controller was
+  correctly still holding the exact right-arm command installed at the loaded
+  boundary. The right elbow measurement was `-0.020277314rad` from that held
+  command; CuRobo's first right-arm sample matched the measurement exactly and
+  therefore violated the executor's command-continuity invariant.
+- This was specific to the newly added left-to-right arm switch. The existing
+  single-cube trajectory path never changes selected arms and already replaces
+  measured active-arm joints with the exact command at every planning
+  boundary.
+- The stack now constructs every dual-arm planning snapshot from both exact
+  held commands while retaining the synchronized measured body and Dex3
+  state. The corrected retained right-arm request passed real CuRobo supported
+  escape planning with `0.000000000rad` start-to-held-command error. A focused
+  regression fixes the observed `0.020277314rad` right-elbow offset in the
+  measured state and proves it cannot enter the command-bound planning
+  snapshot.
+- No robot command was sent while diagnosing, correcting, or replaying this
+  failure.
+
+## 2026-08-21 — Stack feasibility search no longer performs blind nested route planning
+
+- Physical run `stack_20260821T120104Z` reached both supported clearances and
+  opened both hands, then spent about 8 minutes 40 seconds in planning before
+  the operator interrupted it. The worker tried four lower-cube placement
+  samples, planned a complete lower-cube transfer for each, and then attempted
+  hundreds of upper-cube source/destination IK branches. The retained log has
+  208 `trying next source/destination grasp` messages and 327 explicit branch
+  attempts. This was wrapper-level exhaustive search, not one slow CuRobo
+  solve.
+- The dominant structural error was that source and destination batched IK
+  results were available internally but route planning began before comparing
+  them. A placement could therefore spend minutes proving individual source
+  and destination routes even when no identical object-to-hand grasp was valid
+  at both endpoints.
+- The existing fixed-close GPU pruning, batched CuRobo IK, and strict full-robot
+  endpoint collision check are now exposed as a route-free feasibility pass.
+  Pick/place planning intersects source and destination candidate IDs first. If
+  that set is empty, no MotionGen route or attached-payload transfer is tried.
+  If it is nonempty, only those common IDs enter complete lifecycle planning,
+  with the restrictive destination checked before the source and transfer.
+- The stack coordinator now checks the upper-on-lower stage before planning the
+  lower-cube move. An infeasible stack target can no longer cause a redundant
+  complete lower-cube solve for every placement sample.
+- Command-free replay of the exact retained `segment_05_of_05` upper-stage
+  request changed failure time from `91.64 s` to `11.30 s` in a fresh worker.
+  It reported the actual result directly: source and destination each had
+  endpoint-valid grasps, but their common set was `0/57`. The other retained
+  placement samples failed the same endpoint intersection in `8.37--12.21 s`.
+  Synthetic opposite-arm replays also produced `0/57` common endpoint-valid
+  grasps for all five samples. These are one-shot process timings; the hardware
+  path retains one warmed worker and planner pool. Replaying through that exact
+  persistent lifecycle took `15.14 s` for the pre-Space dual-arm warmup, then
+  `5.41 s` for the first placement and `2.12--2.25 s` for each subsequent
+  placement. Thus the four samples that consumed roughly 8 minutes in the
+  physical run now produce the same rejection in about 12 seconds after
+  ownership.
+- A command-free experiment preserving the upper cube's yaw produced a small
+  common endpoint set at two samples, but every resulting route still failed
+  the unchanged table/approach checks. That unproven geometry change was not
+  added to production.
+- The interrupted run's raw MCAP flushed cleanly and remains at approximately
+  30.6 GB under the run directory. It was not deleted. No robot command was
+  sent during diagnosis, implementation, or replay.
+- Verification passed Ruff and `424 passed, 7 skipped` in the control
+  environment.
+
+## 2026-08-21 — Stack task reduced to one direct pick/place
+
+- The original two-stage operation was removed. It needlessly moved one cube
+  to a new table location before picking the other cube, doubling physical
+  execution and multiplying placement and arm-assignment searches.
+- `run-stack` now observes the two uniquely tagged 60 mm cubes, considers each
+  cube with its nearest arm, and selects one complete transfer that places the
+  moving cube directly on the stationary cube. There is no preliminary cube
+  relocation, midpoint, generic task graph, or second pick.
+- The stationary cube is a finite obstacle during source pickup and the same
+  finite object becomes the destination placement support. The real table
+  plane remains bound to the original on-table observation.
+- Four upright quarter-turns may be evaluated as nominal wrist-path choices.
+  This does not assert that Dex3 preserves the cube's yaw. Some in-hand cube
+  rotation is physically unavoidable; the task objective is therefore the
+  moving cube's nominal center over the observed support-cube center, not an
+  exact final cube orientation. No post-grasp visual observation is fabricated
+  while the cube is occluded.
+- Every option receives the route-free source/destination endpoint
+  intersection first. Only endpoint-compatible options can enter the existing
+  complete single-cube pick/place planner and the existing execution/retry
+  path. A physical grasp retry keeps the same moving cube and arm, reobserves
+  both cubes, and excludes the failed grasp candidate.
+- Obsolete two-stage geometry and tests were deleted. Verification passed Ruff,
+  `422 passed, 7 skipped` in the control environment, and `422 passed,
+  1 skipped` in the CUDA planner environment. No robot command was sent.
+
+## 2026-08-21 — Direct stack now uses the commissioned one-arm lifecycle
+
+- Review of retained run `stack_20260821T130046Z` found that the simplified
+  one-pick task still inherited the old coordinator's two-arm preparation: it
+  lifted both supported arms and opened both hands before choosing the mover.
+  That placed the unused hand at transfer height and created the dominant
+  hand-to-hand planning collisions. This behavior was absent from the proven
+  single-cube workflow.
+- `run-stack` now chooses the globally nearest cube/arm pair during read-only
+  preflight, warms only that arm, executes only that supported escape, opens
+  only that hand, and returns only that arm. The unused arm and Dex3 remain at
+  their exact supported initial commands throughout the task and retry path.
+- The first attempted run after this refactor stopped before ownership because
+  the selected-arm pose set was paired with the original left-arm activation
+  gate. The post-preflight ownership gate is now rebound to the selected arm,
+  preserving the required pose-set/activation-arm equality. No command was
+  published during the rejected attempt.
+- The next run, `stack_20260821T132754Z`, selected the primary cube with the
+  right arm, completed the right supported escape, opened the right hand, and
+  found a complete nine-phase pick/place plan. Execution then stopped before
+  the pregrasp because the physically measured empty-close reference used by
+  grasp validation had only been commissioned for the left Dex3. Cleanup and
+  the 5.36 GB MCAP completed without a reported error. This is a real missing
+  right-hand commissioning prerequisite, not a CuRobo failure.
+- Empty-close availability is now checked during read-only preflight, before
+  SPACE, ownership, or arm motion. The stack release/recovery helper was also
+  corrected to open only the selected hand and retain the unused hand at its
+  measured supported posture.
+- The right empty-hand close was then physically commissioned with the
+  standalone finger-only command. A read-only stationary state snapshot
+  recorded `[-0.04185495, -0.58644527, -0.97625828, 0.87804961,
+  0.98250055, 0.87173128, 0.98171157] rad`; maximum velocity was zero and the
+  maximum descriptor-target residual was `0.041855 rad`. Both hands now have
+  explicit measured empty-close references; no mirrored or nominal value was
+  substituted.
+- The shared direct-table 60 mm grasp shortlist now uses a `50 mm` pregrasp
+  approach instead of `100 mm`. This applies identically to both uniquely
+  tagged 60 mm profiles and therefore to standalone 60 mm pickup and direct
+  stacking; the 40 mm profile remains at `50 mm`. Runtime CuRobo still plans
+  and validates the complete approach and exact reverse at the selected
+  distance.
+- An active-only replay removed the retained hand-to-hand failures but exposed
+  a second mismatch: the attached-transfer optimizer's whole-robot table
+  cuboid collided with the deliberately table-supported unused hand. The
+  transfer now retains full-robot self-collision and the finite support cube,
+  while the existing independent plane check enforces clearance for every
+  moving-hand and attached-payload sample.
+- The exact retained right-arm/primary-cube yaw-0 request now produces a full
+  nine-phase CuRobo plan. The transfer kept `support_cube` as its only world
+  cuboid, planned in `0.355 s`, and passed with `104.49 mm` moving-hand and
+  `90.33 mm` payload table-plane clearance. Ruff and the control suite passed
+  with `425 passed, 7 skipped`. No robot command was sent.
+
+## 2026-08-21 — Pregrasp distance is an explicit run contract
+
+- Both uniquely tagged direct-table 60 mm profiles share one grasp shortlist
+  whose default pregrasp distance is now `0.050 m`.
+- `run-tabletop` and `run-stack` both expose `--pregrasp-distance-m`. Omitting
+  it resolves the object shortlist's default; supplying it records that exact
+  positive finite value in every hash-bound `TabletopTaskRequest`.
+- CuRobo uses the request value to construct every pregrasp target. The
+  existing full IK, collision, table-clearance, approach, and exact-reverse
+  validation remains unchanged. Fixture shortlists still reject distances not
+  included in their qualified approach set.
+- The reverted same-frame Dex3 dorsal-marker pregrasp dependency remains
+  absent. Verification passed Ruff, `427 passed, 7 skipped` in the control
+  environment, and `427 passed, 1 skipped` in the planner environment. No
+  robot command was sent.

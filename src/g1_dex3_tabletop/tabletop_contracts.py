@@ -444,6 +444,7 @@ class TabletopTaskRequest:
     retention_test_lift_m: float = 0.030
     lift_m: float = 0.100
     maximum_arm_velocity_rad_s: float = 0.200
+    pregrasp_distance_m: float | None = None
     random_seed: int = 17
     schema_version: int = PLANNER_SCHEMA_VERSION
     operation: str = "plan_tabletop_pick_lift_replace"
@@ -544,6 +545,11 @@ class TabletopTaskRequest:
         ):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive and finite")
+        if self.pregrasp_distance_m is not None:
+            value = float(self.pregrasp_distance_m)
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError("pregrasp_distance_m must be positive and finite")
+            object.__setattr__(self, "pregrasp_distance_m", value)
         if self.retention_test_lift_m >= self.lift_m:
             raise ValueError("retention test lift must be smaller than the complete payload lift")
         for name in ("calibration_bundle_sha256", "grasp_shortlist_sha256"):
@@ -603,6 +609,7 @@ class TabletopTaskRequest:
             "retention_test_lift_m": self.retention_test_lift_m,
             "lift_m": self.lift_m,
             "maximum_arm_velocity_rad_s": self.maximum_arm_velocity_rad_s,
+            "pregrasp_distance_m": self.pregrasp_distance_m,
             "random_seed": self.random_seed,
         }
         if self.estimated_planning_state is not None:
@@ -829,7 +836,9 @@ class MovingGraspContinuationRequest:
             raise ValueError("executed MPC approach does not end at its terminal command")
         if len(self.terminal_mpc_window_sha256) != 64:
             raise ValueError("terminal MPC window SHA-256 must contain 64 characters")
-        provenance = json.loads(json.dumps(self.target_provenance, sort_keys=True, allow_nan=False))
+        provenance = json.loads(
+            json.dumps(self.target_provenance, sort_keys=True, allow_nan=False)
+        )
         if not isinstance(provenance, dict):
             raise TypeError("moving-grasp target provenance must be a JSON object")
         object.__setattr__(self, "target_provenance", provenance)
@@ -898,6 +907,7 @@ class TabletopPickPlaceRequest:
     source_request: TabletopTaskRequest
     source_T_destination_object: tuple[tuple[float, ...], ...]
     destination_support_object_id: str | None = None
+    excluded_candidate_ids: tuple[str, ...] = ()
     schema_version: int = PLANNER_SCHEMA_VERSION
     operation: str = "plan_tabletop_pick_place"
 
@@ -931,6 +941,12 @@ class TabletopPickPlaceRequest:
             if support not in environment_ids:
                 raise ValueError("destination support is absent from the source world")
             object.__setattr__(self, "destination_support_object_id", support)
+        excluded = tuple(str(value).strip() for value in self.excluded_candidate_ids)
+        if any(not value for value in excluded):
+            raise ValueError("excluded grasp candidate IDs must be non-empty")
+        if len(excluded) != len(set(excluded)):
+            raise ValueError("excluded grasp candidate IDs must be unique")
+        object.__setattr__(self, "excluded_candidate_ids", excluded)
 
     @property
     def content_sha256(self) -> str:
@@ -943,6 +959,7 @@ class TabletopPickPlaceRequest:
             "source_request": self.source_request.to_dict(),
             "source_T_destination_object": [list(row) for row in self.source_T_destination_object],
             "destination_support_object_id": self.destination_support_object_id,
+            "excluded_candidate_ids": list(self.excluded_candidate_ids),
         }
         if include_hash:
             result["content_sha256"] = self.content_sha256

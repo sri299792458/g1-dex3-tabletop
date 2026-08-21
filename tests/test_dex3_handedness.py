@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from g1_dex3_tabletop.planning.dex3_handedness import (
     dex3_empty_close_reference,
     dex3_execution_profile,
@@ -50,8 +48,9 @@ def test_execution_profile_has_one_fixed_close_target_mirrored_to_each_hand() ->
     )
 
 
-def test_left_empty_close_reference_is_commissioned_but_right_is_not() -> None:
+def test_both_empty_close_references_are_physically_commissioned() -> None:
     left, threshold = dex3_empty_close_reference("left")
+    right, right_threshold = dex3_empty_close_reference("right")
 
     assert left == (
         -0.02220277674496174,
@@ -63,6 +62,13 @@ def test_left_empty_close_reference_is_commissioned_but_right_is_not() -> None:
         -0.9728087186813354,
     )
     assert threshold == 0.05
-
-    with pytest.raises(RuntimeError, match="not commissioned for right"):
-        dex3_empty_close_reference("right")
+    assert right == (
+        -0.04185494780540466,
+        -0.5864452719688416,
+        -0.9762582778930664,
+        0.8780496120452881,
+        0.9825005531311035,
+        0.8717312812805176,
+        0.9817115664482117,
+    )
+    assert right_threshold == threshold

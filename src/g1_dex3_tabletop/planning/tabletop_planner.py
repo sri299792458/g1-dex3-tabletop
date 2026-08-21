@@ -85,6 +85,36 @@ class _PregraspBranch:
 
 
 @dataclass(frozen=True, slots=True)
+class _EndpointFeasibility:
+    """Strict batched endpoint results without any route planning."""
+
+    candidate_branch_counts: dict[str, int]
+    fixed_close_viable_candidate_count: int
+    rejections: tuple[dict[str, Any], ...]
+    elapsed_s: float
+
+    @property
+    def viable_candidate_ids(self) -> set[str]:
+        return {
+            candidate_id
+            for candidate_id, count in self.candidate_branch_counts.items()
+            if count > 0
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _PickPlaceEndpointAnalysis:
+    candidate_ids: tuple[str, ...]
+    source: _EndpointFeasibility
+    destination: _EndpointFeasibility
+
+    @property
+    def common_candidate_ids(self) -> tuple[str, ...]:
+        common = self.source.viable_candidate_ids & self.destination.viable_candidate_ids
+        return tuple(value for value in self.candidate_ids if value in common)
+
+
+@dataclass(frozen=True, slots=True)
 class _OpenBranchPlan:
     approach: PlannedTrajectory
     grasp: PlannedTrajectory
@@ -499,6 +529,14 @@ def _split_lift_trajectory(
     return test_lift, payload_lift
 
 
+def _request_pregrasp_distance_m(
+    request: TabletopTaskRequest,
+    shortlist: dict[str, Any],
+) -> float:
+    configured = float(shortlist["execution_contract"]["approach_distance_m"])
+    return configured if request.pregrasp_distance_m is None else request.pregrasp_distance_m
+
+
 def _load_shortlist(request: TabletopTaskRequest) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     path = (ROOT / request.grasp_shortlist_path).resolve()
     if not path.is_relative_to(ROOT):
@@ -569,7 +607,7 @@ def _load_shortlist(request: TabletopTaskRequest) -> tuple[dict[str, Any], list[
     candidates = list(document.get("candidates", ()))
     if not candidates or len(candidates) != int(document.get("candidate_count", -1)):
         raise ValueError("qualified cube shortlist candidate count is invalid")
-    approach_distance_m = float(document["execution_contract"]["approach_distance_m"])
+    approach_distance_m = _request_pregrasp_distance_m(request, document)
     if request.fixture is None:
         contract = document["execution_contract"]
         if (
@@ -3294,32 +3332,23 @@ def _attached_transfer_scene(
     request: TabletopPickPlaceRequest,
     base_T_torso: np.ndarray,
 ) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
-    """Build one table/world scene covering the complete source-destination span."""
+    """Build the transfer scene without treating supported geometry as table collision.
+
+    The unused arm may intentionally remain supported on the tabletop.  A
+    whole-robot table cuboid would therefore reject an otherwise valid
+    selected-arm transfer.  The moving wrist/hand and attached payload are
+    checked against the inferred table plane after planning below; full-robot
+    self-collision and explicit environment cuboids remain in CuRobo.
+    """
 
     source = request.source_request
-    plane_point, base_T_object, down = _table_from_resting_object(source, base_T_torso)
+    plane_point, _base_T_object, down = _table_from_resting_object(source, base_T_torso)
     scene = _base_scene(
         source,
         base_T_torso,
         include_cube=False,
         include_open_transit_table_patch=False,
     )
-    dimensions = np.asarray(source.open_transit_table_patch_dimensions_m, dtype=np.float64)
-    relative = np.asarray(request.source_T_destination_object, dtype=np.float64)
-    base_T_detected_source = _base_T_detected_object(source, base_T_torso)
-    base_T_destination = base_T_detected_source @ relative
-    displacement = base_T_destination[:3, 3] - base_T_object[:3, 3]
-    displacement_xy = base_T_object[:3, :2].T @ displacement
-    expanded = dimensions.copy()
-    expanded[:2] += np.abs(displacement_xy)
-    base_T_patch = base_T_object.copy()
-    base_T_patch[:3, 3] = (
-        plane_point + base_T_object[:3, :2] @ (0.5 * displacement_xy) + 0.5 * expanded[2] * down
-    )
-    scene.setdefault("cuboid", {})["open_transit_table_patch"] = {
-        "dims": expanded.tolist(),
-        "pose": _pose_list(base_T_patch),
-    }
     return scene, plane_point, down
 
 
@@ -4143,10 +4172,12 @@ def _plan_tabletop(
     request: TabletopTaskRequest,
     *,
     required_candidate_id: str | None = None,
+    excluded_candidate_ids: tuple[str, ...] = (),
     pregrasp_only: bool,
+    endpoint_feasibility_only: bool = False,
     planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
-) -> TabletopTaskPlan | TabletopPregraspPlan:
+) -> TabletopTaskPlan | TabletopPregraspPlan | _EndpointFeasibility:
     """Plan either the first boundary route or one complete task."""
 
     report = progress or (lambda _message: None)
@@ -4154,6 +4185,18 @@ def _plan_tabletop(
     open_planner_cache = None if planner_pool is None else planner_pool.motion("open", arm)
     attached_planner_cache = None if planner_pool is None else planner_pool.motion("attached", arm)
     shortlist, candidates = _load_shortlist(request)
+    excluded = set(excluded_candidate_ids)
+    if required_candidate_id is not None and required_candidate_id in excluded:
+        raise ValueError(f"required grasp candidate {required_candidate_id!r} is also excluded")
+    if excluded:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate.get("candidate_id")) not in excluded
+        ]
+        if not candidates:
+            raise RuntimeError("every qualified grasp candidate was excluded")
+        report(f"excluded {len(excluded)} previously failed physical grasp candidate(s)")
     if required_candidate_id is not None:
         candidates = [
             candidate
@@ -4259,7 +4302,7 @@ def _plan_tabletop(
             )
             fixed_close_validator_reused = bool(fixed_close_event["reused"])
         grasp_matrices = [base_T_object @ _candidate_transform(item) for item in candidates]
-        approach_distance_m = float(shortlist["execution_contract"]["approach_distance_m"])
+        approach_distance_m = _request_pregrasp_distance_m(request, shortlist)
         branch_rejections: list[dict[str, Any]] = []
         stage_started = time.monotonic()
         exact_table_evidence = None
@@ -4298,6 +4341,15 @@ def _plan_tabletop(
                 "batched fixed-close GPU pruning removed "
                 f"{len(candidate_rejections)}/{len(candidates)} candidates; "
                 f"{len(remaining_indices)} remain for arm IK"
+            )
+        if not remaining_indices and endpoint_feasibility_only:
+            return _EndpointFeasibility(
+                candidate_branch_counts={
+                    str(candidate["candidate_id"]): 0 for candidate in candidates
+                },
+                fixed_close_viable_candidate_count=0,
+                rejections=tuple(branch_rejections),
+                elapsed_s=time.monotonic() - started,
             )
         if not remaining_indices:
             raise RuntimeError(
@@ -4413,7 +4465,7 @@ def _plan_tabletop(
                 )
             finally:
                 _cleanup(ik_solver)
-            if not branches:
+            if not branches and not endpoint_feasibility_only:
                 raise RuntimeError(
                     "no collision-valid pregrasp IK branch remains for the qualified "
                     f"candidates; prior branch rejections={branch_rejections}; {diagnostic}"
@@ -4463,6 +4515,22 @@ def _plan_tabletop(
                 f"{len(subset_candidates)} candidates with {IK_SEEDS} dedicated seeds "
                 f"each produced: {counts_text}"
             )
+            if endpoint_feasibility_only:
+                counts_by_candidate = {
+                    str(candidate["candidate_id"]): 0 for candidate in candidates
+                }
+                counts_by_candidate.update(
+                    {
+                        candidate_ids[index]: branch_counts[index]
+                        for index in range(len(candidate_ids))
+                    }
+                )
+                return _EndpointFeasibility(
+                    candidate_branch_counts=counts_by_candidate,
+                    fixed_close_viable_candidate_count=len(remaining_indices),
+                    rejections=tuple(branch_rejections),
+                    elapsed_s=time.monotonic() - started,
+                )
 
             def attempt_branch(
                 branch: _PregraspBranch,
@@ -4846,6 +4914,7 @@ def _plan_tabletop(
                 "candidate_count": len(candidates),
                 "candidate_count_after_fixed_close_pruning": len(remaining_indices),
                 "required_candidate_id": required_candidate_id,
+                "excluded_candidate_ids": list(excluded_candidate_ids),
                 "execution_maximum_arm_velocity_rad_s": (request.maximum_arm_velocity_rad_s),
                 "selection_policy": (
                     "independent_batched_curobo_pregrasp_ik_with_strict_endpoint_and_"
@@ -5129,6 +5198,7 @@ def plan_tabletop_task(
     request: TabletopTaskRequest,
     *,
     required_candidate_id: str | None = None,
+    excluded_candidate_ids: tuple[str, ...] = (),
     planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopTaskPlan:
@@ -5137,6 +5207,7 @@ def plan_tabletop_task(
     result = _plan_tabletop(
         request,
         required_candidate_id=required_candidate_id,
+        excluded_candidate_ids=excluded_candidate_ids,
         pregrasp_only=False,
         planner_pool=planner_pool,
         progress=progress,
@@ -5144,6 +5215,100 @@ def plan_tabletop_task(
     if not isinstance(result, TabletopTaskPlan):
         raise TypeError("complete task planner returned only a pregrasp route")
     return result
+
+
+def _tabletop_endpoint_feasibility(
+    request: TabletopTaskRequest,
+    *,
+    excluded_candidate_ids: tuple[str, ...] = (),
+    planner_pool: TabletopPlannerPool | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> _EndpointFeasibility:
+    """Run the existing fixed-close, batched IK, and strict endpoint checks only."""
+
+    result = _plan_tabletop(
+        request,
+        excluded_candidate_ids=excluded_candidate_ids,
+        pregrasp_only=False,
+        endpoint_feasibility_only=True,
+        planner_pool=planner_pool,
+        progress=progress,
+    )
+    if not isinstance(result, _EndpointFeasibility):
+        raise TypeError("endpoint feasibility query returned a trajectory plan")
+    return result
+
+
+def _pick_place_endpoint_analysis(
+    request: TabletopPickPlaceRequest,
+    *,
+    planner_pool: TabletopPlannerPool | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> _PickPlaceEndpointAnalysis:
+    """Intersect strict source/destination endpoints without planning a route."""
+
+    report = progress or (lambda _message: None)
+    source = request.source_request
+    destination = destination_request_for_pick_place(request)
+    report("batching source endpoint feasibility without route planning")
+    source_feasibility = _tabletop_endpoint_feasibility(
+        source,
+        excluded_candidate_ids=request.excluded_candidate_ids,
+        planner_pool=planner_pool,
+        progress=report,
+    )
+    report("batching destination endpoint feasibility without route planning")
+    destination_feasibility = _tabletop_endpoint_feasibility(
+        destination,
+        excluded_candidate_ids=request.excluded_candidate_ids,
+        planner_pool=planner_pool,
+        progress=report,
+    )
+    _shortlist, candidates = _load_shortlist(source)
+    excluded = set(request.excluded_candidate_ids)
+    candidate_ids = tuple(
+        str(value["candidate_id"])
+        for value in candidates
+        if str(value["candidate_id"]) not in excluded
+    )
+    analysis = _PickPlaceEndpointAnalysis(
+        candidate_ids=candidate_ids,
+        source=source_feasibility,
+        destination=destination_feasibility,
+    )
+    report(
+        "batched source/destination endpoint intersection retained "
+        f"{len(analysis.common_candidate_ids)}/{len(candidate_ids)} grasp candidates"
+    )
+    return analysis
+
+
+def analyze_tabletop_pick_place_endpoints(
+    request: TabletopPickPlaceRequest,
+    *,
+    planner_pool: TabletopPlannerPool | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """Serialize the route-free feasibility result for coordinator ranking."""
+
+    analysis = _pick_place_endpoint_analysis(
+        request,
+        planner_pool=planner_pool,
+        progress=progress,
+    )
+    return {
+        "operation": "analyze_tabletop_pick_place_endpoints",
+        "request_sha256": request.content_sha256,
+        "candidate_count": len(analysis.candidate_ids),
+        "source_viable_candidate_count": len(analysis.source.viable_candidate_ids),
+        "destination_viable_candidate_count": len(analysis.destination.viable_candidate_ids),
+        "common_candidate_ids": list(analysis.common_candidate_ids),
+        "common_candidate_count": len(analysis.common_candidate_ids),
+        "source_elapsed_s": analysis.source.elapsed_s,
+        "destination_elapsed_s": analysis.destination.elapsed_s,
+        "route_planning_performed": False,
+        "robot_command_authorized": False,
+    }
 
 
 def plan_tabletop_pick_place(
@@ -5157,45 +5322,31 @@ def plan_tabletop_pick_place(
     report = progress or (lambda _message: None)
     started = time.monotonic()
     source = request.source_request
-    report("planning the qualified source grasp and attached lift")
-    first_source_task = plan_tabletop_task(
-        source,
+    destination = destination_request_for_pick_place(request)
+    endpoint_analysis = _pick_place_endpoint_analysis(
+        request,
         planner_pool=planner_pool,
         progress=report,
     )
-    destination = destination_request_for_pick_place(request)
-    _shortlist, candidates = _load_shortlist(source)
-    candidate_ids = [str(value["candidate_id"]) for value in candidates]
-    candidate_order = [
-        first_source_task.selected_candidate_id,
-        *(value for value in candidate_ids if value != first_source_task.selected_candidate_id),
-    ]
+    source_feasibility = endpoint_analysis.source
+    destination_feasibility = endpoint_analysis.destination
+    candidate_ids = endpoint_analysis.candidate_ids
+    source_endpoint_viable = source_feasibility.viable_candidate_ids
+    destination_endpoint_viable = destination_feasibility.viable_candidate_ids
+    common_endpoint_viable = set(endpoint_analysis.common_candidate_ids)
+    if not common_endpoint_viable:
+        raise RuntimeError(
+            "no grasp candidate has a strict endpoint-valid IK branch at both "
+            "the source and destination"
+        )
+
+    candidate_order = [value for value in candidate_ids if value in common_endpoint_viable]
     pick_place_rejections: list[dict[str, str]] = []
     source_task = destination_task = transfer = transfer_provenance = None
     for candidate_id in candidate_order:
-        if candidate_id == first_source_task.selected_candidate_id:
-            current_source = first_source_task
-        else:
-            report(f"trying next source/destination grasp {candidate_id}")
-            try:
-                current_source = plan_tabletop_task(
-                    source,
-                    required_candidate_id=candidate_id,
-                    planner_pool=planner_pool,
-                    progress=report,
-                )
-            except RuntimeError as error:
-                pick_place_rejections.append(
-                    {
-                        "candidate_id": candidate_id,
-                        "stage": "source",
-                        "reason": str(error),
-                    }
-                )
-                continue
         report(
-            "planning the destination contact and reverse retreat while preserving "
-            f"grasp {candidate_id}"
+            f"trying common endpoint-valid grasp {candidate_id}; planning the "
+            "more restrictive destination lifecycle first"
         )
         try:
             current_destination = plan_tabletop_task(
@@ -5204,7 +5355,34 @@ def plan_tabletop_pick_place(
                 planner_pool=planner_pool,
                 progress=report,
             )
-            report("planning the attached-payload bridge between validated lifted states")
+        except RuntimeError as error:
+            pick_place_rejections.append(
+                {
+                    "candidate_id": candidate_id,
+                    "stage": "destination",
+                    "reason": str(error),
+                }
+            )
+            continue
+        report(f"destination passed for {candidate_id}; planning the source lifecycle")
+        try:
+            current_source = plan_tabletop_task(
+                source,
+                required_candidate_id=candidate_id,
+                planner_pool=planner_pool,
+                progress=report,
+            )
+        except RuntimeError as error:
+            pick_place_rejections.append(
+                {
+                    "candidate_id": candidate_id,
+                    "stage": "source",
+                    "reason": str(error),
+                }
+            )
+            continue
+        report("planning the attached-payload bridge between validated lifted states")
+        try:
             current_transfer, current_transfer_provenance = _plan_attached_transfer(
                 request,
                 current_source,
@@ -5215,7 +5393,7 @@ def plan_tabletop_pick_place(
             pick_place_rejections.append(
                 {
                     "candidate_id": candidate_id,
-                    "stage": "destination_or_transfer",
+                    "stage": "attached_transfer",
                     "reason": str(error),
                 }
             )
@@ -5283,7 +5461,15 @@ def plan_tabletop_pick_place(
             "destination_task_sha256": destination_task.content_sha256,
             "transfer": transfer_provenance,
             "rejected_pick_place_grasps": pick_place_rejections,
-            "selection_policy": ("first-grasp-passing-source-destination-and-attached-transfer"),
+            "selection_policy": (
+                "batched-source-destination-endpoint-intersection-then-first-"
+                "grasp-passing-complete-routes-and-attached-transfer"
+            ),
+            "source_endpoint_viable_candidate_count": len(source_endpoint_viable),
+            "destination_endpoint_viable_candidate_count": len(destination_endpoint_viable),
+            "common_endpoint_viable_candidate_count": len(common_endpoint_viable),
+            "source_endpoint_feasibility_elapsed_s": source_feasibility.elapsed_s,
+            "destination_endpoint_feasibility_elapsed_s": (destination_feasibility.elapsed_s),
             "task_structure": "fixed_pick_place_sequence",
         },
     )

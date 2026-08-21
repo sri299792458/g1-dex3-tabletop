@@ -176,9 +176,26 @@ def _serve_tabletop() -> int:
                     request = TabletopTaskRequest.from_json(Path(message["payload"]["request"]))
                     payload = session.prewarm_runtime(
                         request,
-                        moving_grasp_mpc=bool(
-                            message["payload"].get("moving_grasp_mpc", False)
-                        ),
+                        moving_grasp_mpc=bool(message["payload"].get("moving_grasp_mpc", False)),
+                        progress=progress,
+                    )
+                    event = {
+                        "type": "result",
+                        "id": request_id,
+                        "ok": True,
+                        "operation": command,
+                        "payload": payload,
+                    }
+                elif command == "prewarm-tabletop-stack-runtime":
+                    request_paths = message["payload"]["requests"]
+                    if not isinstance(request_paths, dict):
+                        raise TypeError("stack warmup requests must be an arm-to-path mapping")
+                    requests = tuple(
+                        TabletopTaskRequest.from_json(Path(request_paths[arm]))
+                        for arm in ("left", "right")
+                    )
+                    payload = session.prewarm_stack_runtime(
+                        requests,
                         progress=progress,
                     )
                     event = {
@@ -196,6 +213,21 @@ def _serve_tabletop() -> int:
                         "ok": True,
                         "operation": command,
                         "payload": window.to_dict(),
+                    }
+                elif command == "analyze-pick-place-endpoints":
+                    request = TabletopPickPlaceRequest.from_json(
+                        Path(message["payload"]["request"])
+                    )
+                    payload = session.analyze_pick_place_endpoints(
+                        request,
+                        progress=progress,
+                    )
+                    event = {
+                        "type": "result",
+                        "id": request_id,
+                        "ok": True,
+                        "operation": command,
+                        "payload": payload,
                     }
                 else:
                     request_path = Path(message["request"])

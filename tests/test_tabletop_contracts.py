@@ -105,6 +105,20 @@ def test_tabletop_request_round_trip_and_hash_guard(tmp_path: Path) -> None:
         TabletopTaskRequest.from_dict(document)
 
 
+def test_tabletop_request_hash_binds_pregrasp_distance() -> None:
+    original = request()
+    changed = TabletopTaskRequest.from_dict(
+        {**original.to_dict(include_hash=False), "pregrasp_distance_m": 0.075}
+    )
+
+    assert changed.pregrasp_distance_m == 0.075
+    assert changed.content_sha256 != original.content_sha256
+    with pytest.raises(ValueError, match="positive and finite"):
+        TabletopTaskRequest.from_dict(
+            {**original.to_dict(include_hash=False), "pregrasp_distance_m": 0.0}
+        )
+
+
 def test_estimated_planning_state_is_separate_from_visual_observation() -> None:
     original = request()
     object_T_camera = [list(row) for row in identity()]
@@ -192,10 +206,12 @@ def test_pick_place_request_binds_relative_destination_and_support(tmp_path: Pat
         source_request=source,
         source_T_destination_object=destination,
         destination_support_object_id="cube60",
+        excluded_candidate_ids=("failed_grasp",),
     )
     path = tmp_path / "pick_place_request.json"
     pick_place.write_json(path)
     assert TabletopPickPlaceRequest.from_json(path) == pick_place
+    assert pick_place.excluded_candidate_ids == ("failed_grasp",)
 
     bad = pick_place.to_dict(include_hash=False)
     bad["destination_support_object_id"] = "missing"

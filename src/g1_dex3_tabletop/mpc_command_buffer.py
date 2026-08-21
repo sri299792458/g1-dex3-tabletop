@@ -362,6 +362,7 @@ class RollingMPCCommandBuffer:
         *,
         now_s: float,
         active_command_q_rad: Any,
+        handoff_boundary: MPCHandoffBoundary | None = None,
     ) -> None:
         """Queue a worker-certified trajectory without changing one byte of it."""
 
@@ -392,12 +393,20 @@ class RollingMPCCommandBuffer:
 
         first_command = np.asarray(window.command_q_rad[0], dtype=np.float64)
         if self._active is None:
+            if handoff_boundary is not None:
+                raise ValueError("first MPC trajectory must not name a streaming handoff")
             if window.predecessor_sha256 is not None:
                 raise ValueError("first MPC trajectory unexpectedly names a predecessor")
             active = np.asarray(_q7(active_command_q_rad, name="active command"))
             continuity_error = float(np.max(np.abs(first_command - active)))
             self._prestart_command_q = active.copy()
         else:
+            if handoff_boundary is None:
+                raise ValueError("replacement MPC trajectory requires its frozen handoff boundary")
+            if handoff_boundary.predecessor_sha256 != self._active.content_sha256:
+                raise ValueError("frozen MPC handoff belongs to a different active trajectory")
+            if window.valid_from_monotonic_s != handoff_boundary.valid_from_monotonic_s:
+                raise ValueError("MPC trajectory does not use its frozen handoff time")
             if window.predecessor_sha256 != self._active.content_sha256:
                 raise ValueError("MPC trajectory predecessor is not the active trajectory")
             # A certified window ends in a stationary position target.  If
@@ -410,38 +419,39 @@ class RollingMPCCommandBuffer:
                 self._active.expiration_monotonic_s,
             )
             old_command = self._active.sample_command(monotonic_s=predecessor_sample_s)
-            old_predicted = self._active.sample_predicted_q(
-                monotonic_s=predecessor_sample_s
-            )
-            old_predicted_dq = self._active.sample_predicted_dq(
-                monotonic_s=predecessor_sample_s
-            )
-            old_predicted_ddq = self._active.sample_predicted_ddq(
-                monotonic_s=predecessor_sample_s
-            )
+            boundary_command = np.asarray(handoff_boundary.command_q_rad, dtype=np.float64)
+            frozen_command_error = float(np.max(np.abs(boundary_command - old_command)))
+            if frozen_command_error > 1.0e-8:
+                raise ValueError(
+                    "frozen MPC handoff command does not match the active trajectory: "
+                    f"error={frozen_command_error:.9f}rad"
+                )
             continuity_error = float(np.max(np.abs(first_command - old_command)))
             predicted_error = float(
                 np.max(
-                    np.abs(np.asarray(window.predicted_q_rad[0], dtype=np.float64) - old_predicted)
+                    np.abs(
+                        np.asarray(window.predicted_q_rad[0], dtype=np.float64)
+                        - np.asarray(handoff_boundary.predicted_q_rad, dtype=np.float64)
+                    )
                 )
             )
             if predicted_error > 1.0e-8:
                 raise ValueError(
-                    "MPC predicted handoff does not match the active trajectory: "
+                    "MPC predicted handoff does not match the frozen live-reanchored boundary: "
                     f"error={predicted_error:.9f}rad"
                 )
             for label, new_value, old_value, unit, tolerance in (
                 (
                     "velocity",
                     window.predicted_dq_rad_s[0],
-                    old_predicted_dq,
+                    handoff_boundary.predicted_dq_rad_s,
                     "rad/s",
                     1.0e-5,
                 ),
                 (
                     "acceleration",
                     window.predicted_ddq_rad_s2[0],
-                    old_predicted_ddq,
+                    handoff_boundary.predicted_ddq_rad_s2,
                     "rad/s^2",
                     1.0e-4,
                 ),
@@ -476,8 +486,10 @@ class RollingMPCCommandBuffer:
         now_s: float,
         minimum_lead_s: float,
         handoff_quantum_s: float,
+        live_measured_q_rad: Any,
+        live_active_command_q_rad: Any,
     ) -> MPCHandoffBoundary:
-        """Sample an exact future splice from the currently active trajectory."""
+        """Freeze a command splice and reanchor its predicted state to live tracking."""
 
         if self._active is None:
             raise RuntimeError("no active MPC trajectory is available for a future handoff")
@@ -492,18 +504,29 @@ class RollingMPCCommandBuffer:
             raise ValueError("MPC handoff lead must be positive and finite")
         if not np.isfinite(quantum) or quantum <= 0.0:
             raise ValueError("MPC handoff quantum must be positive and finite")
+        live_measured = np.asarray(_q7(live_measured_q_rad, name="live measured position"))
+        live_command = np.asarray(
+            _q7(live_active_command_q_rad, name="live active command")
+        )
+        live_tracking_offset = live_command - live_measured
+        if np.max(np.abs(live_tracking_offset)) > self.maximum_handoff_position_error_rad:
+            raise RuntimeError(
+                "MPC live tracking offset "
+                f"{np.max(np.abs(live_tracking_offset)):.4f}rad exceeds "
+                f"{self.maximum_handoff_position_error_rad:.4f}rad"
+            )
         relative = max(now + lead - self._active.valid_from_monotonic_s, 0.0)
         handoff_offset = math.ceil((relative - 1.0e-12) / quantum) * quantum
         valid_from = self._active.valid_from_monotonic_s + handoff_offset
         predecessor_sample_s = min(valid_from, self._active.expiration_monotonic_s)
+        future_command = self._active.sample_command(monotonic_s=predecessor_sample_s)
         return MPCHandoffBoundary(
             valid_from_monotonic_s=valid_from,
-            command_q_rad=tuple(
-                self._active.sample_command(monotonic_s=predecessor_sample_s)
-            ),
-            predicted_q_rad=tuple(
-                self._active.sample_predicted_q(monotonic_s=predecessor_sample_s)
-            ),
+            command_q_rad=tuple(future_command),
+            # The future command is immutable. Re-estimate the physical state
+            # beneath it with the command-minus-measured offset observed now,
+            # instead of carrying the previous window's stale prediction.
+            predicted_q_rad=tuple(future_command - live_tracking_offset),
             predicted_dq_rad_s=tuple(
                 self._active.sample_predicted_dq(monotonic_s=predecessor_sample_s)
             ),

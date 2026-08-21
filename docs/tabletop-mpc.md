@@ -81,6 +81,15 @@ Each update performs the following transaction:
 9. Install the window only if its predecessor, future boundary, measurements,
    and hash still match.
 
+The command and physical-state sides of the handoff are intentionally distinct.
+At every update, the fixed-rate executor pairs its current arm command with a
+fresh measured arm state and computes `tracking_offset = command - measured`.
+The future command splice remains the exact immutable sample from the active
+window, while the future physical state is reanchored as
+`future_command - tracking_offset`. The replacement window must reproduce both
+parts of that frozen boundary. This preserves command continuity without
+silently carrying an obsolete physical-state prediction into later updates.
+
 The object-relative progress calculation is essential. Comparing the corrected
 joint state with the old nominal joint route caused progress to freeze whenever
 the cube moved, even though individual MPC solves succeeded.

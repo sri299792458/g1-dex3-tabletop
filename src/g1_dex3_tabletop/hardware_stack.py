@@ -1,8 +1,7 @@
-"""Fixed two-cube stack hardware workflow.
+"""Fixed one-pick two-cube stack hardware workflow.
 
-This module deliberately coordinates exactly two existing pick/place operations:
-move the 60 mm cube on the table, observe the result, then place the 40 mm cube
-on it.  It is not a task language.
+One uniquely tagged 60 mm cube is picked and placed directly on the other.
+It is not a task language.
 """
 
 from __future__ import annotations
@@ -82,12 +81,9 @@ from g1_dex3_tabletop.planning.dex3_handedness import (
 )
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
 from g1_dex3_tabletop.stack_workflow import (
-    build_observed_stack_second_stage_request,
-    build_stack_stage_requests,
+    build_direct_stack_request,
     request_base_T_camera,
     request_hand_positions,
-    stack_arm_assignments,
-    stack_placement_candidates,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
     PickPlaceRetentionRouteValidationRequest,
@@ -114,16 +110,41 @@ def _tuple_transform(value: np.ndarray) -> tuple[tuple[float, ...], ...]:
     return tuple(tuple(float(item) for item in row) for row in value)
 
 
-def _exact_clearance_snapshot(
+def _active_clearance_snapshot(
     state,
     hands,
     *,
-    left_escape: SupportedEscapePlan,
-    right_escape: SupportedEscapePlan,
+    arm: str,
+    escape: SupportedEscapePlan,
+    inactive_command_q_rad,
 ) -> RobotSnapshot:
+    endpoint = escape.outbound.command_q_rad[-1]
+    return _dual_arm_command_snapshot(
+        state,
+        hands,
+        left_command_q_rad=endpoint if arm == "left" else inactive_command_q_rad,
+        right_command_q_rad=endpoint if arm == "right" else inactive_command_q_rad,
+    )
+
+
+def _dual_arm_command_snapshot(
+    state,
+    hands,
+    *,
+    left_command_q_rad,
+    right_command_q_rad,
+) -> RobotSnapshot:
+    """Bind planning to the exact held commands, not loaded tracking offsets."""
+
+    left = np.asarray(left_command_q_rad, dtype=np.float64).reshape(-1)
+    right = np.asarray(right_command_q_rad, dtype=np.float64).reshape(-1)
+    if left.shape != (7,) or right.shape != (7,):
+        raise ValueError("dual-arm command snapshot requires two seven-joint commands")
+    if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+        raise ValueError("dual-arm command snapshot contains NaN or infinity")
     q29 = np.asarray(state.position, dtype=np.float64).copy()
-    q29[np.asarray(arm_indices("left"))] = np.asarray(left_escape.outbound.command_q_rad[-1])
-    q29[np.asarray(arm_indices("right"))] = np.asarray(right_escape.outbound.command_q_rad[-1])
+    q29[np.asarray(arm_indices("left"))] = left
+    q29[np.asarray(arm_indices("right"))] = right
     return RobotSnapshot(
         measured_q29_rad=tuple(q29),
         left_dex3_q_rad=tuple(hands.left.position),
@@ -135,20 +156,69 @@ def _observe_pair(
     frames: tuple[ROSImageFrame, ...],
     *,
     expected_camera,
-    cube40_detector,
-    cube60_detector,
+    upper_detector,
+    bottom_detector,
     snapshot: RobotSnapshot,
     quality: QualityThresholds,
 ) -> tuple[TabletopObservation, TabletopObservation]:
     return observe_resting_cube_pair(
         [item.image_bgr for item in frames],
         camera_info=expected_camera,
-        cube40_detector=cube40_detector,
-        cube60_detector=cube60_detector,
+        first_detector=upper_detector,
+        second_detector=bottom_detector,
         snapshot=snapshot,
         minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
         maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
     )
+
+
+def _nearest_cube_move(
+    *,
+    reference_request: TabletopTaskRequest,
+    upper_observation: TabletopObservation,
+    bottom_observation: TabletopObservation,
+    model: URDFModel,
+) -> dict[str, object]:
+    """Choose the globally nearest cube/arm pair from the supported start."""
+
+    base_T_camera = request_base_T_camera(reference_request, model)
+    left_hand, right_hand = request_hand_positions(reference_request, model)
+    hand_positions = {"left": left_hand, "right": right_hand}
+    observations = {
+        "secondary": upper_observation,
+        "primary": bottom_observation,
+    }
+    choices: list[dict[str, object]] = []
+    for moving_cube, observation in observations.items():
+        cube_position = (
+            base_T_camera @ np.asarray(observation.camera_T_object, dtype=np.float64)
+        )[:3, 3]
+        arm = min(
+            ("left", "right"),
+            key=lambda side: float(np.linalg.norm(hand_positions[side] - cube_position)),
+        )
+        choices.append(
+            {
+                "moving_cube": moving_cube,
+                "support_cube": "primary" if moving_cube == "secondary" else "secondary",
+                "arm": arm,
+                "source_hand_distance_m": float(
+                    np.linalg.norm(hand_positions[arm] - cube_position)
+                ),
+            }
+        )
+    return min(
+        choices,
+        key=lambda value: (float(value["source_hand_distance_m"]), str(value["moving_cube"])),
+    )
+
+
+class PickPlaceGraspRejected(TabletopTaskRejected):
+    """A physically rejected grasp after the arm has recovered to clearance."""
+
+    def __init__(self, message: str, *, candidate_id: str) -> None:
+        super().__init__(message)
+        self.candidate_id = str(candidate_id)
 
 
 def _with_other_cube(
@@ -281,6 +351,86 @@ def _plan_pick_place(
     return plan
 
 
+def _find_direct_stack_plan(
+    *,
+    planner,
+    driver,
+    options: tuple[tuple[dict[str, object], TabletopPickPlaceRequest], ...],
+    directory: Path,
+):
+    """Return the first complete direct cube-on-cube plan."""
+
+    attempts: list[dict[str, object]] = []
+    endpoint_viable: list[
+        tuple[
+            dict[str, object],
+            TabletopPickPlaceRequest,
+            Path,
+            dict[str, object],
+        ]
+    ] = []
+    for metadata, request in options:
+        option_directory = (
+            directory
+            / f"move_{metadata['moving_cube']}_with_{metadata['arm']}_arm"
+            / f"yaw_quarter_turns_{metadata['yaw_quarter_turns']}"
+        )
+        option_directory.mkdir(parents=True, exist_ok=True)
+        request_path = option_directory / "request.json"
+        request.write_json(request_path)
+        attempt = dict(metadata)
+        try:
+            event = planner.request_payload(
+                "analyze-pick-place-endpoints",
+                payload={"request": str(request_path.resolve())},
+                control_check=driver.check,
+                timeout_s=60.0,
+            )
+            endpoint = event["payload"]
+            if endpoint.get("request_sha256") != request.content_sha256:
+                raise RuntimeError("endpoint analysis belongs to another request")
+            atomic_write_json(option_directory / "endpoint_feasibility.json", endpoint)
+        except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+            driver.check()
+            attempt.update({"passed": False, "reason": str(error)})
+            attempts.append(attempt)
+            continue
+        attempt["endpoint_feasibility"] = endpoint
+        if int(endpoint["common_candidate_count"]) == 0:
+            attempt.update(
+                {
+                    "passed": False,
+                    "reason": "no common strict endpoint-valid grasp candidate",
+                }
+            )
+            attempts.append(attempt)
+            continue
+        attempts.append(attempt)
+        endpoint_viable.append((metadata, request, option_directory, attempt))
+
+    for metadata, request, option_directory, attempt in endpoint_viable:
+        try:
+            plan = _plan_pick_place(
+                planner,
+                request=request,
+                directory=option_directory,
+                driver=driver,
+            )
+        except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+            driver.check()
+            attempt.update({"passed": False, "reason": str(error)})
+            continue
+        attempt.update(
+            {
+                "passed": True,
+                "request_sha256": request.content_sha256,
+                "plan_sha256": plan.content_sha256,
+            }
+        )
+        return (metadata, request, plan, option_directory), attempts
+    return None, attempts
+
+
 def _execute_pick_place(
     *,
     label: str,
@@ -296,11 +446,12 @@ def _execute_pick_place(
     control_config,
     measured_open_left,
     measured_open_right,
+    empty_close_reference_q_rad,
+    minimum_opposed_shortfall_rad: float,
 ) -> dict[str, object]:
     """Execute one already planned fixed pick/place operation."""
 
     arm = plan.arm
-    empty_close, minimum_shortfall = dex3_empty_close_reference(arm)
     left_open_target, _left_close = dex3_execution_profile("left")
     right_open_target, _right_close = dex3_execution_profile("right")
     recovery = _pick_place_recovery_routes(plan)
@@ -330,8 +481,8 @@ def _execute_pick_place(
             dex_controller,
             driver,
             guard,
-            left=left_open_target,
-            right=right_open_target,
+            left=left_open_target if arm == "left" else measured_open_left,
+            right=right_open_target if arm == "right" else measured_open_right,
             left_acceptance=measured_open_left,
             right_acceptance=measured_open_right,
             label=open_label,
@@ -353,14 +504,17 @@ def _execute_pick_place(
             active_side=arm,
             left=close_target if arm == "left" else measured_open_left,
             right=close_target if arm == "right" else measured_open_right,
-            empty_close_reference_q_rad=empty_close,
-            minimum_opposed_shortfall_rad=minimum_shortfall,
+            empty_close_reference_q_rad=empty_close_reference_q_rad,
+            minimum_opposed_shortfall_rad=minimum_opposed_shortfall_rad,
             label=f"{label}: descriptor-defined {arm}-hand close",
         )
     except Dex3GraspNotAcquiredError as error:
         driver.check()
         recover_from_grasp()
-        raise TabletopTaskRejected(f"{label} did not acquire the cube: {error}") from error
+        raise PickPlaceGraspRejected(
+            f"{label} did not acquire the cube: {error}",
+            candidate_id=plan.selected_candidate_id,
+        ) from error
     atomic_write_json(plan_directory / "grasp_close.json", close.to_dict())
     dex_controller.begin_retention_test()
     retention_request = PickPlaceRetentionRouteValidationRequest(
@@ -381,10 +535,19 @@ def _execute_pick_place(
         )
         retention = RetentionRouteValidationResult.from_json(retention_result_path)
         dex_controller.check_retention_test()
-    except (PlannerRequestRejected, Dex3RetentionLostError, RuntimeError) as error:
+    except (PlannerRequestRejected, Dex3RetentionLostError) as error:
         driver.check()
         recover_from_grasp()
-        raise TabletopTaskRejected(f"{label} measured close did not validate: {error}") from error
+        raise PickPlaceGraspRejected(
+            f"{label} measured close did not validate: {error}",
+            candidate_id=plan.selected_candidate_id,
+        ) from error
+    except RuntimeError as error:
+        driver.check()
+        recover_from_grasp()
+        raise TabletopTaskRejected(
+            f"{label} retention-validation infrastructure failed: {error}"
+        ) from error
     execute(routes["retention_test_lift"])
     try:
         evidence = dex_controller.verify_retention_at_lifted_checkpoint(
@@ -397,7 +560,10 @@ def _execute_pick_place(
         open_active(f"{label}: release after failed retention lift")
         execute(recovery[2])
         execute(recovery[3])
-        raise TabletopTaskRejected(f"{label} lost retention: {error}") from error
+        raise PickPlaceGraspRejected(
+            f"{label} lost retention: {error}",
+            candidate_id=plan.selected_candidate_id,
+        ) from error
     atomic_write_json(plan_directory / "retention_evidence.json", evidence.to_dict())
     for phase in ("payload_lift", "payload_transfer", "placement_lower", "placement_contact"):
         execute(routes[phase])
@@ -459,12 +625,14 @@ def _return_supported_arms(
 
 
 def run_stack(args) -> int:
-    """Move the 60 mm cube, reobserve, then stack the 40 mm cube on it."""
+    """Pick either 60 mm cube and place it directly on the other."""
 
     if args.confirm != MOTION_ACK:
         raise ValueError(f"--confirm must equal exactly: {MOTION_ACK}")
-    cube40_profile = load_tabletop_object_profile("cube40-r3")
-    cube60_profile = load_tabletop_object_profile("cube60-r3")
+    if args.grasp_retries < 0:
+        raise ValueError("--grasp-retries must be non-negative")
+    upper_profile = load_tabletop_object_profile("cube60-r3-secondary")
+    bottom_profile = load_tabletop_object_profile("cube60-r3")
     hardware = load_hardware(args.hardware_config)
     if {
         str(hardware["robot"]["calibration_arm"]),
@@ -493,31 +661,31 @@ def run_stack(args) -> int:
         "calibration": (args.calibration_bundle, args.calibration_bundle.read_bytes()),
         "quality": (args.quality_config, args.quality_config.read_bytes()),
         "task": (args.task_config, args.task_config.read_bytes()),
-        "cube40_profile": (cube40_profile.config_path, cube40_profile.config_path.read_bytes()),
-        "cube60_profile": (cube60_profile.config_path, cube60_profile.config_path.read_bytes()),
-        "cube40_detector": (
-            cube40_profile.detector_config_path,
-            cube40_profile.detector_config_path.read_bytes(),
+        "upper_profile": (upper_profile.config_path, upper_profile.config_path.read_bytes()),
+        "bottom_profile": (bottom_profile.config_path, bottom_profile.config_path.read_bytes()),
+        "upper_detector": (
+            upper_profile.detector_config_path,
+            upper_profile.detector_config_path.read_bytes(),
         ),
-        "cube60_detector": (
-            cube60_profile.detector_config_path,
-            cube60_profile.detector_config_path.read_bytes(),
+        "bottom_detector": (
+            bottom_profile.detector_config_path,
+            bottom_profile.detector_config_path.read_bytes(),
         ),
-        "cube40_grasps": (
-            cube40_profile.direct_grasp_shortlist_path,
-            cube40_profile.direct_grasp_shortlist_path.read_bytes(),
+        "upper_grasps": (
+            upper_profile.direct_grasp_shortlist_path,
+            upper_profile.direct_grasp_shortlist_path.read_bytes(),
         ),
-        "cube60_grasps": (
-            cube60_profile.direct_grasp_shortlist_path,
-            cube60_profile.direct_grasp_shortlist_path.read_bytes(),
+        "bottom_grasps": (
+            bottom_profile.direct_grasp_shortlist_path,
+            bottom_profile.direct_grasp_shortlist_path.read_bytes(),
         ),
     }
-    cube40_detector = CorrespondenceDetector(
-        cube40_profile.detector_config_path,
+    upper_detector = CorrespondenceDetector(
+        upper_profile.detector_config_path,
         preprocess=False,
     )
-    cube60_detector = CorrespondenceDetector(
-        cube60_profile.detector_config_path,
+    bottom_detector = CorrespondenceDetector(
+        bottom_profile.detector_config_path,
         preprocess=False,
     )
     empty_pose_set = PoseSet(
@@ -529,13 +697,17 @@ def run_stack(args) -> int:
     status: dict[str, object] = {
         "status": "started",
         "commands_robot": False,
-        "task": "cube60_to_table_then_cube40_on_cube60",
+        "task": "one_pick_direct_cube60_on_cube60",
         "maximum_arm_velocity_rad_s": velocity,
+        "requested_pregrasp_distance_m": args.pregrasp_distance_m,
+        "grasp_retries": args.grasp_retries,
     }
+    retry_events: list[dict[str, object]] = []
     frame_sets: dict[str, tuple[ROSImageFrame, ...]] = {}
     primary_error: BaseException | None = None
     camera = observer = dex_observer = transport = dex_controller = None
     node = rclpy_module = raw_recorder = guard = synchronized = driver = planner = None
+    runtime_warmup = None
     left_escape = right_escape = None
     left_at_clearance = right_at_clearance = False
     initial_left = initial_right = None
@@ -543,6 +715,16 @@ def run_stack(args) -> int:
     command_lock = CommandOwnerLock(args.lock_file)
     command_lock.acquire()
     try:
+        planner = PersistentTabletopPlanner(
+            executable=ROOT / ".venv-planner/bin/g1-curobo-worker",
+            log_path=run_directory / "planner.log",
+        )
+        planner.launch()
+        print(
+            "PLANNER STARTED — isolated CUDA initialization is running concurrently "
+            "with the read-only two-cube preflight; no command publisher exists",
+            flush=True,
+        )
         try:
             import rclpy
         except ImportError as error:
@@ -591,12 +773,13 @@ def run_stack(args) -> int:
             expected_camera.profile_sha256
         ):
             raise ValueError("live camera profile differs from hardware configuration")
-        _observe_pair(
+        preflight_snapshot = _snapshot(activation.reference_state, hands)
+        preflight_upper, preflight_bottom = _observe_pair(
             frame_sets["preflight"],
             expected_camera=expected_camera,
-            cube40_detector=cube40_detector,
-            cube60_detector=cube60_detector,
-            snapshot=_snapshot(activation.reference_state, hands),
+            upper_detector=upper_detector,
+            bottom_detector=bottom_detector,
+            snapshot=preflight_snapshot,
             quality=quality,
         )
         print(
@@ -604,17 +787,108 @@ def run_stack(args) -> int:
             "on the bare table and no command publisher exists",
             flush=True,
         )
-        planner = PersistentTabletopPlanner(
-            executable=ROOT / ".venv-planner/bin/g1-curobo-worker",
-            log_path=run_directory / "planner.log",
+        preflight_reference = build_tabletop_request(
+            arm="left",
+            observation=preflight_upper,
+            calibration_bundle=bundle,
+            calibration_bundle_path=args.calibration_bundle,
+            grasp_shortlist_path=upper_profile.direct_grasp_shortlist_path,
+            task_config_path=args.task_config,
+            object_dimensions_m=upper_profile.dimensions_m,
+            maximum_arm_velocity_rad_s=velocity,
+            pregrasp_distance_m=args.pregrasp_distance_m,
         )
-        planner.start()
+        status["pregrasp_distance_m"] = preflight_reference.pregrasp_distance_m
+        selected_move = _nearest_cube_move(
+            reference_request=preflight_reference,
+            upper_observation=preflight_upper,
+            bottom_observation=preflight_bottom,
+            model=model,
+        )
+        selected_arm = str(selected_move["arm"])
+        moving_cube = str(selected_move["moving_cube"])
+        # Grasp validation depends on a physically measured empty-close
+        # reference for the selected hand. Resolve it before SPACE, ownership,
+        # or any arm motion—not after a complete task plan has been found.
+        selected_empty_close, selected_minimum_shortfall = dex3_empty_close_reference(
+            selected_arm
+        )
+        if moving_cube == "secondary":
+            preflight_moving = preflight_upper
+            preflight_moving_profile = upper_profile
+            preflight_support = preflight_bottom
+            preflight_support_profile = bottom_profile
+        else:
+            preflight_moving = preflight_bottom
+            preflight_moving_profile = bottom_profile
+            preflight_support = preflight_upper
+            preflight_support_profile = upper_profile
+        preflight_warmup_request = _with_other_cube(
+            build_tabletop_request(
+                arm=selected_arm,
+                observation=preflight_moving,
+                calibration_bundle=bundle,
+                calibration_bundle_path=args.calibration_bundle,
+                grasp_shortlist_path=preflight_moving_profile.direct_grasp_shortlist_path,
+                task_config_path=args.task_config,
+                object_dimensions_m=preflight_moving_profile.dimensions_m,
+                maximum_arm_velocity_rad_s=velocity,
+                pregrasp_distance_m=args.pregrasp_distance_m,
+            ),
+            other_id="support_cube",
+            other_observation=preflight_support,
+            other_dimensions_m=preflight_support_profile.dimensions_m,
+        )
+        atomic_write_json(run_directory / "preflight_selection.json", selected_move)
+        preflight_warmup_path = run_directory / "preflight_warmup_request.json"
+        preflight_warmup_request.write_json(preflight_warmup_path)
+        empty_pose_set = PoseSet(
+            robot_model=model.name,
+            mode_machine=5,
+            urdf_sha256=model.sha256,
+            calibration_arm=selected_arm,
+        )
+        # The read-only preflight necessarily starts from the commissioned
+        # left-arm configuration. Once it selects the active arm, bind the
+        # actual ownership handoff to the same arm as its pose set. This is the
+        # same activation invariant used by the single-cube workflow.
+        recording = replace(recording, calibration_arm=selected_arm)
+        runtime_warmup = planner.begin_payload_request(
+            "prewarm-tabletop-runtime",
+            payload={
+                "request": str(preflight_warmup_path.resolve()),
+                "moving_grasp_mpc": False,
+            },
+        )
+        print(
+            "ACTIVE-ARM RUNTIME WARMUP QUEUED — "
+            f"the {selected_arm} arm is nearest to the {moving_cube} cube; only its "
+            "open-hand and attached-60-mm MotionGen models are warming during the "
+            "read-only preview. SPACE still authorizes only later command-publisher creation",
+            flush=True,
+        )
         _wait_for_space_with_preview(
             rclpy,
             node,
             camera,
-            arm="left",
+            arm=selected_arm,
             no_window=args.no_window,
+        )
+        print(
+            "SPACE RECORDED — no command publisher exists; completing any remaining "
+            "background active-arm warmup before ownership",
+            flush=True,
+        )
+        warmup_event = planner.finish_request(runtime_warmup, timeout_s=300.0)
+        runtime_warmup = None
+        atomic_write_json(
+            run_directory / "runtime_warmup.json",
+            warmup_event["payload"],
+        )
+        print(
+            f"ACTIVE-ARM RUNTIME WARMUP READY — reusable {selected_arm}-arm MotionGen "
+            "topologies completed before robot ownership",
+            flush=True,
         )
         for label, (path, content) in frozen_files.items():
             if path.read_bytes() != content:
@@ -676,7 +950,7 @@ def run_stack(args) -> int:
         )
         print(
             "CONTROL ACQUIRED — both arms are held at the exact measured state; "
-            "planning the left supported escape",
+            f"planning only the selected {selected_arm}-arm supported escape",
             flush=True,
         )
 
@@ -690,6 +964,7 @@ def run_stack(args) -> int:
                 task_config_path=args.task_config,
                 object_dimensions_m=profile.dimensions_m,
                 maximum_arm_velocity_rad_s=velocity,
+                pregrasp_distance_m=args.pregrasp_distance_m,
             )
 
         frame_sets["loaded"] = _collect_frames(
@@ -702,140 +977,97 @@ def run_stack(args) -> int:
         )
         loaded_state = synchronized.observe_state()
         loaded_hands = dex_controller.observer.observe()
-        loaded40, loaded60 = _observe_pair(
+        loaded_upper, loaded_bottom = _observe_pair(
             frame_sets["loaded"],
             expected_camera=expected_camera,
-            cube40_detector=cube40_detector,
-            cube60_detector=cube60_detector,
+            upper_detector=upper_detector,
+            bottom_detector=bottom_detector,
             snapshot=_snapshot(loaded_state, loaded_hands),
             quality=quality,
         )
-        left_request = _with_other_cube(
-            build_request("left", loaded40, cube40_profile),
-            other_id="cube60",
-            other_observation=loaded60,
-            other_dimensions_m=cube60_profile.dimensions_m,
+        if moving_cube == "secondary":
+            loaded_moving = loaded_upper
+            loaded_moving_profile = upper_profile
+            loaded_support = loaded_bottom
+            loaded_support_profile = bottom_profile
+        else:
+            loaded_moving = loaded_bottom
+            loaded_moving_profile = bottom_profile
+            loaded_support = loaded_upper
+            loaded_support_profile = upper_profile
+        active_request = _with_other_cube(
+            build_request(selected_arm, loaded_moving, loaded_moving_profile),
+            other_id="support_cube",
+            other_observation=loaded_support,
+            other_dimensions_m=loaded_support_profile.dimensions_m,
         )
-        left_request.write_json(run_directory / "left_escape_request.json")
+        active_request.write_json(run_directory / "supported_escape_request.json")
         planner.request(
             "plan-supported-escape",
-            request_path=run_directory / "left_escape_request.json",
-            output_path=run_directory / "left_escape.json",
+            request_path=run_directory / "supported_escape_request.json",
+            output_path=run_directory / "supported_escape.json",
             control_check=driver.check,
         )
-        left_escape = SupportedEscapePlan.from_json(run_directory / "left_escape.json")
-        left_pose_set = pose_set_from_trajectories(
-            arm="left",
-            trajectories=(left_escape.outbound, left_escape.inbound),
+        active_escape = SupportedEscapePlan.from_json(run_directory / "supported_escape.json")
+        if selected_arm == "left":
+            left_escape = active_escape
+            inactive_command_q_rad = loaded_state.right_q.copy()
+        else:
+            right_escape = active_escape
+            inactive_command_q_rad = loaded_state.left_q.copy()
+        active_pose_set = pose_set_from_trajectories(
+            arm=selected_arm,
+            trajectories=(active_escape.outbound, active_escape.inbound),
             reference_full_q=loaded_state.position,
             robot_model=model.name,
             urdf_sha256=model.sha256,
-            source="NVlabs/curobo_stack_left_supported_escape",
+            source=f"NVlabs/curobo_stack_{selected_arm}_supported_escape",
         )
         synchronized.install_validated_plan(
-            pose_set=left_pose_set,
-            approved_validation_report_sha256=left_escape.content_sha256,
+            pose_set=active_pose_set,
+            approved_validation_report_sha256=active_escape.content_sha256,
             validated_reference_state=loaded_state,
         )
         _execute_trajectory(
             synchronized,
             driver,
-            left_escape.outbound,
-            plan_sha256=left_escape.content_sha256,
+            active_escape.outbound,
+            plan_sha256=active_escape.content_sha256,
             control_config=control_config,
         )
-        left_at_clearance = True
-
-        frame_sets["left_clearance"] = _collect_frames(
-            rclpy,
-            node,
-            camera,
-            count=args.observation_frames,
-            timeout_s=10.0,
-            control_check=driver.check,
-        )
-        left_clearance_state = synchronized.observe_state()
-        left_clearance_hands = dex_controller.observer.observe()
-        left_q29 = np.asarray(left_clearance_state.position, dtype=np.float64).copy()
-        left_q29[np.asarray(arm_indices("left"))] = np.asarray(
-            left_escape.outbound.command_q_rad[-1]
-        )
-        left_boundary_snapshot = RobotSnapshot(
-            measured_q29_rad=tuple(left_q29),
-            left_dex3_q_rad=tuple(left_clearance_hands.left.position),
-            right_dex3_q_rad=tuple(left_clearance_hands.right.position),
-        )
-        after_left40, after_left60 = _observe_pair(
-            frame_sets["left_clearance"],
-            expected_camera=expected_camera,
-            cube40_detector=cube40_detector,
-            cube60_detector=cube60_detector,
-            snapshot=left_boundary_snapshot,
-            quality=quality,
-        )
-        right_request = _with_other_cube(
-            build_request("right", after_left60, cube60_profile),
-            other_id="cube40",
-            other_observation=after_left40,
-            other_dimensions_m=cube40_profile.dimensions_m,
-        )
-        right_request.write_json(run_directory / "right_escape_request.json")
-        planner.request(
-            "plan-supported-escape",
-            request_path=run_directory / "right_escape_request.json",
-            output_path=run_directory / "right_escape.json",
-            control_check=driver.check,
-        )
-        right_escape = SupportedEscapePlan.from_json(run_directory / "right_escape.json")
-        right_pose_set = pose_set_from_trajectories(
-            arm="right",
-            trajectories=(right_escape.outbound, right_escape.inbound),
-            reference_full_q=left_clearance_state.position,
-            robot_model=model.name,
-            urdf_sha256=model.sha256,
-            source="NVlabs/curobo_stack_right_supported_escape",
-        )
-        synchronized.switch_validated_arm_plan(
-            pose_set=right_pose_set,
-            approved_validation_report_sha256=right_escape.content_sha256,
-            validated_reference_state=left_clearance_state,
-            boundary_pose_id="__handoff__",
-        )
-        _execute_trajectory(
-            synchronized,
-            driver,
-            right_escape.outbound,
-            plan_sha256=right_escape.content_sha256,
-            control_config=control_config,
-        )
-        right_at_clearance = True
+        left_at_clearance = selected_arm == "left"
+        right_at_clearance = selected_arm == "right"
         print(
-            "BOTH CLEARANCES REACHED — opening both Dex3 hands and observing both cubes "
-            "before any object motion",
+            f"{selected_arm.upper()} CLEARANCE REACHED — opening only the selected Dex3 "
+            "hand; the unused arm and hand remain at their supported initial state",
             flush=True,
         )
-        left_open, _left_close = dex3_execution_profile("left")
-        right_open, _right_close = dex3_execution_profile("right")
+        active_open, _active_close = dex3_execution_profile(selected_arm)
         open_pair = _command_fingers(
             dex_controller,
             driver,
             guard,
-            left=left_open,
-            right=right_open,
-            label="stack run-local empty-open acquisition",
+            left=active_open if selected_arm == "left" else initial_left,
+            right=active_open if selected_arm == "right" else initial_right,
+            label=f"{selected_arm}-hand stack empty-open acquisition",
         )
         measured_open_left = open_pair.left.position.copy()
         measured_open_right = open_pair.right.position.copy()
         atomic_write_json(
             run_directory / "dex3_run_local_open.json",
             {
-                "left_command_q_rad": list(left_open),
-                "right_command_q_rad": list(right_open),
+                "active_side": selected_arm,
+                "left_command_q_rad": list(
+                    active_open if selected_arm == "left" else initial_left
+                ),
+                "right_command_q_rad": list(
+                    active_open if selected_arm == "right" else initial_right
+                ),
                 "left_measured_q_rad": measured_open_left.tolist(),
                 "right_measured_q_rad": measured_open_right.tolist(),
             },
         )
-        frame_sets["both_clearance"] = _collect_frames(
+        frame_sets["active_clearance"] = _collect_frames(
             rclpy,
             node,
             camera,
@@ -845,191 +1077,195 @@ def run_stack(args) -> int:
         )
         clearance_state = synchronized.observe_state()
         clearance_hands = dex_controller.observer.observe()
-        clearance_snapshot = _exact_clearance_snapshot(
+        clearance_snapshot = _active_clearance_snapshot(
             clearance_state,
             clearance_hands,
-            left_escape=left_escape,
-            right_escape=right_escape,
+            arm=selected_arm,
+            escape=active_escape,
+            inactive_command_q_rad=inactive_command_q_rad,
         )
-        clearance40, clearance60 = _observe_pair(
-            frame_sets["both_clearance"],
+        clearance_upper, clearance_bottom = _observe_pair(
+            frame_sets["active_clearance"],
             expected_camera=expected_camera,
-            cube40_detector=cube40_detector,
-            cube60_detector=cube60_detector,
+            upper_detector=upper_detector,
+            bottom_detector=bottom_detector,
             snapshot=clearance_snapshot,
             quality=quality,
         )
-        reference_request = build_request("left", clearance40, cube40_profile)
-        base_T_camera = request_base_T_camera(reference_request, model)
-        left_hand, right_hand = request_hand_positions(reference_request, model)
-        assignments = stack_arm_assignments(
-            cube40=clearance40,
-            cube60=clearance60,
-            base_T_camera=base_T_camera,
-            base_left_hand_position=left_hand,
-            base_right_hand_position=right_hand,
-        )
-        candidates = tuple(
-            sorted(
-                stack_placement_candidates(
-                    cube40=clearance40,
-                    cube60=clearance60,
-                    base_T_camera=base_T_camera,
-                ),
-                key=lambda value: (value.cube60_displacement_m, value.candidate_id),
+
+        def direct_options(
+            observed_upper: TabletopObservation,
+            observed_bottom: TabletopObservation,
+            *,
+            excluded_candidate_ids: tuple[str, ...] = (),
+        ) -> tuple[tuple[dict[str, object], TabletopPickPlaceRequest], ...]:
+            reference = build_request(selected_arm, observed_upper, upper_profile)
+            current_base_T_camera = request_base_T_camera(reference, model)
+            left_hand, right_hand = request_hand_positions(reference, model)
+            hand_positions = {"left": left_hand, "right": right_hand}
+            observed = {
+                "secondary": (observed_upper, upper_profile),
+                "primary": (observed_bottom, bottom_profile),
+            }
+            cube_positions = {
+                name: (current_base_T_camera @ np.asarray(value[0].camera_T_object))[:3, 3]
+                for name, value in observed.items()
+            }
+            support_cube = "primary" if moving_cube == "secondary" else "secondary"
+            moving_observation, moving_profile = observed[moving_cube]
+            support_observation = observed[support_cube][0]
+            distance = float(
+                np.linalg.norm(hand_positions[selected_arm] - cube_positions[moving_cube])
             )
+            moving_request = build_request(selected_arm, moving_observation, moving_profile)
+            options = []
+            for yaw_quarter_turns in (0, 1, 3, 2):
+                options.append(
+                    (
+                        {
+                            "moving_cube": moving_cube,
+                            "support_cube": support_cube,
+                            "arm": selected_arm,
+                            "source_hand_distance_m": distance,
+                            "yaw_quarter_turns": yaw_quarter_turns,
+                            "yaw_is_nominal_only": True,
+                        },
+                        build_direct_stack_request(
+                            moving_request=moving_request,
+                            support_cube=support_observation,
+                            base_T_camera=current_base_T_camera,
+                            yaw_quarter_turns=yaw_quarter_turns,
+                            excluded_candidate_ids=excluded_candidate_ids,
+                        ),
+                    )
+                )
+            return tuple(options)
+
+        selected, search_results = _find_direct_stack_plan(
+            planner=planner,
+            driver=driver,
+            options=direct_options(clearance_upper, clearance_bottom),
+            directory=run_directory / "feasibility_search",
         )
-        search_results: list[dict[str, object]] = []
-        selected = None
-        search_root = run_directory / "feasibility_search"
-        for cube60_arm, cube40_arm in assignments:
-            request40 = build_request(cube40_arm, clearance40, cube40_profile)
-            request60 = build_request(cube60_arm, clearance60, cube60_profile)
-            for candidate in candidates:
-                directory = search_root / f"{cube60_arm}60_{cube40_arm}40" / candidate.candidate_id
-                stage1_request, stage2_request = build_stack_stage_requests(
-                    cube40_request=request40,
-                    cube60_request=request60,
-                    candidate=candidate,
-                )
-                attempt = {
-                    "cube60_arm": cube60_arm,
-                    "cube40_arm": cube40_arm,
-                    "candidate": candidate.to_dict(),
-                }
-                try:
-                    stage1_plan = _plan_pick_place(
-                        planner,
-                        request=stage1_request,
-                        directory=directory / "stage1",
-                        driver=driver,
-                    )
-                    stage2_plan = _plan_pick_place(
-                        planner,
-                        request=stage2_request,
-                        directory=directory / "stage2_nominal",
-                        driver=driver,
-                    )
-                except (PlannerRequestRejected, RuntimeError, ValueError) as error:
-                    driver.check()
-                    attempt.update({"passed": False, "reason": str(error)})
-                    search_results.append(attempt)
-                    continue
-                attempt.update(
-                    {
-                        "passed": True,
-                        "stage1_plan_sha256": stage1_plan.content_sha256,
-                        "stage2_nominal_plan_sha256": stage2_plan.content_sha256,
-                    }
-                )
-                search_results.append(attempt)
-                selected = (
-                    candidate,
-                    cube60_arm,
-                    cube40_arm,
-                    stage1_request,
-                    stage1_plan,
-                    directory,
-                )
-                break
-            if selected is not None:
-                break
         atomic_write_json(
             run_directory / "feasibility_search.json",
             {
                 "attempts": search_results,
-                "selected": None if selected is None else selected[0].to_dict(),
+                "selected": None if selected is None else selected[0],
             },
         )
         if selected is None:
             raise TabletopTaskRejected(
-                "no placement candidate and opposite-arm assignment produced both complete plans"
+                f"the selected {selected_arm}-arm direct cube-on-cube transfer produced "
+                "no complete plan"
             )
-        candidate, cube60_arm, cube40_arm, stage1_request, stage1_plan, selected_dir = selected
+        selected_metadata, stack_request, stack_plan, selected_dir = selected
         print(
-            "STACK PLAN SELECTED — "
-            f"60 mm arm={cube60_arm}, 40 mm arm={cube40_arm}, "
-            f"placement={candidate.candidate_id}; executing only the 60 mm transfer now",
+            "DIRECT STACK PLAN SELECTED — "
+            f"{selected_arm} arm picks the {moving_cube} cube and places it directly "
+            f"on the {selected_metadata['support_cube']} cube; nominal yaw quarter-turns="
+            f"{selected_metadata['yaw_quarter_turns']}",
             flush=True,
         )
-        stage1_result = _execute_pick_place(
-            label="stage 1: 60 mm cube",
-            request=stage1_request,
-            plan=stage1_plan,
-            plan_directory=selected_dir / "stage1",
-            synchronized=synchronized,
-            driver=driver,
-            planner=planner,
-            dex_controller=dex_controller,
-            guard=guard,
-            model=model,
-            control_config=control_config,
-            measured_open_left=measured_open_left,
-            measured_open_right=measured_open_right,
-        )
-        frame_sets["after_stage1"] = _collect_frames(
-            rclpy,
-            node,
-            camera,
-            count=args.observation_frames,
-            timeout_s=10.0,
-            control_check=driver.check,
-        )
-        stage1_state = synchronized.observe_state()
-        stage1_hands = dex_controller.observer.observe()
-        stage1_snapshot = _exact_clearance_snapshot(
-            stage1_state,
-            stage1_hands,
-            left_escape=left_escape,
-            right_escape=right_escape,
-        )
-        actual40, actual60 = _observe_pair(
-            frame_sets["after_stage1"],
-            expected_camera=expected_camera,
-            cube40_detector=cube40_detector,
-            cube60_detector=cube60_detector,
-            snapshot=stage1_snapshot,
-            quality=quality,
-        )
-        actual40_request = build_request(cube40_arm, actual40, cube40_profile)
-        actual_base_T_camera = request_base_T_camera(actual40_request, model)
-        final_stage2_request = build_observed_stack_second_stage_request(
-            cube40_request=actual40_request,
-            placed_cube60=actual60,
-            base_T_camera=actual_base_T_camera,
-        )
-        try:
-            final_stage2_plan = _plan_pick_place(
-                planner,
-                request=final_stage2_request,
-                directory=selected_dir / "stage2_actual",
-                driver=driver,
-            )
-        except (PlannerRequestRejected, RuntimeError, ValueError) as error:
-            driver.check()
-            raise TabletopTaskRejected(
-                f"the actual 60 mm placement left no complete 40-on-60 plan: {error}"
-            ) from error
-        print(
-            "STAGE-ONE RESULT REOBSERVED — the final 40-on-60 plan uses the actual "
-            "placed 60 mm cube pose; beginning the 40 mm transfer",
-            flush=True,
-        )
-        stage2_result = _execute_pick_place(
-            label="stage 2: 40 mm cube onto 60 mm cube",
-            request=final_stage2_request,
-            plan=final_stage2_plan,
-            plan_directory=selected_dir / "stage2_actual",
-            synchronized=synchronized,
-            driver=driver,
-            planner=planner,
-            dex_controller=dex_controller,
-            guard=guard,
-            model=model,
-            control_config=control_config,
-            measured_open_left=measured_open_left,
-            measured_open_right=measured_open_right,
-        )
+        failed_candidates: list[str] = []
+        task_attempt = 1
+        while True:
+            try:
+                stack_result = _execute_pick_place(
+                    label=f"direct stack attempt {task_attempt}: {moving_cube} 60 mm cube",
+                    request=stack_request,
+                    plan=stack_plan,
+                    plan_directory=selected_dir,
+                    synchronized=synchronized,
+                    driver=driver,
+                    planner=planner,
+                    dex_controller=dex_controller,
+                    guard=guard,
+                    model=model,
+                    control_config=control_config,
+                    measured_open_left=measured_open_left,
+                    measured_open_right=measured_open_right,
+                    empty_close_reference_q_rad=selected_empty_close,
+                    minimum_opposed_shortfall_rad=selected_minimum_shortfall,
+                )
+                break
+            except PickPlaceGraspRejected as rejection:
+                driver.check()
+                failed_candidates.append(rejection.candidate_id)
+                retry_events.append(
+                    {
+                        "attempt": task_attempt,
+                        "candidate_id": rejection.candidate_id,
+                        "reason": str(rejection),
+                        "recovered_to_clearance": True,
+                    }
+                )
+                if task_attempt > args.grasp_retries:
+                    raise TabletopTaskRejected(
+                        f"direct stack exhausted {args.grasp_retries} grasp retries: {rejection}"
+                    ) from rejection
+                task_attempt += 1
+                print(
+                    "DIRECT STACK GRASP REJECTED — the active arm recovered to clearance; "
+                    "reobserving both cubes and replanning the same one-pick task without "
+                    f"{rejection.candidate_id} (attempt {task_attempt}/"
+                    f"{args.grasp_retries + 1})",
+                    flush=True,
+                )
+                key = f"retry_{task_attempt:02d}"
+                frame_sets[key] = _collect_frames(
+                    rclpy,
+                    node,
+                    camera,
+                    count=args.observation_frames,
+                    timeout_s=10.0,
+                    control_check=driver.check,
+                )
+                retry_state = synchronized.observe_state()
+                retry_hands = dex_controller.observer.observe()
+                retry_snapshot = _active_clearance_snapshot(
+                    retry_state,
+                    retry_hands,
+                    arm=selected_arm,
+                    escape=active_escape,
+                    inactive_command_q_rad=inactive_command_q_rad,
+                )
+                try:
+                    retry_upper, retry_bottom = _observe_pair(
+                        frame_sets[key],
+                        expected_camera=expected_camera,
+                        upper_detector=upper_detector,
+                        bottom_detector=bottom_detector,
+                        snapshot=retry_snapshot,
+                        quality=quality,
+                    )
+                    retry_selected, retry_search = _find_direct_stack_plan(
+                        planner=planner,
+                        driver=driver,
+                        options=direct_options(
+                            retry_upper,
+                            retry_bottom,
+                            excluded_candidate_ids=tuple(failed_candidates),
+                        ),
+                        directory=(run_directory / "retries" / f"attempt_{task_attempt:02d}"),
+                    )
+                    atomic_write_json(
+                        run_directory / "retries" / f"attempt_{task_attempt:02d}_search.json",
+                        {
+                            "excluded_candidate_ids": failed_candidates,
+                            "attempts": retry_search,
+                        },
+                    )
+                    if retry_selected is None:
+                        raise RuntimeError(
+                            "no direct stack plan remained after excluding the failed grasp"
+                        )
+                    selected_metadata, stack_request, stack_plan, selected_dir = retry_selected
+                except (PlannerRequestRejected, RuntimeError, ValueError) as error:
+                    driver.check()
+                    raise TabletopTaskRejected(
+                        f"direct stack retry could not produce a fresh plan: {error}"
+                    ) from error
         _command_fingers(
             dex_controller,
             driver,
@@ -1057,19 +1293,17 @@ def run_stack(args) -> int:
         status = {
             "status": "completed",
             "commands_robot": True,
-            "task": "cube60_to_table_then_cube40_on_cube60",
-            "placement_candidate": candidate.to_dict(),
-            "cube60_arm": cube60_arm,
-            "cube40_arm": cube40_arm,
-            "stage1": stage1_result,
-            "stage2": stage2_result,
+            "task": "one_pick_direct_cube60_on_cube60",
+            "selection": selected_metadata,
+            "result": stack_result,
+            "retry_events": retry_events,
             "terminal_action": guard.terminal_action,
             "maximum_arm_velocity_rad_s": velocity,
         }
         print(
-            "TWO-CUBE STACK PASSED — the 60 mm cube was placed and reobserved, the "
-            "40 mm cube was placed on it, both arms returned to their supported starts, "
-            "and seated FSM 3 was restored",
+            "DIRECT TWO-CUBE STACK PASSED — one 60 mm cube was placed directly on "
+            f"the other, the {selected_arm} arm returned to its supported start, "
+            "the unused arm never moved, and seated FSM 3 was restored",
             flush=True,
         )
     except TabletopTaskRejected as rejection:
@@ -1114,14 +1348,16 @@ def run_stack(args) -> int:
         status = {
             "status": "task_rejected",
             "commands_robot": bool(transport is not None and transport.command_count),
-            "task": "cube60_to_table_then_cube40_on_cube60",
+            "task": "one_pick_direct_cube60_on_cube60",
             "reason": str(rejection),
+            "retry_events": retry_events,
             "terminal_action": guard.terminal_action,
             "supported_return_completed": not left_at_clearance and not right_at_clearance,
         }
         print(
-            "STACK TASK REJECTED — both arms returned through their frozen supported "
-            f"routes and seated FSM 3 was restored. Reason: {rejection}",
+            "STACK TASK REJECTED — the selected arm returned through its frozen "
+            "supported route, the unused arm remained at its start, and seated FSM 3 "
+            f"was restored. Reason: {rejection}",
             flush=True,
         )
     except BaseException as error:
@@ -1129,9 +1365,10 @@ def run_stack(args) -> int:
         status = {
             "status": "failed",
             "commands_robot": bool(transport is not None and transport.command_count),
-            "task": "cube60_to_table_then_cube40_on_cube60",
+            "task": "one_pick_direct_cube60_on_cube60",
             "error_type": type(error).__name__,
             "error": str(error),
+            "retry_events": retry_events,
         }
         raise
     finally:

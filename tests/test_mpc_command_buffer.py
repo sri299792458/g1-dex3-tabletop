@@ -22,12 +22,14 @@ def _window(
     terminal: bool = False,
     route_progress: int = 0,
     predicted_dq_rad_s: float | None = None,
+    tracking_offset_rad: float = 0.0,
 ) -> MPCCommandWindow:
     times = np.linspace(0.0, 0.2, 51)
     values = np.linspace(start_q, end_q, len(times))[:, None] * np.ones((1, 7))
     velocity = (end_q - start_q) / times[-1] if predicted_dq_rad_s is None else predicted_dq_rad_s
     velocities = np.full_like(values, velocity)
     accelerations = np.zeros_like(values)
+    predicted_values = values - tracking_offset_rad
     return MPCCommandWindow(
         generation=generation,
         plan_sha256=PLAN_HASH,
@@ -35,7 +37,7 @@ def _window(
         valid_from_monotonic_s=valid_from_s,
         sample_time_s=tuple(times),
         command_q_rad=tuple(tuple(row) for row in values),
-        predicted_q_rad=tuple(tuple(row) for row in values),
+        predicted_q_rad=tuple(tuple(row) for row in predicted_values),
         predicted_dq_rad_s=tuple(tuple(row) for row in velocities),
         predicted_ddq_rad_s2=tuple(tuple(row) for row in accelerations),
         predecessor_sha256=predecessor_sha256,
@@ -183,6 +185,8 @@ def test_next_window_can_restart_from_a_held_certified_endpoint() -> None:
         now_s=10.40,
         minimum_lead_s=0.12,
         handoff_quantum_s=0.04,
+        live_measured_q_rad=np.full(7, 0.02),
+        live_active_command_q_rad=np.full(7, 0.02),
     )
     assert boundary.valid_from_monotonic_s == pytest.approx(10.52)
     assert boundary.command_q_rad == pytest.approx((0.02,) * 7)
@@ -202,7 +206,12 @@ def test_next_window_can_restart_from_a_held_certified_endpoint() -> None:
         route_progress=10,
         predicted_dq_rad_s=0.0,
     )
-    buffer.install(second, now_s=10.45, active_command_q_rad=np.full(7, 0.02))
+    buffer.install(
+        second,
+        now_s=10.45,
+        active_command_q_rad=np.full(7, 0.02),
+        handoff_boundary=boundary,
+    )
     assert np.allclose(
         buffer.command(
             now_s=10.50,
@@ -228,7 +237,13 @@ def test_next_window_starts_at_exact_certified_future_boundary() -> None:
     buffer.install(first, now_s=10.05, active_command_q_rad=np.zeros(7))
     buffer.command(now_s=10.12, measured_q_rad=np.zeros(7), measured_dq_rad_s=np.full(7, 0.1))
 
-    boundary = buffer.handoff_boundary(now_s=10.13, minimum_lead_s=0.12, handoff_quantum_s=0.04)
+    boundary = buffer.handoff_boundary(
+        now_s=10.13,
+        minimum_lead_s=0.12,
+        handoff_quantum_s=0.04,
+        live_measured_q_rad=np.full(7, 0.001),
+        live_active_command_q_rad=np.full(7, 0.001),
+    )
     assert boundary.valid_from_monotonic_s == pytest.approx(10.28)
     assert boundary.command_q_rad == pytest.approx((0.016,) * 7)
     assert boundary.predicted_q_rad == pytest.approx((0.016,) * 7)
@@ -247,7 +262,12 @@ def test_next_window_starts_at_exact_certified_future_boundary() -> None:
         route_progress=10,
         predicted_dq_rad_s=boundary.predicted_dq_rad_s[0],
     )
-    buffer.install(second, now_s=10.20, active_command_q_rad=np.zeros(7))
+    buffer.install(
+        second,
+        now_s=10.20,
+        active_command_q_rad=np.zeros(7),
+        handoff_boundary=boundary,
+    )
     assert np.allclose(
         buffer.command(
             now_s=10.28, measured_q_rad=np.full(7, 0.016), measured_dq_rad_s=np.full(7, 0.04)
@@ -281,7 +301,13 @@ def test_buffer_rejects_wrong_predecessor_and_live_handoff_state() -> None:
     buffer = _buffer()
     buffer.install(first, now_s=10.05, active_command_q_rad=np.zeros(7))
     buffer.command(now_s=10.12, measured_q_rad=np.zeros(7), measured_dq_rad_s=np.full(7, 0.1))
-    boundary = buffer.handoff_boundary(now_s=10.13, minimum_lead_s=0.12, handoff_quantum_s=0.04)
+    boundary = buffer.handoff_boundary(
+        now_s=10.13,
+        minimum_lead_s=0.12,
+        handoff_quantum_s=0.04,
+        live_measured_q_rad=np.full(7, 0.001),
+        live_active_command_q_rad=np.full(7, 0.001),
+    )
     wrong = _window(
         generation=1,
         source_s=10.14,
@@ -291,7 +317,12 @@ def test_buffer_rejects_wrong_predecessor_and_live_handoff_state() -> None:
         predecessor_sha256="b" * 64,
     )
     with pytest.raises(ValueError, match="predecessor"):
-        buffer.install(wrong, now_s=10.20, active_command_q_rad=np.zeros(7))
+        buffer.install(
+            wrong,
+            now_s=10.20,
+            active_command_q_rad=np.zeros(7),
+            handoff_boundary=boundary,
+        )
 
 
 def test_buffer_can_finish_the_unchanged_active_horizon_after_planning_failure() -> None:
@@ -322,4 +353,71 @@ def test_buffer_can_finish_the_unchanged_active_horizon_after_planning_failure()
             now_s=10.13,
             minimum_lead_s=0.04,
             handoff_quantum_s=0.04,
+            live_measured_q_rad=np.zeros(7),
+            live_active_command_q_rad=np.zeros(7),
         )
+
+
+def test_future_handoff_remeasures_live_tracking_offset() -> None:
+    buffer = _buffer()
+    first = _window(route_progress=6)
+    buffer.install(first, now_s=10.05, active_command_q_rad=np.zeros(7))
+    buffer.command(now_s=10.12, measured_q_rad=np.zeros(7), measured_dq_rad_s=np.full(7, 0.1))
+
+    boundary = buffer.handoff_boundary(
+        now_s=10.13,
+        minimum_lead_s=0.12,
+        handoff_quantum_s=0.04,
+        live_measured_q_rad=np.full(7, -0.009),
+        live_active_command_q_rad=np.full(7, 0.001),
+    )
+
+    # The immutable future command is 0.016 rad. The newly observed physical
+    # tracking offset is +0.010 rad, so the predicted physical handoff is
+    # reanchored to 0.006 rad instead of retaining the old 0.016 rad prediction.
+    assert boundary.command_q_rad == pytest.approx((0.016,) * 7)
+    assert boundary.predicted_q_rad == pytest.approx((0.006,) * 7)
+
+    stale_prediction = _window(
+        generation=1,
+        source_s=10.14,
+        valid_from_s=boundary.valid_from_monotonic_s,
+        start_q=0.016,
+        end_q=0.020,
+        predecessor_sha256=boundary.predecessor_sha256,
+        route_progress=10,
+        predicted_dq_rad_s=boundary.predicted_dq_rad_s[0],
+    )
+    with pytest.raises(ValueError, match="live-reanchored boundary"):
+        buffer.install(
+            stale_prediction,
+            now_s=10.20,
+            active_command_q_rad=np.full(7, 0.008),
+            handoff_boundary=boundary,
+        )
+
+    replacement = _window(
+        generation=1,
+        source_s=10.14,
+        valid_from_s=boundary.valid_from_monotonic_s,
+        start_q=0.016,
+        end_q=0.020,
+        predecessor_sha256=boundary.predecessor_sha256,
+        route_progress=10,
+        predicted_dq_rad_s=boundary.predicted_dq_rad_s[0],
+        tracking_offset_rad=0.01,
+    )
+    buffer.install(
+        replacement,
+        now_s=10.20,
+        active_command_q_rad=np.full(7, 0.008),
+        handoff_boundary=boundary,
+    )
+    assert np.allclose(
+        buffer.command(
+            now_s=10.28,
+            measured_q_rad=np.full(7, 0.006),
+            measured_dq_rad_s=np.full(7, boundary.predicted_dq_rad_s[0]),
+        ),
+        0.016,
+    )

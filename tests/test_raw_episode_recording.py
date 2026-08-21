@@ -80,13 +80,32 @@ def test_tabletop_cli_records_camera_by_default_and_exposes_explicit_skip() -> N
     assert args.object_profile == "cube40-r3"
     assert args.skip_camera_recording is False
     assert args.maximum_arm_velocity_rad_s is None
+    assert args.pregrasp_distance_m is None
     assert build_parser().parse_args(
         [*command, "--maximum-arm-velocity-rad-s", "0.2"]
     ).maximum_arm_velocity_rad_s == pytest.approx(0.2)
+    assert build_parser().parse_args(
+        [*command, "--pregrasp-distance-m", "0.05"]
+    ).pregrasp_distance_m == pytest.approx(0.05)
     assert (
         build_parser().parse_args([*command, "--skip-camera-recording"]).skip_camera_recording
         is True
     )
+
+
+def test_stack_cli_exposes_pregrasp_distance_override() -> None:
+    command = [
+        "run-stack",
+        "--network-interface",
+        "test0",
+        "--confirm",
+        "test acknowledgement",
+    ]
+
+    assert build_parser().parse_args(command).pregrasp_distance_m is None
+    assert build_parser().parse_args(
+        [*command, "--pregrasp-distance-m", "0.075"]
+    ).pregrasp_distance_m == pytest.approx(0.075)
 
 
 def test_seat_compliance_cli_records_camera_and_runs_both_arms() -> None:

@@ -42,6 +42,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     _planned_trajectory,
     _pregrasp_endpoint_self_collision_reasons,
     _PregraspBranch,
+    _request_pregrasp_distance_m,
     _selected_open_transit_world_robot,
     _split_lift_trajectory,
     _table_from_resting_object,
@@ -394,9 +395,7 @@ def test_mpc_initial_window_timeout_never_starts_streaming() -> None:
                     solve_time_s=0.02,
                     diagnostics={
                         "curobo_feasible": False,
-                        "curobo_constraints": [
-                            {"name": "cspace", "maximum": 1.0}
-                        ],
+                        "curobo_constraints": [{"name": "cspace", "maximum": 1.0}],
                     },
                 ).to_dict()
             }
@@ -445,9 +444,7 @@ def test_mpc_retries_a_rejected_replacement_from_the_unchanged_predecessor() -> 
                 predicted_ddq_rad_s2=q,
                 command_q_rad=q,
                 valid_from_monotonic_s=time.monotonic() + 1.0,
-                predecessor_sha256=(
-                    None if self.active is None else self.active.content_sha256
-                ),
+                predecessor_sha256=(None if self.active is None else self.active.content_sha256),
                 committed_route_progress_index=0,
             )
 
@@ -465,7 +462,7 @@ def test_mpc_retries_a_rejected_replacement_from_the_unchanged_predecessor() -> 
                 "remaining_s": 0.0,
             }
 
-        def update_streaming_trajectory(self, *, window):
+        def update_streaming_trajectory(self, *, window, **_kwargs):
             assert window.predecessor_sha256 == self.active.content_sha256
             self.active = window
             self.state = ExecutorState.READY
@@ -1317,6 +1314,7 @@ def test_task_config_uses_only_a_local_open_transit_table_patch() -> None:
     assert "physical_table_thickness_m" not in request.to_dict()
     assert request.open_transit_table_patch_dimensions_m == (0.400, 0.400, 0.020)
     assert request.maximum_arm_velocity_rad_s == 0.200
+    assert request.pregrasp_distance_m == 0.050
     assert request.retention_test_lift_m == 0.030
     assert request.minimum_hand_plane_clearance_m == 0.005
 
@@ -1329,8 +1327,12 @@ def test_task_config_uses_only_a_local_open_transit_table_patch() -> None:
         task_config_path=task,
         object_dimensions_m=(0.040, 0.040, 0.040),
         maximum_arm_velocity_rad_s=0.100,
+        pregrasp_distance_m=0.075,
     )
     assert slower_request.maximum_arm_velocity_rad_s == 0.100
+    assert slower_request.pregrasp_distance_m == 0.075
+    shortlist_document, _ = _load_shortlist(slower_request)
+    assert _request_pregrasp_distance_m(slower_request, shortlist_document) == 0.075
 
 
 def test_tabletop_trajectory_is_retimed_to_task_velocity() -> None:
@@ -1375,10 +1377,17 @@ def test_validated_lift_split_preserves_every_sample_and_exact_join() -> None:
 
 
 @pytest.mark.parametrize(
-    ("profile_id", "dimensions_m", "candidate_count", "top_marker_id"),
     (
-        ("cube40-r3", (0.040, 0.040, 0.040), 5, 4),
-        ("cube60-r3", (0.060, 0.060, 0.060), 57, 14),
+        "profile_id",
+        "dimensions_m",
+        "candidate_count",
+        "top_marker_id",
+        "approach_distance_m",
+    ),
+    (
+        ("cube40-r3", (0.040, 0.040, 0.040), 5, 4, 0.050),
+        ("cube60-r3", (0.060, 0.060, 0.060), 57, 14, 0.050),
+        ("cube60-r3-secondary", (0.060, 0.060, 0.060), 57, 24, 0.050),
     ),
 )
 def test_object_profile_binds_detector_mesh_dimensions_and_shortlist(
@@ -1386,6 +1395,7 @@ def test_object_profile_binds_detector_mesh_dimensions_and_shortlist(
     dimensions_m,
     candidate_count,
     top_marker_id,
+    approach_distance_m,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
     bundle_path = root / "config/calibrations/dex3_shared_20260812_selected_free.json"
@@ -1406,6 +1416,8 @@ def test_object_profile_binds_detector_mesh_dimensions_and_shortlist(
     detector = json.loads(profile.detector_config_path.read_text(encoding="utf-8"))
 
     assert request.object_dimensions_m == dimensions_m
+    assert request.pregrasp_distance_m == approach_distance_m
+    assert _shortlist["execution_contract"]["approach_distance_m"] == approach_distance_m
     assert len(candidates) == candidate_count
     assert all(
         item["execution_evidence"]["qualification_model"]

@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from scipy.spatial.transform import Rotation
 
+from g1_aprilcube_calibration.joint_map import arm_indices
+from g1_dex3_tabletop import hardware_stack
+from g1_dex3_tabletop.hardware_stack import (
+    _active_clearance_snapshot,
+    _dual_arm_command_snapshot,
+    _nearest_cube_move,
+)
 from g1_dex3_tabletop.planning import tabletop_planner, tabletop_session
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
 from g1_dex3_tabletop.planning.dex3_handedness import dex3_execution_profile
@@ -15,10 +22,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
 )
 from g1_dex3_tabletop.planning.tabletop_session import TabletopPlanningSession
 from g1_dex3_tabletop.stack_workflow import (
-    build_observed_stack_second_stage_request,
-    build_stack_stage_requests,
-    stack_arm_assignments,
-    stack_placement_candidates,
+    build_direct_stack_request,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
     TabletopObservation,
@@ -70,11 +74,86 @@ def _trajectory(source: str, target: str, start: float, end: float) -> PlannedTr
     )
 
 
+def test_right_escape_snapshot_uses_held_command_instead_of_tracking_measurement() -> None:
+    measured = np.zeros(29)
+    right_indices = np.asarray(arm_indices("right"))
+    measured[right_indices[3]] = -0.020277314
+    state = SimpleNamespace(position=measured)
+    hands = SimpleNamespace(
+        left=SimpleNamespace(position=np.zeros(7)),
+        right=SimpleNamespace(position=np.zeros(7)),
+    )
+    left_command = np.full(7, 0.25)
+    held_right_command = np.zeros(7)
+
+    snapshot = _dual_arm_command_snapshot(
+        state,
+        hands,
+        left_command_q_rad=left_command,
+        right_command_q_rad=held_right_command,
+    )
+
+    q29 = np.asarray(snapshot.measured_q29_rad)
+    np.testing.assert_array_equal(q29[right_indices], held_right_command)
+    np.testing.assert_array_equal(q29[np.asarray(arm_indices("left"))], left_command)
+
+
+def test_active_clearance_snapshot_keeps_unused_arm_at_supported_command() -> None:
+    state = SimpleNamespace(position=np.full(29, 0.9))
+    hands = SimpleNamespace(
+        left=SimpleNamespace(position=np.zeros(7)),
+        right=SimpleNamespace(position=np.ones(7)),
+    )
+    escape = SimpleNamespace(
+        outbound=SimpleNamespace(command_q_rad=((0.0,) * 7, (0.25,) * 7))
+    )
+
+    snapshot = _active_clearance_snapshot(
+        state,
+        hands,
+        arm="right",
+        escape=escape,
+        inactive_command_q_rad=np.full(7, -0.1),
+    )
+
+    q29 = np.asarray(snapshot.measured_q29_rad)
+    np.testing.assert_array_equal(q29[np.asarray(arm_indices("left"))], -0.1)
+    np.testing.assert_array_equal(q29[np.asarray(arm_indices("right"))], 0.25)
+
+
+def test_nearest_cube_move_selects_one_global_cube_arm_pair() -> None:
+    class FakeModel:
+        @staticmethod
+        def transform(_parent, child, _positions):
+            value = np.eye(4)
+            if child == "left_rubber_hand":
+                value[0, 3] = -0.30
+            elif child == "right_rubber_hand":
+                value[0, 3] = 0.30
+            return value
+
+    upper = _observation(0.24, 0.0, 0.030)
+    bottom = _observation(-0.05, 0.0, 0.030)
+
+    selected = _nearest_cube_move(
+        reference_request=_request("left", upper, 0.060),
+        upper_observation=upper,
+        bottom_observation=bottom,
+        model=FakeModel(),
+    )
+
+    assert selected["moving_cube"] == "secondary"
+    assert selected["support_cube"] == "primary"
+    assert selected["arm"] == "right"
+    assert selected["source_hand_distance_m"] == pytest.approx(np.hypot(0.06, 0.03))
+
+
 def _task(
     request: TabletopTaskRequest,
     *,
     candidate_id: str,
     endpoints: tuple[float, ...],
+    branch_counts: dict[str, int] | None = None,
 ) -> TabletopTaskPlan:
     phases = (
         "move_to_pregrasp",
@@ -104,56 +183,37 @@ def _task(
         initial_active_dex3_q_rad=(0.0,) * 7,
         trajectories=tuple(routes),
         phase_order=phases,
-        planner_provenance={},
+        planner_provenance=(
+            {}
+            if branch_counts is None
+            else {"pregrasp_ik_unique_branches_by_candidate": branch_counts}
+        ),
     )
 
 
-def test_stack_candidates_span_only_proven_nonoverlapping_table_segment() -> None:
-    cube40 = _observation(0.20, 0.0, 0.020)
-    cube60 = _observation(-0.20, 0.0, 0.030)
+def test_direct_stack_uses_observed_support_cube_and_center_on_center_target() -> None:
+    moving = _observation(0.20, 0.0, 0.030)
+    support = _observation(-0.20, 0.10, 0.030)
 
-    candidates = stack_placement_candidates(
-        cube40=cube40,
-        cube60=cube60,
+    request = build_direct_stack_request(
+        moving_request=_request("left", moving, 0.060),
+        support_cube=support,
         base_T_camera=np.eye(4),
-        count=5,
+        excluded_candidate_ids=("failed_grasp",),
     )
 
-    assert len(candidates) == 5
-    assert all(item.cube60_displacement_m > 0.0 for item in candidates)
-    assert all(item.placed_center_separation_m > 0.075 for item in candidates)
-    assert [item.placed_center_separation_m for item in candidates] == sorted(
-        item.placed_center_separation_m for item in candidates
-    )
-    assert candidates[0].table_plane_disagreement_mm == pytest.approx(0.0)
-    assert candidates[0].table_normal_disagreement_deg == pytest.approx(0.0)
-
-
-def test_stack_stage_requests_keep_real_table_and_finite_60mm_support() -> None:
-    cube40 = _observation(0.20, 0.0, 0.020)
-    cube60 = _observation(-0.20, 0.0, 0.030)
-    candidate = stack_placement_candidates(
-        cube40=cube40,
-        cube60=cube60,
-        base_T_camera=np.eye(4),
-        count=1,
-    )[0]
-    stage1, stage2 = build_stack_stage_requests(
-        cube40_request=_request("right", cube40, 0.040),
-        cube60_request=_request("left", cube60, 0.060),
-        candidate=candidate,
-    )
-
-    assert stage1.source_request.environment_cuboids[0].object_id == "cube40"
-    assert stage1.destination_support_object_id is None
-    assert stage2.source_request.environment_cuboids[0].object_id == "cube60"
-    destination = destination_request_for_pick_place(stage2)
-    assert destination.environment_cuboids[0].role == "placement_support"
-    camera_T_destination = np.asarray(destination.observation.camera_T_object)
-    assert camera_T_destination[2, 3] == pytest.approx(0.080)
+    obstacle = request.source_request.environment_cuboids[0]
+    assert obstacle.object_id == "support_cube"
     np.testing.assert_allclose(
-        destination.table_reference_camera_T_object,
-        stage2.source_request.observation.camera_T_object,
+        np.asarray(obstacle.object_T_cuboid)[:3, 3],
+        (-0.40, 0.10, 0.0),
+    )
+    assert request.excluded_candidate_ids == ("failed_grasp",)
+    destination = destination_request_for_pick_place(request)
+    assert destination.environment_cuboids[0].role == "placement_support"
+    np.testing.assert_allclose(
+        np.asarray(destination.observation.camera_T_object)[:3, 3],
+        (-0.20, 0.10, 0.090),
     )
     plane_point, _destination_object, _down = _table_from_resting_object(
         destination,
@@ -162,62 +222,125 @@ def test_stack_stage_requests_keep_real_table_and_finite_60mm_support() -> None:
     assert plane_point[2] == pytest.approx(0.0)
 
 
-def test_observed_second_stage_uses_actual_support_pose() -> None:
-    cube40 = _observation(0.20, 0.0, 0.020)
-    placed60 = _observation(-0.05, 0.10, 0.030)
+def test_direct_stack_yaw_is_only_a_nominal_wrist_path_choice() -> None:
+    moving = _observation(0.20, 0.0, 0.030)
+    support = _observation(-0.20, 0.10, 0.030)
 
-    stage2 = build_observed_stack_second_stage_request(
-        cube40_request=_request("right", cube40, 0.040),
-        placed_cube60=placed60,
+    request = build_direct_stack_request(
+        moving_request=_request("right", moving, 0.060),
+        support_cube=support,
         base_T_camera=np.eye(4),
+        yaw_quarter_turns=1,
     )
+    source_T_destination = np.asarray(request.source_T_destination_object)
 
-    support = stage2.source_request.environment_cuboids[0]
-    assert support.object_id == "cube60"
     np.testing.assert_allclose(
-        np.asarray(support.object_T_cuboid)[:3, 3],
-        (-0.25, 0.10, 0.01),
+        source_T_destination[:3, :3],
+        Rotation.from_euler("z", 90.0, degrees=True).as_matrix(),
+        atol=1.0e-12,
     )
-    destination = destination_request_for_pick_place(stage2)
-    assert destination.environment_cuboids[0].role == "placement_support"
-    np.testing.assert_allclose(
-        np.asarray(destination.observation.camera_T_object)[:3, 3],
-        (-0.05, 0.10, 0.080),
-    )
-
-
-def test_nearest_arm_assignment_is_only_an_ordering_heuristic() -> None:
-    cube40 = _observation(0.30, 0.20, 0.020)
-    cube60 = _observation(0.30, -0.20, 0.030)
-    ordered = stack_arm_assignments(
-        cube40=cube40,
-        cube60=cube60,
-        base_T_camera=np.eye(4),
-        base_left_hand_position=np.asarray((0.30, 0.15, 0.10)),
-        base_right_hand_position=np.asarray((0.30, -0.15, 0.10)),
-    )
-
-    assert ordered == (("right", "left"), ("left", "right"))
-    assert set(ordered) == {("left", "right"), ("right", "left")}
-
-
-def test_stack_requires_opposite_arms() -> None:
-    cube40 = _observation(0.20, 0.0, 0.020)
-    cube60 = _observation(-0.20, 0.0, 0.030)
-    candidate = stack_placement_candidates(
-        cube40=cube40,
-        cube60=cube60,
-        base_T_camera=np.eye(4),
-        count=1,
-    )[0]
-    request40 = _request("left", cube40, 0.040)
-    request60 = replace(_request("right", cube60, 0.060), arm="left")
-    with pytest.raises(ValueError, match="different arm"):
-        build_stack_stage_requests(
-            cube40_request=request40,
-            cube60_request=request60,
-            candidate=candidate,
+    with pytest.raises(ValueError, match="0, 1, 2, or 3"):
+        build_direct_stack_request(
+            moving_request=_request("right", moving, 0.060),
+            support_cube=support,
+            base_T_camera=np.eye(4),
+            yaw_quarter_turns=4,
         )
+
+
+def test_attached_stack_transfer_does_not_turn_supported_unused_arm_into_table_collision(
+    monkeypatch,
+) -> None:
+    moving = _observation(0.20, 0.0, 0.030)
+    support = _observation(-0.20, 0.10, 0.030)
+    request = build_direct_stack_request(
+        moving_request=_request("right", moving, 0.060),
+        support_cube=support,
+        base_T_camera=np.eye(4),
+    )
+    base_scene_calls = []
+
+    def fake_base_scene(_request, _base_T_torso, **kwargs):
+        base_scene_calls.append(kwargs)
+        return {"cuboid": {"support_cube": {"dims": [0.06, 0.06, 0.06]}}}
+
+    monkeypatch.setattr(tabletop_planner, "_base_scene", fake_base_scene)
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_table_from_resting_object",
+        lambda _request, _base_T_torso: (
+            np.array([0.0, 0.0, 0.0]),
+            np.eye(4),
+            np.array([0.0, 0.0, -1.0]),
+        ),
+    )
+
+    scene, _plane_point, _down = tabletop_planner._attached_transfer_scene(
+        request,
+        np.eye(4),
+    )
+
+    assert base_scene_calls == [
+        {"include_cube": False, "include_open_transit_table_patch": False}
+    ]
+    assert set(scene["cuboid"]) == {"support_cube"}
+
+
+def test_direct_stack_intersects_every_endpoint_before_route_planning(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    moving = _observation(0.20, 0.0, 0.030)
+    support = _observation(-0.20, 0.10, 0.030)
+    requests = tuple(
+        build_direct_stack_request(
+            moving_request=_request("left", moving, 0.060),
+            support_cube=support,
+            base_T_camera=np.eye(4),
+            yaw_quarter_turns=yaw,
+        )
+        for yaw in (0, 1)
+    )
+    events = []
+
+    class FakePlanner:
+        def request_payload(self, _operation, *, payload, **_kwargs):
+            request = TabletopPickPlaceRequest.from_json(payload["request"])
+            events.append(("endpoint", request.content_sha256))
+            common = 0 if request.content_sha256 == requests[0].content_sha256 else 2
+            return {
+                "payload": {
+                    "request_sha256": request.content_sha256,
+                    "common_candidate_count": common,
+                }
+            }
+
+    plan = SimpleNamespace(content_sha256="c" * 64)
+
+    def fake_plan(_planner, *, request, **_kwargs):
+        events.append(("plan", request.content_sha256))
+        return plan
+
+    monkeypatch.setattr(hardware_stack, "_plan_pick_place", fake_plan)
+    result, attempts = hardware_stack._find_direct_stack_plan(
+        planner=FakePlanner(),
+        driver=SimpleNamespace(check=lambda: None),
+        options=(
+            ({"moving_cube": "first", "arm": "left", "yaw_quarter_turns": 0}, requests[0]),
+            (
+                {"moving_cube": "first", "arm": "left", "yaw_quarter_turns": 1},
+                requests[1],
+            ),
+        ),
+        directory=tmp_path,
+    )
+
+    assert [event[0] for event in events] == ["endpoint", "endpoint", "plan"]
+    assert result is not None
+    assert result[1] == requests[1]
+    assert result[2] is plan
+    assert attempts[0]["passed"] is False
+    assert attempts[1]["passed"] is True
 
 
 def test_pick_place_tries_next_grasp_when_first_cannot_place(monkeypatch) -> None:
@@ -234,7 +357,11 @@ def test_pick_place_tries_next_grasp_when_first_cannot_place(monkeypatch) -> Non
     calls = []
 
     def fake_plan(current, *, required_candidate_id=None, **_kwargs):
-        candidate_id = required_candidate_id or "candidate_a"
+        candidate_id = required_candidate_id or (
+            "candidate_b"
+            if current.content_sha256 == destination.content_sha256
+            else "candidate_a"
+        )
         calls.append((current.content_sha256, required_candidate_id))
         if current.content_sha256 == destination.content_sha256 and candidate_id == "candidate_a":
             raise RuntimeError("candidate_a cannot reach destination")
@@ -259,6 +386,16 @@ def test_pick_place_tries_next_grasp_when_first_cannot_place(monkeypatch) -> Non
     monkeypatch.setattr(tabletop_planner, "plan_tabletop_task", fake_plan)
     monkeypatch.setattr(
         tabletop_planner,
+        "_tabletop_endpoint_feasibility",
+        lambda _request, **_kwargs: tabletop_planner._EndpointFeasibility(
+            candidate_branch_counts={"candidate_a": 2, "candidate_b": 2},
+            fixed_close_viable_candidate_count=2,
+            rejections=(),
+            elapsed_s=0.1,
+        ),
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
         "_load_shortlist",
         lambda _request: ({}, [{"candidate_id": "candidate_a"}, {"candidate_id": "candidate_b"}]),
     )
@@ -267,10 +404,148 @@ def test_pick_place_tries_next_grasp_when_first_cannot_place(monkeypatch) -> Non
     plan = plan_tabletop_pick_place(request)
 
     assert plan.selected_candidate_id == "candidate_b"
-    assert [value[1] for value in calls] == [None, "candidate_a", "candidate_b", "candidate_b"]
+    assert [value[1] for value in calls] == ["candidate_a", "candidate_b", "candidate_b"]
     assert plan.planner_provenance["rejected_pick_place_grasps"][0]["candidate_id"] == (
         "candidate_a"
     )
+
+
+def test_pick_place_skips_candidates_pruned_by_batched_endpoint_intersection(
+    monkeypatch,
+) -> None:
+    source = _request("left", _observation(0.20, 0.0, 0.020), 0.040)
+    source_T_destination = np.eye(4)
+    source_T_destination[0, 3] = 0.10
+    request = TabletopPickPlaceRequest(
+        source_request=source,
+        source_T_destination_object=source_T_destination,
+    )
+    endpoints = (0.10, 0.20, 0.30, 0.40, 0.30, 0.20, 0.10, 0.0)
+    calls = []
+
+    def fake_plan(current, *, required_candidate_id=None, **_kwargs):
+        calls.append((current.content_sha256, required_candidate_id))
+        return _task(current, candidate_id=required_candidate_id, endpoints=endpoints)
+
+    def fake_feasibility(current, **_kwargs):
+        counts = (
+            {"candidate_a": 4, "candidate_b": 0, "candidate_c": 3}
+            if current.content_sha256 == source.content_sha256
+            else {"candidate_a": 0, "candidate_b": 5, "candidate_c": 2}
+        )
+        return tabletop_planner._EndpointFeasibility(
+            candidate_branch_counts=counts,
+            fixed_close_viable_candidate_count=2,
+            rejections=(),
+            elapsed_s=0.1,
+        )
+
+    monkeypatch.setattr(tabletop_planner, "plan_tabletop_task", fake_plan)
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_tabletop_endpoint_feasibility",
+        fake_feasibility,
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_load_shortlist",
+        lambda _request: (
+            {},
+            [
+                {"candidate_id": "candidate_a"},
+                {"candidate_id": "candidate_b"},
+                {"candidate_id": "candidate_c"},
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_plan_attached_transfer",
+        lambda _request, source_task, destination_task, **_kwargs: (
+            _trajectory(
+                "payload_lift",
+                "payload_transfer",
+                source_task.trajectories[3].command_q_rad[-1][0],
+                destination_task.trajectories[3].command_q_rad[-1][0],
+            ),
+            {"test": True},
+        ),
+    )
+
+    plan = plan_tabletop_pick_place(request)
+
+    assert plan.selected_candidate_id == "candidate_c"
+    assert [required for _request_hash, required in calls] == ["candidate_c", "candidate_c"]
+    assert plan.planner_provenance["common_endpoint_viable_candidate_count"] == 1
+
+
+def test_pick_place_retry_excludes_failed_physical_grasp(monkeypatch) -> None:
+    source = _request("left", _observation(0.20, 0.0, 0.030), 0.060)
+    source_T_destination = np.eye(4)
+    source_T_destination[0, 3] = 0.10
+    request = TabletopPickPlaceRequest(
+        source_request=source,
+        source_T_destination_object=source_T_destination,
+        excluded_candidate_ids=("candidate_a",),
+    )
+    calls = []
+    feasibility_calls = []
+
+    def fake_plan(
+        current,
+        *,
+        required_candidate_id=None,
+        excluded_candidate_ids=(),
+        **_kwargs,
+    ):
+        calls.append((required_candidate_id, excluded_candidate_ids))
+        candidate_id = required_candidate_id or "candidate_b"
+        return _task(
+            current,
+            candidate_id=candidate_id,
+            endpoints=(0.10, 0.20, 0.30, 0.40, 0.30, 0.20, 0.10, 0.0),
+        )
+
+    monkeypatch.setattr(tabletop_planner, "plan_tabletop_task", fake_plan)
+
+    def fake_feasibility(_current, *, excluded_candidate_ids=(), **_kwargs):
+        feasibility_calls.append(excluded_candidate_ids)
+        return tabletop_planner._EndpointFeasibility(
+            candidate_branch_counts={"candidate_b": 2},
+            fixed_close_viable_candidate_count=1,
+            rejections=(),
+            elapsed_s=0.1,
+        )
+
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_tabletop_endpoint_feasibility",
+        fake_feasibility,
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_load_shortlist",
+        lambda _request: ({}, [{"candidate_id": "candidate_a"}, {"candidate_id": "candidate_b"}]),
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_plan_attached_transfer",
+        lambda _request, source_task, destination_task, **_kwargs: (
+            _trajectory(
+                "payload_lift",
+                "payload_transfer",
+                source_task.trajectories[3].command_q_rad[-1][0],
+                destination_task.trajectories[3].command_q_rad[-1][0],
+            ),
+            {"test": True},
+        ),
+    )
+
+    plan = plan_tabletop_pick_place(request)
+
+    assert plan.selected_candidate_id == "candidate_b"
+    assert feasibility_calls == [("candidate_a",), ("candidate_a",)]
+    assert all(required != "candidate_a" for required, _excluded in calls)
 
 
 def test_pick_place_checker_is_built_only_for_the_selected_execution(monkeypatch) -> None:
@@ -304,3 +579,51 @@ def test_pick_place_checker_is_built_only_for_the_selected_execution(monkeypatch
         None,
     )
     assert builds == [(planned_request, planned_plan)]
+
+
+def test_stack_runtime_warmup_populates_both_arm_pools_without_planning(
+    monkeypatch,
+) -> None:
+    left = SimpleNamespace(arm="left")
+    right = SimpleNamespace(arm="right")
+    calls = []
+    events = []
+
+    def prewarm(request, *, planner_pool):
+        calls.append((request.arm, planner_pool))
+        return {"arm": request.arm, "task_feasibility_planning_performed": False}
+
+    monkeypatch.setattr(tabletop_session, "prewarm_tabletop_runtime_models", prewarm)
+    session = TabletopPlanningSession()
+
+    result = session.prewarm_stack_runtime(
+        (right, left),
+        progress=events.append,
+    )
+
+    assert calls == [
+        ("left", session._planner_pool),
+        ("right", session._planner_pool),
+    ]
+    assert set(result["arms"]) == {"left", "right"}
+    assert result["task_feasibility_planning_performed"] is False
+    assert result["robot_command_authorized"] is False
+    assert session._active_task is None
+    assert session._execution is None
+    assert events == [
+        (
+            "warming persistent left-arm open-hand and attached-payload MotionGen "
+            "models; no robot command or task solve"
+        ),
+        (
+            "warming persistent right-arm open-hand and attached-payload MotionGen "
+            "models; no robot command or task solve"
+        ),
+        (
+            "command-free dual-arm stack warmup complete; live loaded and clearance "
+            "observations remain the only source of executable task feasibility"
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate arm"):
+        session.prewarm_stack_runtime((left, left))

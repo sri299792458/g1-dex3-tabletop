@@ -15,6 +15,7 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
     RetentionRouteValidator,
     TabletopPlannerPool,
+    analyze_tabletop_pick_place_endpoints,
     plan_moving_grasp_continuation,
     plan_supported_escape,
     plan_tabletop_pick_place,
@@ -154,9 +155,7 @@ class TabletopPlanningSession:
                 phase="grasp_approach",
             )
             try:
-                mpc_setup_s = controller.setup_at_frozen_route_start(
-                    validate_strict_start=False
-                )
+                mpc_setup_s = controller.setup_at_frozen_route_start(validate_strict_start=False)
             except BaseException:
                 controller.close()
                 raise
@@ -177,6 +176,52 @@ class TabletopPlanningSession:
             "observations remain the only source of executable task feasibility"
         )
         return result
+
+    def prewarm_stack_runtime(
+        self,
+        requests: tuple[TabletopTaskRequest, ...],
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> dict:
+        """Warm both arm topologies for the fixed two-cube stack.
+
+        One aggregate worker command is intentional: the persistent CuRobo
+        process owns one CUDA context and one planner pool, while the parent is
+        free to keep servicing the read-only camera preview.  The two arms are
+        warmed sequentially inside that process; launching a second GPU worker
+        would duplicate model memory without making either planner reusable by
+        the hardware run.
+        """
+
+        by_arm = {request.arm: request for request in requests}
+        if len(by_arm) != len(requests):
+            raise ValueError("stack runtime warmup received a duplicate arm")
+        if set(by_arm) != {"left", "right"}:
+            raise ValueError("stack runtime warmup requires exactly left and right requests")
+        report = progress or (lambda _message: None)
+        started = time.perf_counter()
+        results: dict[str, dict] = {}
+        for arm in ("left", "right"):
+            report(
+                f"warming persistent {arm}-arm open-hand and attached-payload "
+                "MotionGen models; no robot command or task solve"
+            )
+            results[arm] = prewarm_tabletop_runtime_models(
+                by_arm[arm],
+                planner_pool=self._planner_pool,
+            )
+        elapsed_s = time.perf_counter() - started
+        report(
+            "command-free dual-arm stack warmup complete; live loaded and clearance "
+            "observations remain the only source of executable task feasibility"
+        )
+        return {
+            "operation": "prewarm_stack_runtime",
+            "elapsed_s": elapsed_s,
+            "arms": results,
+            "task_feasibility_planning_performed": False,
+            "robot_command_authorized": False,
+        }
 
     def plan_pick_place(
         self,
@@ -200,6 +245,20 @@ class TabletopPlanningSession:
         self._pick_place_plan = plan
         self._pick_place_retention_validator = None
         return plan
+
+    def analyze_pick_place_endpoints(
+        self,
+        request: TabletopPickPlaceRequest,
+        *,
+        progress: Callable[[str], None] | None = None,
+    ) -> dict:
+        """Run only the shared source/destination endpoint feasibility pass."""
+
+        return analyze_tabletop_pick_place_endpoints(
+            request,
+            planner_pool=self._planner_pool,
+            progress=progress,
+        )
 
     def validate_pick_place_retention_route(
         self,
@@ -536,9 +595,7 @@ class TabletopPlanningSession:
             reference_T_camera=np.asarray(
                 moving_target.get("reference_T_camera"), dtype=np.float64
             ),
-            camera_T_object=np.asarray(
-                moving_target.get("camera_T_object"), dtype=np.float64
-            ),
+            camera_T_object=np.asarray(moving_target.get("camera_T_object"), dtype=np.float64),
             target_provenance=moving_target,
             committed_route_progress_index=int(payload["committed_route_progress_index"]),
         )

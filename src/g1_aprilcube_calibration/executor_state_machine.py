@@ -205,16 +205,22 @@ class PoseExecutor:
             raise ValueError("MPC handoff lead must be positive and finite")
         if not np.isfinite(quantum) or quantum <= 0.0:
             raise ValueError("MPC handoff quantum must be positive and finite")
-        now = self.clock.monotonic()
         if self._mpc_command_buffer is not None:
+            # Pair these under the executor lock so the offset cannot combine a
+            # state sample with a command from a different controller tick.
+            live_state, live_active_command_q_rad = self.observe_control_input()
+            now = self.clock.monotonic()
             return self._mpc_command_buffer.handoff_boundary(
                 now_s=now,
                 minimum_lead_s=lead,
                 handoff_quantum_s=quantum,
+                live_measured_q_rad=live_state.arm_q(self.pose_set.calibration_arm),
+                live_active_command_q_rad=live_active_command_q_rad,
             )
         if self.state not in {ExecutorState.HOLDING, ExecutorState.READY}:
             raise RuntimeError("initial MPC handoff requires a stationary held state")
         sample = self.observe_state()
+        now = self.clock.monotonic()
         valid_from = np.ceil((now + lead) / quantum) * quantum
         return MPCHandoffBoundary(
             valid_from_monotonic_s=float(valid_from),
@@ -530,6 +536,7 @@ class PoseExecutor:
         self,
         *,
         window: MPCCommandWindow,
+        handoff_boundary: MPCHandoffBoundary,
     ) -> MPCCommandWindow:
         """Queue the next worker-certified window without modifying it."""
 
@@ -540,6 +547,7 @@ class PoseExecutor:
             window,
             now_s=now,
             active_command_q_rad=self.calibration_command_q,
+            handoff_boundary=handoff_boundary,
         )
         self._calibration_goal_q = np.asarray(window.predicted_q_rad[-1], dtype=np.float64)
         self._goal_q14 = self._compose_command(self._calibration_goal_q)

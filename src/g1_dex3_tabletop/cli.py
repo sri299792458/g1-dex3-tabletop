@@ -184,6 +184,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tabletop.add_argument(
+        "--pregrasp-distance-m",
+        type=float,
+        default=None,
+        help="object-frame approach distance; omitted uses the object-profile default",
+    )
+    tabletop.add_argument(
         "--pc2-host",
         default=os.environ.get("G1_PC2_HOST", "unitree@192.168.123.164"),
     )
@@ -218,7 +224,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     stack = subparsers.add_parser(
         "run-stack",
-        help="move the 60 mm cube, reobserve it, then place the 40 mm cube on top",
+        help="pick either 60 mm cube and place it directly on the other",
     )
     stack.add_argument("--network-interface", required=True)
     stack.add_argument("--domain-id", type=int, default=0)
@@ -229,10 +235,24 @@ def build_parser() -> argparse.ArgumentParser:
     stack.add_argument("--output-root", type=Path, default=ROOT / "runs")
     stack.add_argument("--observation-frames", type=int, default=5)
     stack.add_argument(
+        "--grasp-retries",
+        type=int,
+        default=1,
+        help=(
+            "reobserve and replan this many times after a physically rejected grasp; default: 1"
+        ),
+    )
+    stack.add_argument(
         "--maximum-arm-velocity-rad-s",
         type=float,
         default=None,
         help="explicit per-run limit; omitted uses the task-config default",
+    )
+    stack.add_argument(
+        "--pregrasp-distance-m",
+        type=float,
+        default=None,
+        help="object-frame approach distance; omitted uses the shared 60 mm profile default",
     )
     stack.add_argument(
         "--pc2-host",

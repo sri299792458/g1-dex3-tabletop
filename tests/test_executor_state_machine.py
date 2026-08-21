@@ -336,8 +336,17 @@ def mpc_window(
     valid_from_s: float | None = None,
     predecessor_sha256: str | None = None,
     predicted_dq_rad_s: np.ndarray | None = None,
+    predicted_start_q: np.ndarray | None = None,
 ) -> MPCCommandWindow:
     midpoint = (start_q + end_q) / 2.0
+    predicted_start = (
+        start_q
+        if predicted_start_q is None
+        else np.asarray(predicted_start_q, dtype=np.float64)
+    )
+    tracking_offset = start_q - predicted_start
+    predicted_midpoint = midpoint - tracking_offset
+    predicted_end = end_q - tracking_offset
     source_s = clock.monotonic()
     valid_from_s = source_s + 0.04 if valid_from_s is None else valid_from_s
     velocity = (
@@ -352,7 +361,11 @@ def mpc_window(
         valid_from_monotonic_s=valid_from_s,
         sample_time_s=(0.0, 0.1, 0.2),
         command_q_rad=(tuple(start_q), tuple(midpoint), tuple(end_q)),
-        predicted_q_rad=(tuple(start_q), tuple(midpoint), tuple(end_q)),
+        predicted_q_rad=(
+            tuple(predicted_start),
+            tuple(predicted_midpoint),
+            tuple(predicted_end),
+        ),
         predicted_dq_rad_s=(tuple(velocity), tuple(velocity), tuple(velocity)),
         predicted_ddq_rad_s2=((0.0,) * 7,) * 3,
         predecessor_sha256=predecessor_sha256,
@@ -401,8 +414,12 @@ def test_executor_streams_exact_future_handoff_then_settles_terminal_window() ->
         valid_from_s=boundary.valid_from_monotonic_s,
         predecessor_sha256=boundary.predecessor_sha256,
         predicted_dq_rad_s=np.asarray(boundary.predicted_dq_rad_s),
+        predicted_start_q=np.asarray(boundary.predicted_q_rad),
     )
-    accepted = executor.update_streaming_trajectory(window=terminal)
+    accepted = executor.update_streaming_trajectory(
+        window=terminal,
+        handoff_boundary=boundary,
+    )
     assert accepted is terminal
     np.testing.assert_allclose(accepted.command_q_rad[0], boundary.command_q_rad)
     assert accepted.predecessor_sha256 == first.content_sha256
@@ -517,6 +534,10 @@ def test_executor_never_replaces_active_stream_with_infeasible_mpc_window() -> N
         transport.step(0.02)
         executor.tick()
     generation_before = executor.streaming_trajectory_status()["generation"]
+    boundary = executor.prepare_streaming_handoff(
+        minimum_lead_s=0.04,
+        handoff_quantum_s=0.02,
+    )
 
     with pytest.raises(ValueError, match="infeasible"):
         executor.update_streaming_trajectory(
@@ -527,7 +548,8 @@ def test_executor_never_replaces_active_stream_with_infeasible_mpc_window() -> N
                 end_q=np.full(7, 0.02),
                 terminal=False,
                 feasible=False,
-            )
+            ),
+            handoff_boundary=boundary,
         )
 
     assert executor.state is ExecutorState.MOVING

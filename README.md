@@ -412,6 +412,12 @@ rejects anything above the hardware configuration's `0.200 rad/s` ceiling.
 Dex3 posture changes retain their separately commissioned two-second smooth
 ramp.
 
+The direct-table object profile supplies the default pregrasp distance. A run
+may override it with `--pregrasp-distance-m`; the resolved positive distance is
+hash-bound into every planning request, and CuRobo rechecks the complete IK,
+collision, table-clearance, approach, and reverse-route contracts at that
+distance. Both direct-table 60 mm profiles currently default to `0.050 m`.
+
 The persistent planner's complete output is streamed to the terminal and
 retained as `planner.log` in that run directory. Terminal IK failures name the candidate
 and colliding links/scene object with penetration or signed clearance when a
@@ -444,12 +450,14 @@ PC2 does not generate a point cloud or perform live depth-to-color alignment.
 The driver publishes the two raw motion streams separately; it does not
 synthesize an orientation estimate.
 
-### Fixed two-cube stack
+### Direct two-cube stack
 
-`run-stack` is one explicit workflow, not a generic task language. Both the
-40 mm and 60 mm uniquely tagged R3 cubes start on the bare table and must be
-jointly visible. The robot starts seated in FSM 3 with both arms supported and
-stationary on the table.
+`run-stack` is one explicit workflow, not a generic task language. Both 60 mm
+R3 cubes start on the bare table and must be jointly visible. The original cube
+uses `DICT_4X4_100` IDs 10–15 and the second print uses IDs 20–25. Either cube
+may be picked; the other stays fixed and becomes the placement support. The
+robot starts seated in FSM 3 with both arms supported and stationary on the
+table.
 
 ```bash
 cd /home/kanth042/g1-dex3-tabletop
@@ -459,34 +467,60 @@ cd /home/kanth042/g1-dex3-tabletop
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
-The controller lifts the left arm and then the right arm through independently
-planned supported escapes. It opens and measures both hands at clearance, then
-orders the two possible arm assignments by live hand-to-cube distance. That
-distance is only an ordering heuristic: an assignment is selectable only when
-the same grasp passes the complete source pickup, destination placement, and
-attached-payload transfer checks for both stages.
+The read-only preflight assigns each cube to its nearest hand and selects the
+globally nearest cube/arm pair. The controller then plans and executes only that
+arm's supported escape and opens only that Dex3 hand. The unused arm and hand
+remain at their exact supported initial commands. At clearance, the planner
+first checks all source/destination grasp endpoints, then performs expensive
+route planning only for a grasp that is viable at both endpoints.
 
-The first stage moves the 60 mm cube to one of five finite proposals along the
-table segment already evidenced by the two cube centers; the stationary 40 mm
-cube remains a strict finite obstacle. After the 60 mm cube is released and the
-arm returns to clearance, both cubes are observed again. The second stage is
-then planned from the actual 60 mm pose, with that finite cube as the placement
-support, and places the 40 mm cube on top. No midpoint rule, table boundary,
-separate board, or hidden task description is used. Only one arm moves at a
-time; both arms finally reverse their supported escapes in right-then-left
-order and seated control is restored.
+CuRobo launches as soon as `run-stack` starts. After the read-only two-cube
+observation, the persistent CUDA worker warms only the selected arm's open-hand
+and attached-60-mm-cube MotionGen models while the camera preview remains
+active. Pressing Space still creates no publisher until that command-free
+warmup has completed. Live supported-escape and task solves remain after
+ownership because their joint and object states do not exist beforehand.
+
+The selected arm picks one cube and places it directly on the other. The
+stationary cube remains a finite collision obstacle during pickup and becomes
+the finite placement support at the destination. No midpoint, preliminary cube
+relocation, table boundary, separate board, or second pick is involved. The
+selected arm finally reverses its exact supported escape and seated control is
+restored; the unused arm never leaves its supported start.
+
+During the attached transfer, CuRobo retains full-robot self-collision and the
+stationary support cube as an explicit obstacle. It does not add a whole-robot
+table cuboid because the unused arm is deliberately supported on that table.
+The already-established local table-plane check independently validates every
+sample of the moving wrist/hand and attached cube.
+
+The planner may test four upright quarter-turn wrist targets because redundant
+arm IK and hand clearance depend on wrist orientation. This is only a nominal
+path choice. The software does not assume that the physical cube retains an
+exact yaw inside Dex3. Placement targets the moving cube's nominal center over
+the observed support-cube center; unavoidable in-hand rotation therefore does
+not create a false exact-yaw success claim.
 
 Destination planning carries the original on-table cube observation as explicit
 evidence for the unchanged real table plane. It does not infer a new plane under
-the elevated 40 mm destination and therefore does not turn the top of the finite
-60 mm support into a large fictitious raised table.
+the elevated destination and therefore does not turn the top of the finite
+support cube into a large fictitious raised table.
 
 Planning and measured-close validation reuse the single-cube CuRobo, Dex3,
 gravity-feedforward, controller, watchdog, RealSense, and MCAP implementations.
-Expected grasp rejection returns through frozen routes. Controller, transport,
-or watchdog faults retain the existing fail-closed zero-torque behavior.
-`--maximum-arm-velocity-rad-s` and `--skip-camera-recording` have the same
-meaning as in `run-tabletop`.
+The fixed stack executor currently retains its complete clearance-boundary
+pick/place plans; the single-cube trajectory mode's additional pregrasp
+state-correction replan is deliberately not part of this first stack
+commissioning path.
+Expected grasp rejection opens the active hand and returns it through the frozen
+grasp-retreat and clearance routes. The default `--grasp-retries 1` then takes a
+fresh joint/camera snapshot, detects both cubes again, excludes the physically
+failed grasp candidate, and replans the same moving-cube/arm choice. A second
+grasp rejection ends the task normally and returns the selected arm. Planner,
+controller, transport, and watchdog faults are never retried and retain the
+existing fail-closed behavior. `--maximum-arm-velocity-rad-s` and
+`--pregrasp-distance-m` are hash-bound per-run overrides;
+`--skip-camera-recording` has the same meaning as in `run-tabletop`.
 
 ## Verification
 

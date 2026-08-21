@@ -69,7 +69,7 @@ from g1_dex3_tabletop.hardware_config import (
     transport_config,
     watchdog,
 )
-from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow
+from g1_dex3_tabletop.mpc_command_buffer import MPCCommandWindow, MPCHandoffBoundary
 from g1_dex3_tabletop.persistent_planner import (
     PersistentTabletopPlanner,
     PlannerRequestRejected,
@@ -697,7 +697,7 @@ def _execute_mpc_phase(
 
     handoff_lead_s = MPC_HANDOFF_INTERVAL_S
 
-    def request_window() -> MPCCommandWindow:
+    def request_window() -> tuple[MPCCommandWindow, MPCHandoffBoundary]:
         nonlocal pending_moving_target
         moving_target = None
         if moving_target_provider is not None:
@@ -767,7 +767,7 @@ def _execute_mpc_phase(
                 )
             if phase_record is not None:
                 phase_record["moving_targets"].append(moving_target)
-        return window
+        return window, boundary
 
     windows: list[dict] = []
     initial_deadline = time.monotonic() + control_config.motion_timeout_s
@@ -775,7 +775,7 @@ def _execute_mpc_phase(
     last_rejection = "no window was returned"
     while True:
         try:
-            first = request_window()
+            first, _first_boundary = request_window()
         except (PlannerRequestRejected, RuntimeError, ValueError) as error:
             driver.check()
             last_rejection = str(error)
@@ -833,7 +833,7 @@ def _execute_mpc_phase(
             time.sleep(0.01)
             continue
         try:
-            window = request_window()
+            window, boundary = request_window()
         except (PlannerRequestRejected, RuntimeError, ValueError) as error:
             # Confirm this was not a controller/transport failure before
             # treating it as an unavailable planner update.
@@ -860,7 +860,10 @@ def _execute_mpc_phase(
             )
             continue
         try:
-            accepted = synchronized.update_streaming_trajectory(window=window)
+            accepted = synchronized.update_streaming_trajectory(
+                window=window,
+                handoff_boundary=boundary,
+            )
         except (TypeError, ValueError, RuntimeError) as error:
             driver.check()
             if phase_record is not None:
@@ -1068,6 +1071,7 @@ def run_tabletop(args) -> int:
         "presentation_id": presentation.presentation_id,
         "motion_controller": args.motion_controller,
         "maximum_arm_velocity_rad_s": task_velocity,
+        "requested_pregrasp_distance_m": args.pregrasp_distance_m,
         "arm_velocity_source": (
             "task_config_default"
             if args.maximum_arm_velocity_rad_s is None
@@ -1184,9 +1188,11 @@ def run_tabletop(args) -> int:
                 task_config_path=args.task_config,
                 object_dimensions_m=object_profile.dimensions_m,
                 maximum_arm_velocity_rad_s=task_velocity,
+                pregrasp_distance_m=args.pregrasp_distance_m,
                 presentation_id=presentation.presentation_id,
                 fixture=presentation.fixture,
             )
+            status["pregrasp_distance_m"] = preflight_request.pregrasp_distance_m
             preflight_warmup_request_path = task_run / "preflight_warmup_request.json"
             preflight_request.write_json(preflight_warmup_request_path)
             runtime_warmup = planner.begin_payload_request(
@@ -1336,6 +1342,7 @@ def run_tabletop(args) -> int:
                 task_config_path=args.task_config,
                 object_dimensions_m=object_profile.dimensions_m,
                 maximum_arm_velocity_rad_s=task_velocity,
+                pregrasp_distance_m=args.pregrasp_distance_m,
                 presentation_id=presentation.presentation_id,
                 fixture=presentation.fixture,
             )
