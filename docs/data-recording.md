@@ -269,6 +269,23 @@ unpublished task-specific JSON interpretation remain in the raw run. Delete a
 raw MCAP only after the generated episode reloads successfully and after making
 an explicit retention decision.
 
+For an explicit disk-reclamation pass, use the guarded sequential driver:
+
+```bash
+./tools/convert_verified_raw_bags.py \
+  --confirm 'I CONFIRM VERIFIED RAW BAGS MAY BE PERMANENTLY DELETED'
+```
+
+It writes completed, task-rejected, and failed runs into separate LeRobot
+datasets. For each run it checks the recorded topic inventory, performs the
+normal conversion and reload verification, writes
+`raw_episode/lerobot_replacement.json`, and only then permanently removes that
+run's `raw_episode/bag` directory. A failed or structurally incompatible
+conversion retains its raw bag. The append ledger and per-run logs live under
+`work/lerobot_bulk_conversion/`; the process refuses to append to a dataset
+whose episode count and verified conversion receipts disagree. Run with
+`--dry-run` to audit the selection without converting or deleting anything.
+
 The no-robot benchmark at
 `work/recording_benchmark/20260814T160128Z/report.json` measured approximately
 `39.86 MiB/s` for state/command topics plus raw 1280x720 RGB8 at 15 Hz. Budget
