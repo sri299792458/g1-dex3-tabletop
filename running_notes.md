@@ -5218,7 +5218,26 @@ Primary references:
   installation preserves that command and retains the exact `1e-9 rad`
   trajectory-start invariant. This directly covers the retained
   `0.021020331 rad` measured-versus-command right-elbow failure.
-- No waist motion, gain experiment, three-frame outlier tolerance,
-  four-assignment search, compact-hand experiment, or multi-episode retention
-  was included. The two correctness fixes are isolated as `c0d0b87` and
-  `c235760`; verification passed Ruff and `435 passed, 7 skipped`.
+- No waist motion, gain experiment, compact-hand experiment, or simulated
+  release filter was included. The 57-candidate Friday shortlist remains
+  unchanged.
+
+## 2026-08-22 — MCAP-to-LeRobot conversion avoids high-rate over-decoding
+
+- The commissioned converter dynamically decoded every 250-1000 Hz state
+  message and read camera payloads in separate passes even though the LeRobot
+  timeline is only the 15 Hz color stream. A 14 GiB episode spent `325.31 s`
+  in indexing and `164.14 s` in its staged writer.
+- The indexer now scans raw MCAP records in log-time order, retains the latest
+  state sample, and decodes only the state/action values that can be selected
+  by a color frame. On the same-size retained run, indexing took `11.67 s`.
+- Exact comparison against the old implementation on retained run
+  `stack_20260821T164205Z` produced the same 196 color/depth references,
+  identical state/action arrays, and identical timeline bounds.
+- RGB and depth are now fed through LeRobot's built-in
+  `StreamingVideoEncoder` in one image pass. Retained full-run output hashes
+  were identical between the preload and single-pass implementations. The
+  12.95 GiB `seat_compliance_rigid_20260816T121420Z` conversion completed and
+  reload-verified in `74.61 s` for 3,447 frames.
+- Source raw deletion remains unchanged: a bag is deleted only after that
+  episode is reloaded and verified and the replacement receipt is written.

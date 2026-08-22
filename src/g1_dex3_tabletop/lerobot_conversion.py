@@ -108,35 +108,25 @@ class ImageRef:
     timestamp_ns: int
 
 
-@dataclass
-class TimeSeries:
-    topic: str
-    timestamps_ns: list[int]
-    values: list[np.ndarray]
-
-    def latest_before(self, target_ns: int) -> tuple[np.ndarray, int] | None:
-        index = bisect.bisect_right(self.timestamps_ns, target_ns) - 1
-        if index < 0:
-            return None
-        timestamp_ns = self.timestamps_ns[index]
-        return self.values[index], target_ns - timestamp_ns
-
-    def first_ts(self) -> int:
-        if not self.timestamps_ns:
-            raise RuntimeError(f"no samples for required topic {self.topic}")
-        return self.timestamps_ns[0]
-
-    def last_ts(self) -> int:
-        if not self.timestamps_ns:
-            raise RuntimeError(f"no samples for required topic {self.topic}")
-        return self.timestamps_ns[-1]
-
-
 @dataclass(frozen=True)
 class AlignedFrame:
     color_ref: ImageRef
     depth_ref: ImageRef
     values: dict[str, np.ndarray]
+
+
+@dataclass(frozen=True)
+class _RawSample:
+    timestamp_ns: int
+    schema: Any
+    channel: Any
+    message: Any
+
+
+@dataclass(frozen=True)
+class _ColorSnapshot:
+    color_ref: ImageRef
+    samples: dict[str, tuple[int, np.ndarray]]
 
 
 def _float_array(values: Iterable[Any], expected: int, label: str) -> np.ndarray:
@@ -266,56 +256,131 @@ def _bag_files(bag_directory: Path) -> tuple[Path, ...]:
     return files
 
 
-def index_episode(
+def index_and_align_episode(
     bag_files: tuple[Path, ...],
-) -> tuple[dict[str, TimeSeries], list[ImageRef], list[ImageRef], dict[str, Any]]:
+    *,
+    state_max_age_ms: float = STATE_MAX_AGE_MS,
+    action_max_age_ms: float = ACTION_MAX_AGE_MS,
+    depth_max_skew_ms: float = DEPTH_MAX_SKEW_MS,
+) -> tuple[list[AlignedFrame], dict[str, Any], dict[str, Any]]:
+    """Index and align an episode without decoding every high-rate sample.
+
+    The original implementation used ``read_ros2_messages`` over every topic.
+    That dynamically decoded roughly one million 250-1000 Hz state messages in
+    a typical run even though the published timeline is the 15 Hz color camera.
+    MCAP already exposes raw messages in log-time order, so retain the latest
+    state sample and only decode it when a color frame arrives.  Commands need
+    their active/timeout predicate, so retain the messages since the previous
+    color frame and scan newest-to-oldest until the latest active command is
+    found.  This preserves latest-before semantics while reducing decoding to
+    the samples that can actually enter the LeRobot episode.
+    """
+
     try:
-        from mcap_ros2.reader import read_ros2_messages
+        from mcap.reader import make_reader
+        from mcap_ros2.decoder import DecoderFactory
     except ImportError as error:
         raise RuntimeError(
             "mcap_ros2 is unavailable; run tools/setup_lerobot_conversion.sh"
         ) from error
 
     parsers = _message_parsers()
-    series = {
-        topic: TimeSeries(topic=topic, timestamps_ns=[], values=[])
-        for topic in parsers
-    }
+    state_topics = (LOWSTATE_TOPIC, SECONDARY_IMU_TOPIC, LEFT_STATE_TOPIC, RIGHT_STATE_TOPIC)
+    action_topics = (LOWCMD_TOPIC, LEFT_CMD_TOPIC, RIGHT_CMD_TOPIC)
+    factory = DecoderFactory()
+    latest_state: dict[str, _RawSample] = {}
+    pending_commands: dict[str, list[_RawSample]] = {topic: [] for topic in action_topics}
+    latest_active_command: dict[str, tuple[int, np.ndarray]] = {}
+    first_timestamps: dict[str, int] = {}
+    last_timestamps: dict[str, int] = {}
+    snapshots: list[_ColorSnapshot] = []
     color_refs: list[ImageRef] = []
     depth_refs: list[ImageRef] = []
+    raw_counts = {topic: 0 for topic in REQUIRED_TOPICS}
+    decoded_counts = {topic: 0 for topic in parsers}
     started = time.monotonic()
+
+    def decode(sample: _RawSample) -> Any:
+        decoder = factory.decoder_for(sample.channel.message_encoding, sample.schema)
+        if decoder is None:
+            raise RuntimeError(
+                f"no ROS 2 decoder for {sample.channel.topic} "
+                f"({sample.channel.message_encoding}, {sample.schema.encoding})"
+            )
+        return decoder(sample.message.data)
+
+    def update_commands() -> None:
+        for topic in action_topics:
+            pending = pending_commands[topic]
+            if not pending:
+                continue
+            parser, predicate = parsers[topic]
+            for sample in reversed(pending):
+                decoded_counts[topic] += 1
+                message = decode(sample)
+                if predicate(message):
+                    latest_active_command[topic] = (sample.timestamp_ns, parser(message))
+                    first_timestamps.setdefault(topic, sample.timestamp_ns)
+                    last_timestamps[topic] = sample.timestamp_ns
+                    break
+            pending.clear()
 
     for file_index, bag_file in enumerate(bag_files):
         topic_indices = {COLOR_TOPIC: 0, DEPTH_TOPIC: 0}
-        for item in read_ros2_messages(
-            bag_file,
-            topics=REQUIRED_TOPICS,
-            log_time_order=True,
-        ):
-            topic = item.channel.topic
-            timestamp_ns = int(item.log_time_ns)
-            if topic in topic_indices:
-                reference = ImageRef(
-                    file_index=file_index,
-                    topic_index=topic_indices[topic],
-                    timestamp_ns=timestamp_ns,
-                )
-                topic_indices[topic] += 1
-                if topic == COLOR_TOPIC:
-                    color_refs.append(reference)
-                else:
-                    depth_refs.append(reference)
-                continue
-            parser_entry = parsers.get(topic)
-            if parser_entry is None:
-                continue
-            parser, predicate = parser_entry
-            if not predicate(item.ros_msg):
-                continue
-            series[topic].timestamps_ns.append(timestamp_ns)
-            series[topic].values.append(parser(item.ros_msg))
+        with bag_file.open("rb") as stream:
+            reader = make_reader(stream)
+            for schema, channel, message in reader.iter_messages(
+                topics=REQUIRED_TOPICS,
+                log_time_order=True,
+            ):
+                if schema is None:
+                    raise RuntimeError(f"required topic {channel.topic} has no MCAP schema")
+                topic = channel.topic
+                timestamp_ns = int(message.log_time)
+                raw_counts[topic] += 1
+                if topic in topic_indices:
+                    reference = ImageRef(
+                        file_index=file_index,
+                        topic_index=topic_indices[topic],
+                        timestamp_ns=timestamp_ns,
+                    )
+                    topic_indices[topic] += 1
+                    if topic == DEPTH_TOPIC:
+                        depth_refs.append(reference)
+                        continue
 
-    missing = [topic for topic, values in series.items() if not values.timestamps_ns]
+                    color_refs.append(reference)
+                    update_commands()
+                    samples: dict[str, tuple[int, np.ndarray]] = dict(latest_active_command)
+                    for state_topic in state_topics:
+                        sample = latest_state.get(state_topic)
+                        if sample is None:
+                            continue
+                        parser, _predicate = parsers[state_topic]
+                        decoded_counts[state_topic] += 1
+                        samples[state_topic] = (sample.timestamp_ns, parser(decode(sample)))
+                    snapshots.append(_ColorSnapshot(color_ref=reference, samples=samples))
+                    continue
+
+                sample = _RawSample(
+                    timestamp_ns=timestamp_ns,
+                    schema=schema,
+                    channel=channel,
+                    message=message,
+                )
+                if topic in state_topics:
+                    latest_state[topic] = sample
+                    first_timestamps.setdefault(topic, timestamp_ns)
+                    last_timestamps[topic] = timestamp_ns
+                elif topic in action_topics:
+                    pending_commands[topic].append(sample)
+
+    # Commands after the last color frame still define the original timeline's
+    # terminal bound.  Decoding newest-to-oldest finds the only value that can
+    # affect that bound without decoding the entire high-rate command stream.
+    update_commands()
+
+    missing = [topic for topic in (*state_topics, *action_topics) if topic not in first_timestamps]
     if not color_refs:
         missing.append(COLOR_TOPIC)
     if not depth_refs:
@@ -323,48 +388,13 @@ def index_episode(
     if missing:
         raise RuntimeError(f"raw episode is missing required data: {sorted(missing)}")
 
-    return series, color_refs, depth_refs, {
-        "elapsed_s": time.monotonic() - started,
-        "bag_files": [str(path) for path in bag_files],
-        "topic_counts": {
-            **{topic: len(values.timestamps_ns) for topic, values in series.items()},
-            COLOR_TOPIC: len(color_refs),
-            DEPTH_TOPIC: len(depth_refs),
-        },
-    }
-
-
-def _nearest_ref(refs: list[ImageRef], timestamp_ns: int) -> tuple[ImageRef, int] | None:
-    index = bisect.bisect_left(refs, timestamp_ns, key=lambda ref: ref.timestamp_ns)
-    candidates: list[ImageRef] = []
-    if index < len(refs):
-        candidates.append(refs[index])
-    if index > 0:
-        candidates.append(refs[index - 1])
-    if not candidates:
-        return None
-    selected = min(candidates, key=lambda ref: abs(ref.timestamp_ns - timestamp_ns))
-    return selected, abs(selected.timestamp_ns - timestamp_ns)
-
-
-def align_frames(
-    series: dict[str, TimeSeries],
-    color_refs: list[ImageRef],
-    depth_refs: list[ImageRef],
-    *,
-    state_max_age_ms: float = STATE_MAX_AGE_MS,
-    action_max_age_ms: float = ACTION_MAX_AGE_MS,
-    depth_max_skew_ms: float = DEPTH_MAX_SKEW_MS,
-) -> tuple[list[AlignedFrame], dict[str, Any]]:
-    state_topics = (LOWSTATE_TOPIC, SECONDARY_IMU_TOPIC, LEFT_STATE_TOPIC, RIGHT_STATE_TOPIC)
-    action_topics = (LOWCMD_TOPIC, LEFT_CMD_TOPIC, RIGHT_CMD_TOPIC)
     t_start_ns = max(
-        *(series[topic].first_ts() for topic in (*state_topics, *action_topics)),
+        *(first_timestamps[topic] for topic in (*state_topics, *action_topics)),
         color_refs[0].timestamp_ns,
         depth_refs[0].timestamp_ns,
     )
     t_end_ns = min(
-        *(series[topic].last_ts() for topic in (*state_topics, *action_topics)),
+        *(last_timestamps[topic] for topic in (*state_topics, *action_topics)),
         color_refs[-1].timestamp_ns,
         depth_refs[-1].timestamp_ns,
     )
@@ -373,27 +403,32 @@ def align_frames(
     depth_limit_ns = round(depth_max_skew_ms * 1_000_000.0)
     aligned: list[AlignedFrame] = []
     rejected: list[dict[str, Any]] = []
-    ages_ms: dict[str, list[float]] = {topic: [] for topic in series}
+    ages_ms: dict[str, list[float]] = {topic: [] for topic in parsers}
     depth_skews_ms: list[float] = []
 
-    for color_ref in color_refs:
-        timestamp_ns = color_ref.timestamp_ns
+    for snapshot in snapshots:
+        timestamp_ns = snapshot.color_ref.timestamp_ns
         if timestamp_ns < t_start_ns or timestamp_ns > t_end_ns:
             continue
         values: dict[str, np.ndarray] = {}
         failure: str | None = None
         for topic in (*state_topics, *action_topics):
-            result = series[topic].latest_before(timestamp_ns)
+            result = snapshot.samples.get(topic)
             if result is None:
                 failure = f"no latest-before sample for {topic}"
                 break
-            value, age_ns = result
+            sample_timestamp_ns, value = result
+            age_ns = timestamp_ns - sample_timestamp_ns
             limit_ns = state_limit_ns if topic in state_topics else action_limit_ns
+            if age_ns < 0:
+                failure = f"latest-before sample for {topic} is from the future"
+                break
             if age_ns > limit_ns:
                 failure = f"{topic} age {age_ns / 1e6:.3f}ms exceeds {limit_ns / 1e6:.3f}ms"
                 break
             values[topic] = value
             ages_ms[topic].append(age_ns / 1e6)
+
         depth_result = _nearest_ref(depth_refs, timestamp_ns) if failure is None else None
         if failure is None and depth_result is None:
             failure = "no depth sample"
@@ -410,7 +445,11 @@ def align_frames(
             continue
         assert depth_result is not None
         aligned.append(
-            AlignedFrame(color_ref=color_ref, depth_ref=depth_result[0], values=values)
+            AlignedFrame(
+                color_ref=snapshot.color_ref,
+                depth_ref=depth_result[0],
+                values=values,
+            )
         )
 
     if not aligned:
@@ -432,7 +471,14 @@ def align_frames(
             "std": float(array.std()),
         }
 
-    return aligned, {
+    index_diagnostics = {
+        "elapsed_s": time.monotonic() - started,
+        "bag_files": [str(path) for path in bag_files],
+        "topic_counts": raw_counts,
+        "decoded_topic_counts": decoded_counts,
+        "strategy": "raw_mcap_latest_before_camera",
+    }
+    alignment_diagnostics = {
         "timeline": "recorded_color_frames",
         "fps": FPS,
         "t_start_ns": t_start_ns,
@@ -446,6 +492,20 @@ def align_frames(
         "latest_before_age_ms": {topic: stats(values) for topic, values in ages_ms.items()},
         "depth_skew_ms": stats(depth_skews_ms),
     }
+    return aligned, index_diagnostics, alignment_diagnostics
+
+
+def _nearest_ref(refs: list[ImageRef], timestamp_ns: int) -> tuple[ImageRef, int] | None:
+    index = bisect.bisect_left(refs, timestamp_ns, key=lambda ref: ref.timestamp_ns)
+    candidates: list[ImageRef] = []
+    if index < len(refs):
+        candidates.append(refs[index])
+    if index > 0:
+        candidates.append(refs[index - 1])
+    if not candidates:
+        return None
+    selected = min(candidates, key=lambda ref: abs(ref.timestamp_ns - timestamp_ns))
+    return selected, abs(selected.timestamp_ns - timestamp_ns)
 
 
 def _decode_rgb(msg: Any) -> np.ndarray:
@@ -490,6 +550,8 @@ def extract_selected_images(
             reference = wanted.get(topic_index)
             if reference is not None:
                 result[reference] = decoder(item.ros_msg)
+                if all(candidate in result for candidate in wanted.values()):
+                    break
         missing = set(wanted.values()) - set(result)
         if missing:
             raise RuntimeError(f"failed to extract {len(missing)} selected {topic} frames")
@@ -672,17 +734,13 @@ def _validate_depth_encoder_bounds(
 
 
 def _depth_report(
-    depth_images: Iterable[np.ndarray],
+    histogram: np.ndarray,
+    frame_count: int,
     *,
     scale: float,
     depth_min_m: float,
     depth_max_m: float,
 ) -> dict[str, Any]:
-    histogram = np.zeros(65536, dtype=np.int64)
-    frame_count = 0
-    for image in depth_images:
-        histogram += np.bincount(image.reshape(-1), minlength=65536)
-        frame_count += 1
     total = int(histogram.sum())
     zero = int(histogram[0])
     valid_histogram = histogram[1:]
@@ -750,26 +808,18 @@ def convert_episode(args: argparse.Namespace) -> int:
         raise RuntimeError(f"episode already has conversion artifacts at {artifact_dir}")
 
     bag_files = _bag_files(episode_directory / "bag")
-    series, color_refs, depth_refs, index_diagnostics = index_episode(bag_files)
-    aligned, alignment_diagnostics = align_frames(series, color_refs, depth_refs)
-    depth_images = extract_selected_images(
+    aligned, index_diagnostics, alignment_diagnostics = index_and_align_episode(bag_files)
+    first_depth_images = extract_selected_images(
         bag_files,
         DEPTH_TOPIC,
-        (frame.depth_ref for frame in aligned),
+        [aligned[0].depth_ref],
         _decode_depth,
     )
-    depth_report = _depth_report(
-        depth_images.values(),
-        scale=args.depth_scale_m_per_unit,
-        depth_min_m=args.depth_min_m,
-        depth_max_m=args.depth_max_m,
-    )
-
     first_color_images = extract_selected_images(
         bag_files, COLOR_TOPIC, [aligned[0].color_ref], _decode_rgb
     )
     first_rgb = first_color_images[aligned[0].color_ref]
-    first_depth = depth_images[aligned[0].depth_ref]
+    first_depth = first_depth_images[aligned[0].depth_ref]
     features = feature_schema(first_rgb.shape, (*first_depth.shape, 1))
     rgb_encoder = RGBEncoderConfig(vcodec=args.vcodec)
     depth_encoder = DepthEncoderConfig(
@@ -784,6 +834,7 @@ def convert_episode(args: argparse.Namespace) -> int:
             root=dataset_root,
             rgb_encoder=rgb_encoder,
             depth_encoder=depth_encoder,
+            streaming_encoding=True,
         )
         if int(dataset.fps) != FPS:
             raise RuntimeError(f"existing dataset fps is {dataset.fps}, expected {FPS}")
@@ -807,17 +858,21 @@ def convert_episode(args: argparse.Namespace) -> int:
             features=features,
             rgb_encoder=rgb_encoder,
             depth_encoder=depth_encoder,
-            image_writer_threads=4,
+            streaming_encoding=True,
         )
 
     dataset_episode_index = int(dataset.meta.total_episodes)
     task = args.task or _episode_task(run_directory, status)
     first_timestamp_ns = aligned[0].color_ref.timestamp_ns
-    selected_by_file: dict[int, dict[int, int]] = {}
+    selected_color_by_file: dict[int, dict[int, int]] = {}
+    selected_depth_by_file: dict[int, dict[int, list[int]]] = {}
     for frame_index, frame in enumerate(aligned):
-        selected_by_file.setdefault(frame.color_ref.file_index, {})[
+        selected_color_by_file.setdefault(frame.color_ref.file_index, {})[
             frame.color_ref.topic_index
         ] = frame_index
+        selected_depth_by_file.setdefault(frame.depth_ref.file_index, {}).setdefault(
+            frame.depth_ref.topic_index, []
+        ).append(frame_index)
     numeric_frames = [
         build_numeric_frame(frame, first_timestamp_ns, task) for frame in aligned
     ]
@@ -825,26 +880,70 @@ def convert_episode(args: argparse.Namespace) -> int:
     started = time.monotonic()
     from mcap_ros2.reader import read_ros2_messages
 
+    pending_images: dict[int, dict[str, np.ndarray]] = {}
+    next_frame_index = 0
+    depth_histogram = np.zeros(65536, dtype=np.int64)
+    depth_frame_count = 0
     try:
-        for file_index, wanted in selected_by_file.items():
-            for topic_index, item in enumerate(
-                read_ros2_messages(
-                    bag_files[file_index], topics=[COLOR_TOPIC], log_time_order=False
-                )
+        for file_index, bag_file in enumerate(bag_files):
+            topic_indices = {COLOR_TOPIC: 0, DEPTH_TOPIC: 0}
+            wanted_colors = selected_color_by_file.get(file_index, {})
+            wanted_depths = selected_depth_by_file.get(file_index, {})
+            for item in read_ros2_messages(
+                bag_file,
+                topics=[COLOR_TOPIC, DEPTH_TOPIC],
+                log_time_order=True,
             ):
-                frame_index = wanted.get(topic_index)
-                if frame_index is not None:
-                    aligned_frame = aligned[frame_index]
-                    frame = numeric_frames[frame_index]
-                    frame["observation.images.head"] = _decode_rgb(item.ros_msg)
+                topic = item.channel.topic
+                topic_index = topic_indices[topic]
+                topic_indices[topic] += 1
+                if topic == COLOR_TOPIC:
+                    frame_index = wanted_colors.get(topic_index)
+                    if frame_index is not None:
+                        pending_images.setdefault(frame_index, {})["rgb"] = _decode_rgb(
+                            item.ros_msg
+                        )
+                else:
+                    frame_indices = wanted_depths.get(topic_index)
+                    if frame_indices:
+                        depth = _decode_depth(item.ros_msg)
+                        depth_histogram += np.bincount(depth.reshape(-1), minlength=65536)
+                        depth_frame_count += 1
+                        for frame_index in frame_indices:
+                            pending_images.setdefault(frame_index, {})["depth"] = depth
+
+                while next_frame_index in pending_images and set(
+                    pending_images[next_frame_index]
+                ) == {"rgb", "depth"}:
+                    images = pending_images.pop(next_frame_index)
+                    frame = numeric_frames[next_frame_index]
+                    frame["observation.images.head"] = images["rgb"]
                     frame["observation.depth.head"] = (
-                        depth_images[aligned_frame.depth_ref].astype(np.float32)
+                        images["depth"].astype(np.float32)
                         * np.float32(args.depth_scale_m_per_unit)
                     )[:, :, None]
                     dataset.add_frame(frame)
+                    # StreamingVideoEncoder owns the queued arrays after
+                    # add_frame().  Do not retain every multi-megabyte image
+                    # through numeric_frames until reload verification.
+                    del frame["observation.images.head"]
+                    del frame["observation.depth.head"]
+                    next_frame_index += 1
+        if next_frame_index != len(aligned):
+            raise RuntimeError(
+                f"extracted images for only {next_frame_index}/{len(aligned)} aligned frames"
+            )
         dataset.save_episode()
     finally:
         dataset.finalize()
+
+    depth_report = _depth_report(
+        depth_histogram,
+        depth_frame_count,
+        scale=args.depth_scale_m_per_unit,
+        depth_min_m=args.depth_min_m,
+        depth_max_m=args.depth_max_m,
+    )
 
     reloaded = LeRobotDataset(
         repo_id=args.dataset_id,
@@ -911,6 +1010,7 @@ def convert_episode(args: argparse.Namespace) -> int:
         "alignment": alignment_diagnostics,
         "depth": depth_report,
         "writer_elapsed_s": time.monotonic() - started,
+        "video_encoding": "LeRobot StreamingVideoEncoder",
         "verified_reload_indices": [0, len(aligned) // 2, len(aligned) - 1],
         "source_snapshot": str(source_dir.relative_to(dataset_root)),
     }
