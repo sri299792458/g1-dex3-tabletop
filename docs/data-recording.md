@@ -202,6 +202,73 @@ Compression, head/tail trimming, image transcoding, temporal resampling, and
 LeRobot export belong in later offline tools. The original episode remains
 available if any derived job fails.
 
+### Direct LeRobot conversion
+
+For learning datasets, do not create an archive first. The account-local
+converter reads the schemas embedded in raw MCAP directly under Python 3.12,
+aligns official G1/Dex3 state and command messages to the recorded 15 Hz color
+frames, and lets LeRobot encode RGB, native depth, and Parquet features in one
+job:
+
+```bash
+cd /home/kanth042/g1-dex3-tabletop
+./tools/setup_lerobot_conversion.sh
+./tools/convert_raw_to_lerobot.sh \
+  runs/stack_<UTC> \
+  --dataset-id rpm_lab/g1_dex3_tabletop
+```
+
+Run the same command with another completed run directory and the same dataset
+ID to append it as the next LeRobot episode. `LeRobotDataset.resume` here means
+dataset append only; it never resumes robot motion or modifies the source MCAP.
+The append path verifies that FPS, feature names/shapes, and native-depth encoder
+bounds still match before writing.
+
+The setup is isolated from the Python 3.10 hardware and Python 3.11 planner
+environments. It uses SPARK's tested LeRobot `v0.6.1` checkout and CPU-only
+PyTorch because conversion does not need CUDA.
+
+The `g1_seated_tabletop_lerobot_v1` contract publishes:
+
+- 43 measured positions, velocities, and estimated efforts: G1 29 + left Dex3
+  7 + right Dex3 7;
+- the corresponding 43 commanded positions, velocities, feed-forward efforts,
+  `kp`, and `kd`;
+- both hands' 216 pressure values and all four Unitree IMUs;
+- head RGB and native depth video.
+
+Terminal Dex3 timeout packets and terminal weight-zero G1 packets are not used
+as learning actions. The frame timeline is the actual recorded RGB sequence;
+the source MCAP receipt time is retained as a numeric feature. Conversion
+defaults to completed task runs and requires an explicit override for failures.
+State samples must be no more than 50 ms old. Commands use the controller's
+zero-order-hold semantics and the commissioned 500 ms watchdog window; this
+preserves the observed 334 ms damping-to-trajectory handoff without inventing
+intermediate commands. The maximum observed age is recorded in every episode's
+alignment diagnostics.
+
+The D435i depth scale and LeRobot encoder bounds are explicit conversion
+parameters. The commissioned defaults are `0.001 m/unit` and `0.15–2.0 m`.
+Those bounds were checked across all 13 retained successful `stack_*` runs from
+2026-08-21: 26,191 depth frames (8.046 billion pixels) had no nonzero depth
+below 0.15 m, while only 0.1205% of nonzero pixels exceeded 2.0 m. The upper
+bound therefore preserves the tabletop workspace at useful precision while
+clipping a small amount of distant background and invalid/outlier range data.
+Every conversion records the observed depth distribution and clipping fractions
+under `meta/g1_conversion/<episode_id>/diagnostics.json`.
+
+The commissioned end-to-end check converted and appended two successful stack
+runs (2,780 frames). LeRobot then reloaded each episode and matched the first,
+middle, and final numeric state/action frames against the raw MCAP. The local
+verification dataset is under `work/lerobot_verification/` and is disposable;
+it is not a replacement for the raw recordings.
+
+Direct LeRobot conversion is intentionally lossy and training-oriented. It is
+not a bit-for-bit ROS archive: full-rate messages, exact CDR payloads, and
+unpublished task-specific JSON interpretation remain in the raw run. Delete a
+raw MCAP only after the generated episode reloads successfully and after making
+an explicit retention decision.
+
 The no-robot benchmark at
 `work/recording_benchmark/20260814T160128Z/report.json` measured approximately
 `39.86 MiB/s` for state/command topics plus raw 1280x720 RGB8 at 15 Hz. Budget
