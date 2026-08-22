@@ -454,12 +454,6 @@ def index_and_align_episode(
 
     if not aligned:
         raise RuntimeError("no RGB frames survived G1 state/action/depth alignment")
-    if rejected:
-        raise RuntimeError(
-            "mid-episode alignment rejected recorded RGB frames; refusing a silently sparse dataset: "
-            f"count={len(rejected)}, first={rejected[0]}"
-        )
-
     def stats(values: list[float]) -> dict[str, float] | None:
         if not values:
             return None
@@ -479,11 +473,13 @@ def index_and_align_episode(
         "strategy": "raw_mcap_latest_before_camera",
     }
     alignment_diagnostics = {
-        "timeline": "recorded_color_frames",
+        "timeline": "qualified_recorded_color_frames",
         "fps": FPS,
         "t_start_ns": t_start_ns,
         "t_end_ns": t_end_ns,
         "published_frame_count": len(aligned),
+        "rejected_frame_count": len(rejected),
+        "rejected_frames": rejected,
         "alignment_limits_ms": {
             "state": state_max_age_ms,
             "action": action_max_age_ms,
@@ -1030,7 +1026,7 @@ def convert_episode(args: argparse.Namespace) -> int:
             {
                 "profile_name": "g1_seated_tabletop_lerobot_v1",
                 "fps": FPS,
-                "timeline": "recorded_color_frames",
+                "timeline": "qualified_recorded_color_frames",
                 "state_max_age_ms": STATE_MAX_AGE_MS,
                 "action_max_age_ms": ACTION_MAX_AGE_MS,
                 "depth_max_skew_ms": DEPTH_MAX_SKEW_MS,

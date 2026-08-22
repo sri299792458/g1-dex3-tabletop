@@ -5241,3 +5241,10 @@ Primary references:
   reload-verified in `74.61 s` for 3,447 frames.
 - Source raw deletion remains unchanged: a bag is deleted only after that
   episode is reloaded and verified and the replacement receipt is written.
+- Archival conversion now omits individual color frames that cannot satisfy
+  the unchanged state/action-age or RGB/depth-skew bounds, records every
+  omitted timestamp and reason in `diagnostics.json`, and retains the original
+  per-frame source time. This avoids discarding an otherwise valid episode for
+  one or two bad frames without forward-filling stale commands or depth. A
+  retained two-gap run reload-verified with 252 qualified frames and both
+  rejected timestamps recorded exactly.
