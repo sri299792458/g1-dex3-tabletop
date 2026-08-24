@@ -8,7 +8,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +97,11 @@ class _EndpointFeasibility:
     fixed_close_viable_candidate_count: int
     rejections: tuple[dict[str, Any], ...]
     elapsed_s: float
+    request_sha256: str | None = None
+    goal_request_sha256s: tuple[str, ...] = ()
+    robot_configuration_key: str | None = None
+    grasp_shortlist_sha256: str | None = None
+    branches_by_candidate: dict[str, tuple[_PregraspBranch, ...]] = field(default_factory=dict)
 
     @property
     def viable_candidate_ids(self) -> set[str]:
@@ -109,6 +114,7 @@ class _EndpointFeasibility:
 
 @dataclass(frozen=True, slots=True)
 class _PickPlaceEndpointAnalysis:
+    request_sha256: str
     candidate_ids: tuple[str, ...]
     source: _EndpointFeasibility
     destination: _EndpointFeasibility
@@ -144,6 +150,44 @@ class _PickPlaceEndpointAnalysis:
                 key=lambda candidate_id: costs[candidate_id]["total"],
             )
         )
+
+
+def _cached_endpoint_branch(branch: _PregraspBranch) -> _PregraspBranch:
+    """Detach one endpoint branch from its batched candidate-local indexing."""
+
+    model_q_rad = np.asarray(branch.model_q_rad, dtype=np.float64).copy()
+    model_q_rad.setflags(write=False)
+    return _PregraspBranch(
+        candidate_local_index=0,
+        solver_seed_index=branch.solver_seed_index,
+        model_q_rad=model_q_rad,
+        position_error_m=branch.position_error_m,
+        rotation_error_rad=branch.rotation_error_rad,
+        goalset_index=branch.goalset_index,
+    )
+
+
+def _endpoint_feasibility_matches(
+    feasibility: _EndpointFeasibility | None,
+    *,
+    request_sha256: str,
+    goal_request_sha256s: tuple[str, ...],
+    robot_configuration_key: str,
+    grasp_shortlist_sha256: str,
+    candidate_id: str | None,
+) -> bool:
+    """Require every endpoint-branch binding before skipping fresh IK."""
+
+    return bool(
+        feasibility is not None
+        and candidate_id is not None
+        and feasibility.request_sha256 == request_sha256
+        and feasibility.goal_request_sha256s == goal_request_sha256s
+        and feasibility.robot_configuration_key == robot_configuration_key
+        and feasibility.grasp_shortlist_sha256 == grasp_shortlist_sha256
+        and candidate_id in feasibility.branches_by_candidate
+        and feasibility.candidate_branch_counts.get(candidate_id, 0) > 0
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1741,6 +1785,24 @@ class TabletopPlannerPool:
             fixed_close_validator=entry.validator,
         )
 
+    def pick_place_retention_validator(
+        self,
+        request: TabletopPickPlaceRequest,
+        plan: TabletopPickPlacePlan,
+    ) -> PickPlaceRetentionRouteValidator:
+        """Reuse only an exactly compatible source fixed-close checker."""
+
+        tabletop = request.source_request
+        entry = self._fixed_close.get(tabletop.arm)
+        expected_key = _fixed_close_configuration_key(tabletop)
+        if entry is None or entry.configuration_key != expected_key:
+            return PickPlaceRetentionRouteValidator(request, plan)
+        return PickPlaceRetentionRouteValidator(
+            request,
+            plan,
+            fixed_close_validator=entry.validator,
+        )
+
     def close(self) -> None:
         planners = tuple(self._motion.values())
         self._motion.clear()
@@ -2598,6 +2660,7 @@ def _validate_supported_escape_endpoint(
 def plan_supported_escape(
     request: TabletopTaskRequest | CharucoSupportedEscapeRequest,
     *,
+    planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> SupportedEscapePlan:
     """Lift the supported selected hand along the observed table normal."""
@@ -2619,6 +2682,8 @@ def plan_supported_escape(
     optimizer_model_clone_s = 0.0
     optimizer_setup_s = 0.0
     pose_planning_s = 0.0
+    strict_checker_reused = False
+    strict_checker_topology_rebuilt = False
     try:
         import torch
         from curobo.types import DeviceCfg
@@ -2629,7 +2694,21 @@ def plan_supported_escape(
         # immediately destroying a throwaway MotionPlanner.
         device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
         stage_started = time.monotonic()
-        strict_checker = CuroboKinematicCollisionChecker(robot=strict_robot, device_cfg=device_cfg)
+        if planner_pool is None:
+            strict_checker = CuroboKinematicCollisionChecker(
+                robot=strict_robot,
+                device_cfg=device_cfg,
+            )
+        else:
+            strict_checker, strict_event = planner_pool.acquire_strict_checker(
+                role="open",
+                arm=arm,
+                robot=strict_robot,
+                device_cfg=device_cfg,
+                configuration_key=_configuration_key(strict_robot),
+            )
+            strict_checker_reused = bool(strict_event["reused"])
+            strict_checker_topology_rebuilt = bool(strict_event["topology_rebuilt"])
         strict_model_resolution_s = time.monotonic() - stage_started
         names = arm_joint_names(arm)
         reference = np.asarray(reference_tuple)
@@ -2796,6 +2875,8 @@ def plan_supported_escape(
                 "arm": arm,
                 "self_collision_start_state": "clear",
                 "self_collision_strict_sample_count": len(strict_collision_samples),
+                "strict_checker_reused": strict_checker_reused,
+                "strict_checker_topology_rebuilt": strict_checker_topology_rebuilt,
             },
         )
     finally:
@@ -4124,6 +4205,8 @@ class PickPlaceRetentionRouteValidator:
         self,
         request: TabletopPickPlaceRequest,
         plan: TabletopPickPlacePlan,
+        *,
+        fixed_close_validator: _FixedCloseSweepValidator | None = None,
     ) -> None:
         import torch
         from curobo.types import DeviceCfg, JointState
@@ -4138,16 +4221,30 @@ class PickPlaceRetentionRouteValidator:
         self.arm = self.tabletop.arm
         self.route_q = _pick_place_payload_route(plan)
         started = time.monotonic()
-        robot, self.active_joint_names, reference = build_tabletop_route_validation_robot_config(
-            arm=self.arm,
-            snapshot=self.tabletop.planning_snapshot,
-            joint_position_offsets_rad=self.tabletop.joint_position_offsets_rad,
-        )
-        self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
-        self.checker = CuroboKinematicCollisionChecker(
-            robot=robot,
-            device_cfg=self.device_cfg,
-        )
+        if fixed_close_validator is None:
+            robot, self.active_joint_names, reference = (
+                build_tabletop_route_validation_robot_config(
+                    arm=self.arm,
+                    snapshot=self.tabletop.planning_snapshot,
+                    joint_position_offsets_rad=self.tabletop.joint_position_offsets_rad,
+                )
+            )
+            self.device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+            self.checker = CuroboKinematicCollisionChecker(
+                robot=robot,
+                device_cfg=self.device_cfg,
+            )
+            self.reused_fixed_close_checker = False
+        else:
+            if fixed_close_validator.arm != self.arm:
+                raise ValueError(
+                    "pick-place retention checker cannot reuse another arm's fixed-close model"
+                )
+            self.active_joint_names = fixed_close_validator.active_joint_names
+            reference = fixed_close_validator.reference_q
+            self.device_cfg = fixed_close_validator.device_cfg
+            self.checker = fixed_close_validator.checker
+            self.reused_fixed_close_checker = True
         reference_state = JointState.from_position(
             self.device_cfg.to_device(np.asarray(reference, dtype=np.float64)[None]),
             joint_names=list(self.active_joint_names),
@@ -4249,6 +4346,7 @@ class PickPlaceRetentionRouteValidator:
                 "elapsed_s": time.monotonic() - started,
                 "cached_kinematics": True,
                 "cache_build_s": self.cache_build_s,
+                "reused_fixed_close_checker": self.reused_fixed_close_checker,
                 "required_hand_plane_clearance_m": (self.tabletop.minimum_hand_plane_clearance_m),
                 "table_plane_policy": "positive_source_and_destination_contacts",
                 "source_contact_hand_plane_clearance_m": float(hand_clearances[0]),
@@ -4284,12 +4382,19 @@ def _plan_tabletop(
     excluded_candidate_ids: tuple[str, ...] = (),
     pregrasp_only: bool,
     endpoint_feasibility_only: bool = False,
+    endpoint_feasibility: _EndpointFeasibility | None = None,
     planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopTaskPlan | TabletopPregraspPlan | _EndpointFeasibility:
     """Plan either the first boundary route or one complete task."""
 
     report = progress or (lambda _message: None)
+    if endpoint_feasibility is not None and (
+        pregrasp_only or endpoint_feasibility_only or required_candidate_id is None
+    ):
+        raise ValueError(
+            "cached endpoint branches require one named candidate in complete-task planning"
+        )
     goal_requests = (request, *tuple(alternative_goal_requests))
     _validate_equivalent_task_goalset(goal_requests)
     goalset_count = len(goal_requests)
@@ -4357,6 +4462,7 @@ def _plan_tabletop(
     fixed_close_sweep_validation_s = 0.0
     open_branch_planning_s = 0.0
     attached_lift_planning_s = 0.0
+    endpoint_branches_reused = False
     try:
         import torch
         from curobo.types import DeviceCfg
@@ -4373,6 +4479,16 @@ def _plan_tabletop(
         # candidate branch, so no temporary model is needed.
         device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
         strict_configuration_key = _configuration_key(query_robot)
+        endpoint_branches_reused = _endpoint_feasibility_matches(
+            endpoint_feasibility,
+            request_sha256=request.content_sha256,
+            goal_request_sha256s=tuple(current.content_sha256 for current in goal_requests),
+            robot_configuration_key=strict_configuration_key,
+            grasp_shortlist_sha256=request.grasp_shortlist_sha256,
+            candidate_id=required_candidate_id,
+        )
+        if endpoint_feasibility is not None and not endpoint_branches_reused:
+            report("cached endpoint branches do not match this exact task; recomputing IK")
         stage_started = time.monotonic()
         if planner_pool is None:
             strict_open_checker = CuroboKinematicCollisionChecker(
@@ -4432,55 +4548,70 @@ def _plan_tabletop(
         ]
         approach_distance_m = _request_pregrasp_distance_m(request, shortlist)
         branch_rejections: list[dict[str, Any]] = []
-        stage_started = time.monotonic()
-        exact_table_evidence = None
-        if request.fixture is None:
-            exact_table_evidence = []
-            for candidate in candidates:
-                evidence = candidate["execution_evidence"]
-                link_name = str(evidence["fixed_close_sweep_minimum_link"])
-                if arm == "left":
-                    link_name = link_name.replace("right_", "left_", 1)
-                exact_table_evidence.extend(
-                    [
-                        (
-                            float(evidence["fixed_close_sweep_table_clearance_m"]),
-                            link_name,
-                            int(evidence["fixed_close_sweep_minimum_sample"]),
-                        )
-                    ]
-                    * goalset_count
-                )
-        fixed_close_pair_rejections = fixed_close_validator.batch_candidate_rejections(
-            [matrix for candidate_matrices in grasp_matrices for matrix in candidate_matrices],
-            exact_table_evidence=exact_table_evidence,
-        )
-        batched_fixed_close_s = time.monotonic() - stage_started
-        remaining_indices = [
-            candidate_index
-            for candidate_index in range(len(candidates))
-            if any(
-                candidate_index * goalset_count + goal_index not in fixed_close_pair_rejections
-                for goal_index in range(goalset_count)
+        if endpoint_branches_reused:
+            assert endpoint_feasibility is not None
+            fixed_close_pair_rejections: dict[int, tuple[str, str]] = {}
+            remaining_indices = list(range(len(candidates)))
+            branch_rejections.extend(
+                rejection
+                for rejection in endpoint_feasibility.rejections
+                if rejection.get("candidate_id") == required_candidate_id
             )
-        ]
-        for flat_index, (stage, reason) in fixed_close_pair_rejections.items():
-            candidate_index, goal_index = divmod(flat_index, goalset_count)
-            branch_rejections.append(
-                {
-                    "candidate_id": str(candidates[candidate_index]["candidate_id"]),
-                    "goalset_index": goal_index,
-                    "stage": stage,
-                    "reason": reason,
-                }
-            )
-        if fixed_close_pair_rejections:
             report(
-                "batched fixed-close GPU pruning removed "
-                f"{len(fixed_close_pair_rejections)}/"
-                f"{len(candidates) * goalset_count} candidate/goal pairs; "
-                f"{len(remaining_indices)} remain for arm IK"
+                "reusing strict endpoint-valid IK branches for "
+                f"{required_candidate_id}; batched fixed-close and endpoint IK "
+                "analysis will not be repeated"
             )
+        else:
+            stage_started = time.monotonic()
+            exact_table_evidence = None
+            if request.fixture is None:
+                exact_table_evidence = []
+                for candidate in candidates:
+                    evidence = candidate["execution_evidence"]
+                    link_name = str(evidence["fixed_close_sweep_minimum_link"])
+                    if arm == "left":
+                        link_name = link_name.replace("right_", "left_", 1)
+                    exact_table_evidence.extend(
+                        [
+                            (
+                                float(evidence["fixed_close_sweep_table_clearance_m"]),
+                                link_name,
+                                int(evidence["fixed_close_sweep_minimum_sample"]),
+                            )
+                        ]
+                        * goalset_count
+                    )
+            fixed_close_pair_rejections = fixed_close_validator.batch_candidate_rejections(
+                [matrix for candidate_matrices in grasp_matrices for matrix in candidate_matrices],
+                exact_table_evidence=exact_table_evidence,
+            )
+            batched_fixed_close_s = time.monotonic() - stage_started
+            remaining_indices = [
+                candidate_index
+                for candidate_index in range(len(candidates))
+                if any(
+                    candidate_index * goalset_count + goal_index not in fixed_close_pair_rejections
+                    for goal_index in range(goalset_count)
+                )
+            ]
+            for flat_index, (stage, reason) in fixed_close_pair_rejections.items():
+                candidate_index, goal_index = divmod(flat_index, goalset_count)
+                branch_rejections.append(
+                    {
+                        "candidate_id": str(candidates[candidate_index]["candidate_id"]),
+                        "goalset_index": goal_index,
+                        "stage": stage,
+                        "reason": reason,
+                    }
+                )
+            if fixed_close_pair_rejections:
+                report(
+                    "batched fixed-close GPU pruning removed "
+                    f"{len(fixed_close_pair_rejections)}/"
+                    f"{len(candidates) * goalset_count} candidate/goal pairs; "
+                    f"{len(remaining_indices)} remain for arm IK"
+                )
         if not remaining_indices and endpoint_feasibility_only:
             return _EndpointFeasibility(
                 candidate_branch_counts={
@@ -4490,6 +4621,10 @@ def _plan_tabletop(
                 fixed_close_viable_candidate_count=0,
                 rejections=tuple(branch_rejections),
                 elapsed_s=time.monotonic() - started,
+                request_sha256=request.content_sha256,
+                goal_request_sha256s=tuple(current.content_sha256 for current in goal_requests),
+                robot_configuration_key=strict_configuration_key,
+                grasp_shortlist_sha256=request.grasp_shortlist_sha256,
             )
         if not remaining_indices:
             raise RuntimeError(
@@ -4573,103 +4708,115 @@ def _plan_tabletop(
                 )
                 return current_planner, current_device, current_state
 
-            stage_started = time.monotonic()
-            ik_solver = _batched_pregrasp_ik_solver(
-                resolved_transit_robot,
-                scene,
-                candidate_count=len(subset_candidates),
-                goalset_count=goalset_count,
-                seed=request.random_seed,
-                device_cfg=device_cfg,
-            )
-            batched_ik_setup_s += time.monotonic() - stage_started
-            pregrasp_goals = _batched_goalset_pose_goals(
-                pregrasp_matrices,
-                device_cfg,
-                arm=arm,
-            )
-            stage_started = time.monotonic()
-            try:
-                branches, ik_result = _enumerate_pregrasp_branches(
-                    ik_solver,
-                    pregrasp_goals,
-                    state,
+            if endpoint_branches_reused:
+                assert endpoint_feasibility is not None
+                assert required_candidate_id is not None
+                branches = list(endpoint_feasibility.branches_by_candidate[required_candidate_id])
+                ik_branch_counts = {0: len(branches)}
+                branch_counts = dict(ik_branch_counts)
+                report(
+                    f"reused {len(branches)} strict-endpoint-valid pregrasp IK "
+                    f"branches for {required_candidate_id}"
+                )
+            else:
+                stage_started = time.monotonic()
+                ik_solver = _batched_pregrasp_ik_solver(
+                    resolved_transit_robot,
+                    scene,
                     candidate_count=len(subset_candidates),
                     goalset_count=goalset_count,
+                    seed=request.random_seed,
+                    device_cfg=device_cfg,
                 )
-                branches = [
-                    branch
-                    for branch in branches
-                    if subset_indices[branch.candidate_local_index] * goalset_count
-                    + branch.goalset_index
-                    not in fixed_close_pair_rejections
-                ]
-                batched_ik_s += time.monotonic() - stage_started
-                diagnostic = (
-                    None
-                    if branches
-                    else _batched_ik_failure_diagnostic(
-                        result=ik_result,
-                        robot=transit_robot,
-                        scene=scene,
-                        candidates=subset_candidates,
-                        device_cfg=device_cfg,
-                        disabled_collision_links=set(),
+                batched_ik_setup_s += time.monotonic() - stage_started
+                pregrasp_goals = _batched_goalset_pose_goals(
+                    pregrasp_matrices,
+                    device_cfg,
+                    arm=arm,
+                )
+                stage_started = time.monotonic()
+                try:
+                    branches, ik_result = _enumerate_pregrasp_branches(
+                        ik_solver,
+                        pregrasp_goals,
+                        state,
+                        candidate_count=len(subset_candidates),
+                        goalset_count=goalset_count,
                     )
+                    branches = [
+                        branch
+                        for branch in branches
+                        if subset_indices[branch.candidate_local_index] * goalset_count
+                        + branch.goalset_index
+                        not in fixed_close_pair_rejections
+                    ]
+                    batched_ik_s += time.monotonic() - stage_started
+                    diagnostic = (
+                        None
+                        if branches
+                        else _batched_ik_failure_diagnostic(
+                            result=ik_result,
+                            robot=transit_robot,
+                            scene=scene,
+                            candidates=subset_candidates,
+                            device_cfg=device_cfg,
+                            disabled_collision_links=set(),
+                        )
+                    )
+                finally:
+                    _cleanup(ik_solver)
+                if not branches and not endpoint_feasibility_only:
+                    raise RuntimeError(
+                        "no collision-valid pregrasp IK branch remains for the qualified "
+                        f"candidates; prior branch rejections={branch_rejections}; "
+                        f"{diagnostic}"
+                    )
+                ik_branch_counts = {
+                    local_index: sum(
+                        branch.candidate_local_index == local_index for branch in branches
+                    )
+                    for local_index in range(len(subset_candidates))
+                }
+                stage_started = time.monotonic()
+                endpoint_collision_reasons = _pregrasp_endpoint_self_collision_reasons(
+                    branches,
+                    checker=strict_open_checker,
                 )
-            finally:
-                _cleanup(ik_solver)
-            if not branches and not endpoint_feasibility_only:
-                raise RuntimeError(
-                    "no collision-valid pregrasp IK branch remains for the qualified "
-                    f"candidates; prior branch rejections={branch_rejections}; {diagnostic}"
+                endpoint_precheck_s += time.monotonic() - stage_started
+                surviving_branches: list[_PregraspBranch] = []
+                endpoint_pruned = 0
+                for branch, reason in zip(branches, endpoint_collision_reasons, strict=True):
+                    if reason is None:
+                        surviving_branches.append(branch)
+                        continue
+                    endpoint_pruned += 1
+                    branch_rejections.append(
+                        {
+                            "candidate_id": candidate_ids[branch.candidate_local_index],
+                            "goalset_index": branch.goalset_index,
+                            "solver_seed_index": branch.solver_seed_index,
+                            "stage": "pregrasp_endpoint_strict_self_collision",
+                            "reason": reason,
+                        }
+                    )
+                branches = surviving_branches
+                branch_counts = {
+                    local_index: sum(
+                        branch.candidate_local_index == local_index for branch in branches
+                    )
+                    for local_index in range(len(subset_candidates))
+                }
+                counts_text = ", ".join(
+                    f"{candidate_ids[index]}={ik_branch_counts[index]}"
+                    for index in range(len(candidate_ids))
                 )
-            ik_branch_counts = {
-                local_index: sum(
-                    branch.candidate_local_index == local_index for branch in branches
+                report(
+                    f"CuRobo independent batched pregrasp IK: {len(branches)} unique "
+                    "strict-endpoint-valid branches after pruning "
+                    f"{endpoint_pruned} branches in one GPU pass; "
+                    f"{len(subset_candidates)} candidates with {IK_SEEDS} dedicated seeds "
+                    f"each produced: {counts_text}"
                 )
-                for local_index in range(len(subset_candidates))
-            }
-            stage_started = time.monotonic()
-            endpoint_collision_reasons = _pregrasp_endpoint_self_collision_reasons(
-                branches,
-                checker=strict_open_checker,
-            )
-            endpoint_precheck_s += time.monotonic() - stage_started
-            surviving_branches: list[_PregraspBranch] = []
-            endpoint_pruned = 0
-            for branch, reason in zip(branches, endpoint_collision_reasons, strict=True):
-                if reason is None:
-                    surviving_branches.append(branch)
-                    continue
-                endpoint_pruned += 1
-                branch_rejections.append(
-                    {
-                        "candidate_id": candidate_ids[branch.candidate_local_index],
-                        "goalset_index": branch.goalset_index,
-                        "solver_seed_index": branch.solver_seed_index,
-                        "stage": "pregrasp_endpoint_strict_self_collision",
-                        "reason": reason,
-                    }
-                )
-            branches = surviving_branches
-            branch_counts = {
-                local_index: sum(
-                    branch.candidate_local_index == local_index for branch in branches
-                )
-                for local_index in range(len(subset_candidates))
-            }
-            counts_text = ", ".join(
-                f"{candidate_ids[index]}={ik_branch_counts[index]}"
-                for index in range(len(candidate_ids))
-            )
-            report(
-                f"CuRobo independent batched pregrasp IK: {len(branches)} unique "
-                "strict-endpoint-valid branches after pruning "
-                f"{endpoint_pruned} branches in one GPU pass; "
-                f"{len(subset_candidates)} candidates with {IK_SEEDS} dedicated seeds "
-                f"each produced: {counts_text}"
-            )
             if endpoint_feasibility_only:
                 counts_by_candidate = {
                     str(candidate["candidate_id"]): 0 for candidate in candidates
@@ -4695,6 +4842,21 @@ def _plan_tabletop(
                     fixed_close_viable_candidate_count=len(remaining_indices),
                     rejections=tuple(branch_rejections),
                     elapsed_s=time.monotonic() - started,
+                    request_sha256=request.content_sha256,
+                    goal_request_sha256s=tuple(
+                        current.content_sha256 for current in goal_requests
+                    ),
+                    robot_configuration_key=strict_configuration_key,
+                    grasp_shortlist_sha256=request.grasp_shortlist_sha256,
+                    branches_by_candidate={
+                        candidate_ids[local_index]: tuple(
+                            _cached_endpoint_branch(branch)
+                            for branch in branches
+                            if branch.candidate_local_index == local_index
+                        )
+                        for local_index in range(len(subset_candidates))
+                        if branch_counts[local_index] > 0
+                    },
                 )
 
             def attempt_branch(
@@ -4980,6 +5142,7 @@ def _plan_tabletop(
                     ),
                     "open_optimizer_reused": open_optimizer_reused,
                     "open_optimizer_topology_rebuilt": open_optimizer_topology_rebuilt,
+                    "endpoint_branches_reused": endpoint_branches_reused,
                     "strict_checker_reused": strict_checker_reused,
                     "strict_checker_topology_rebuilt": strict_checker_topology_rebuilt,
                     "fixed_close_validator_reused": fixed_close_validator_reused,
@@ -5182,6 +5345,7 @@ def _plan_tabletop(
                 "return_policy": "exact reverse lift, grasp, and approach trajectories",
                 "open_optimizer_reused": open_optimizer_reused,
                 "open_optimizer_topology_rebuilt": open_optimizer_topology_rebuilt,
+                "endpoint_branches_reused": endpoint_branches_reused,
                 "strict_checker_reused": strict_checker_reused,
                 "strict_checker_topology_rebuilt": strict_checker_topology_rebuilt,
                 "fixed_close_validator_reused": fixed_close_validator_reused,
@@ -5379,6 +5543,7 @@ def plan_tabletop_task(
     *,
     required_candidate_id: str | None = None,
     excluded_candidate_ids: tuple[str, ...] = (),
+    endpoint_feasibility: _EndpointFeasibility | None = None,
     planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopTaskPlan:
@@ -5389,6 +5554,7 @@ def plan_tabletop_task(
         required_candidate_id=required_candidate_id,
         excluded_candidate_ids=excluded_candidate_ids,
         pregrasp_only=False,
+        endpoint_feasibility=endpoint_feasibility,
         planner_pool=planner_pool,
         progress=progress,
     )
@@ -5401,6 +5567,7 @@ def _plan_tabletop_task_goalset(
     requests: tuple[TabletopTaskRequest, ...],
     *,
     required_candidate_id: str,
+    endpoint_feasibility: _EndpointFeasibility | None = None,
     planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopTaskPlan:
@@ -5413,6 +5580,7 @@ def _plan_tabletop_task_goalset(
         alternative_goal_requests=requests[1:],
         required_candidate_id=required_candidate_id,
         pregrasp_only=False,
+        endpoint_feasibility=endpoint_feasibility,
         planner_pool=planner_pool,
         progress=progress,
     )
@@ -5479,6 +5647,7 @@ def _pick_place_endpoint_analysis(
         if str(value["candidate_id"]) not in excluded
     )
     analysis = _PickPlaceEndpointAnalysis(
+        request_sha256=request.content_sha256,
         candidate_ids=candidate_ids,
         source=source_feasibility,
         destination=destination_feasibility,
@@ -5488,6 +5657,28 @@ def _pick_place_endpoint_analysis(
         f"{len(analysis.common_candidate_ids)}/{len(candidate_ids)} grasp candidates"
     )
     return analysis
+
+
+def _pick_place_endpoint_analysis_report(
+    analysis: _PickPlaceEndpointAnalysis,
+) -> dict[str, Any]:
+    """Serialize endpoint evidence without serializing retained IK branches."""
+
+    return {
+        "operation": "analyze_tabletop_pick_place_endpoints",
+        "request_sha256": analysis.request_sha256,
+        "candidate_count": len(analysis.candidate_ids),
+        "source_viable_candidate_count": len(analysis.source.viable_candidate_ids),
+        "destination_viable_candidate_count": len(analysis.destination.viable_candidate_ids),
+        "common_candidate_ids": list(analysis.common_candidate_ids),
+        "ranked_common_candidate_ids": list(analysis.ranked_common_candidate_ids),
+        "common_candidate_joint_distance_rad": (analysis.common_candidate_joint_distance_rad),
+        "common_candidate_count": len(analysis.common_candidate_ids),
+        "source_elapsed_s": analysis.source.elapsed_s,
+        "destination_elapsed_s": analysis.destination.elapsed_s,
+        "route_planning_performed": False,
+        "robot_command_authorized": False,
+    }
 
 
 def analyze_tabletop_pick_place_endpoints(
@@ -5503,26 +5694,13 @@ def analyze_tabletop_pick_place_endpoints(
         planner_pool=planner_pool,
         progress=progress,
     )
-    return {
-        "operation": "analyze_tabletop_pick_place_endpoints",
-        "request_sha256": request.content_sha256,
-        "candidate_count": len(analysis.candidate_ids),
-        "source_viable_candidate_count": len(analysis.source.viable_candidate_ids),
-        "destination_viable_candidate_count": len(analysis.destination.viable_candidate_ids),
-        "common_candidate_ids": list(analysis.common_candidate_ids),
-        "ranked_common_candidate_ids": list(analysis.ranked_common_candidate_ids),
-        "common_candidate_joint_distance_rad": (analysis.common_candidate_joint_distance_rad),
-        "common_candidate_count": len(analysis.common_candidate_ids),
-        "source_elapsed_s": analysis.source.elapsed_s,
-        "destination_elapsed_s": analysis.destination.elapsed_s,
-        "route_planning_performed": False,
-        "robot_command_authorized": False,
-    }
+    return _pick_place_endpoint_analysis_report(analysis)
 
 
 def plan_tabletop_pick_place(
     request: TabletopPickPlaceRequest,
     *,
+    endpoint_analysis: _PickPlaceEndpointAnalysis | None = None,
     planner_pool: TabletopPlannerPool | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> TabletopPickPlacePlan:
@@ -5532,11 +5710,21 @@ def plan_tabletop_pick_place(
     started = time.monotonic()
     source = request.source_request
     destinations = destination_requests_for_pick_place(request)
-    endpoint_analysis = _pick_place_endpoint_analysis(
-        request,
-        planner_pool=planner_pool,
-        progress=report,
+    endpoint_analysis_reused = bool(
+        endpoint_analysis is not None
+        and endpoint_analysis.request_sha256 == request.content_sha256
     )
+    if not endpoint_analysis_reused:
+        if endpoint_analysis is not None:
+            report("cached endpoint analysis belongs to another request; recomputing")
+        endpoint_analysis = _pick_place_endpoint_analysis(
+            request,
+            planner_pool=planner_pool,
+            progress=report,
+        )
+    else:
+        report("reusing one-shot source/destination endpoint analysis")
+    assert endpoint_analysis is not None
     source_feasibility = endpoint_analysis.source
     destination_feasibility = endpoint_analysis.destination
     source_endpoint_viable = source_feasibility.viable_candidate_ids
@@ -5571,6 +5759,7 @@ def plan_tabletop_pick_place(
             current_destination = _plan_tabletop_task_goalset(
                 destinations,
                 required_candidate_id=candidate_id,
+                endpoint_feasibility=destination_feasibility,
                 planner_pool=planner_pool,
                 progress=report,
             )
@@ -5588,6 +5777,7 @@ def plan_tabletop_pick_place(
             current_source = plan_tabletop_task(
                 source,
                 required_candidate_id=candidate_id,
+                endpoint_feasibility=source_feasibility,
                 planner_pool=planner_pool,
                 progress=report,
             )
@@ -5706,6 +5896,11 @@ def plan_tabletop_pick_place(
             "common_endpoint_viable_candidate_count": len(common_endpoint_viable),
             "source_endpoint_feasibility_elapsed_s": source_feasibility.elapsed_s,
             "destination_endpoint_feasibility_elapsed_s": (destination_feasibility.elapsed_s),
+            "endpoint_analysis_reused": endpoint_analysis_reused,
+            "endpoint_branches_reused": bool(
+                source_task.planner_provenance.get("endpoint_branches_reused")
+                and destination_task.planner_provenance.get("endpoint_branches_reused")
+            ),
             "task_structure": "fixed_pick_place_sequence",
         },
     )

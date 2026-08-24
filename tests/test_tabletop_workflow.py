@@ -718,6 +718,150 @@ def test_planner_pool_reuses_fixed_close_checker_for_retention(monkeypatch) -> N
     assert created == [(request, task, None, validator)]
 
 
+def test_planner_pool_reuses_matching_checker_for_pick_place_retention(
+    monkeypatch,
+) -> None:
+    class Validator:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+    created = []
+
+    class PickPlaceRetention:
+        def __init__(self, request, plan, *, fixed_close_validator=None) -> None:
+            created.append((request, plan, fixed_close_validator))
+
+    monkeypatch.setattr(tabletop_planner, "_FixedCloseSweepValidator", Validator)
+    monkeypatch.setattr(
+        tabletop_planner,
+        "PickPlaceRetentionRouteValidator",
+        PickPlaceRetention,
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_fixed_close_configuration_key",
+        lambda _request: "matching",
+    )
+    pool = TabletopPlannerPool()
+    source = SimpleNamespace(arm="left")
+    request = SimpleNamespace(source_request=source)
+    validator, _event = pool.acquire_fixed_close_validator(
+        configuration_key="matching",
+        request=source,
+        base_T_object=np.eye(4),
+        base_T_detected_object=np.eye(4),
+        plane_point=np.zeros(3),
+        down=np.asarray((0.0, 0.0, -1.0)),
+        open_q=np.zeros(7),
+        close_target_q=np.ones(7),
+    )
+    plan = object()
+
+    result = pool.pick_place_retention_validator(request, plan)
+
+    assert isinstance(result, PickPlaceRetention)
+    assert created == [(request, plan, validator)]
+
+
+def test_planner_pool_rebuilds_incompatible_pick_place_retention_checker(
+    monkeypatch,
+) -> None:
+    created = []
+
+    class PickPlaceRetention:
+        def __init__(self, request, plan, *, fixed_close_validator=None) -> None:
+            created.append((request, plan, fixed_close_validator))
+
+    monkeypatch.setattr(
+        tabletop_planner,
+        "PickPlaceRetentionRouteValidator",
+        PickPlaceRetention,
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_fixed_close_configuration_key",
+        lambda _request: "required",
+    )
+    pool = TabletopPlannerPool()
+    pool._fixed_close["left"] = SimpleNamespace(
+        configuration_key="stale",
+        validator=object(),
+    )
+    request = SimpleNamespace(source_request=SimpleNamespace(arm="left"))
+    plan = object()
+
+    result = pool.pick_place_retention_validator(request, plan)
+
+    assert isinstance(result, PickPlaceRetention)
+    assert created == [(request, plan, None)]
+
+
+def test_cached_endpoint_branch_is_normalized_and_immutable() -> None:
+    values = np.arange(7, dtype=np.float64)
+    branch = tabletop_planner._PregraspBranch(
+        candidate_local_index=9,
+        solver_seed_index=3,
+        model_q_rad=values,
+        position_error_m=0.001,
+        rotation_error_rad=0.002,
+        goalset_index=2,
+    )
+
+    cached = tabletop_planner._cached_endpoint_branch(branch)
+    values[0] = 100.0
+
+    assert cached.candidate_local_index == 0
+    assert cached.solver_seed_index == 3
+    assert cached.goalset_index == 2
+    assert cached.model_q_rad[0] == 0.0
+    assert cached.model_q_rad.flags.writeable is False
+
+
+def test_cached_endpoint_branches_require_every_exact_binding() -> None:
+    candidate_id = "candidate"
+    branch = tabletop_planner._PregraspBranch(
+        candidate_local_index=0,
+        solver_seed_index=0,
+        model_q_rad=np.zeros(7),
+        position_error_m=0.0,
+        rotation_error_rad=0.0,
+    )
+    values = {
+        "candidate_branch_counts": {candidate_id: 1},
+        "candidate_best_joint_distance_rad": {candidate_id: 0.0},
+        "fixed_close_viable_candidate_count": 1,
+        "rejections": (),
+        "elapsed_s": 0.1,
+        "request_sha256": "request",
+        "goal_request_sha256s": ("goal",),
+        "robot_configuration_key": "robot",
+        "grasp_shortlist_sha256": "shortlist",
+        "branches_by_candidate": {candidate_id: (branch,)},
+    }
+
+    def matches(feasibility):
+        return tabletop_planner._endpoint_feasibility_matches(
+            feasibility,
+            request_sha256="request",
+            goal_request_sha256s=("goal",),
+            robot_configuration_key="robot",
+            grasp_shortlist_sha256="shortlist",
+            candidate_id=candidate_id,
+        )
+
+    assert matches(tabletop_planner._EndpointFeasibility(**values))
+    for changes in (
+        {"request_sha256": "stale"},
+        {"goal_request_sha256s": ("other",)},
+        {"robot_configuration_key": "other"},
+        {"grasp_shortlist_sha256": "other"},
+        {"candidate_branch_counts": {candidate_id: 0}},
+        {"branches_by_candidate": {}},
+    ):
+        feasibility = tabletop_planner._EndpointFeasibility(**{**values, **changes})
+        assert not matches(feasibility)
+
+
 def test_reusable_motion_planner_reuses_unchanged_configuration(monkeypatch) -> None:
     created = []
 

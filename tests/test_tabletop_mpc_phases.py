@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from g1_aprilcube_calibration.transforms import invert_transform
+from g1_dex3_tabletop.planning import tabletop_session
 from g1_dex3_tabletop.planning.curobo_backend import _clearance_from_activation_cost
 from g1_dex3_tabletop.planning.tabletop_mpc import (
     MovingGraspMPC,
@@ -402,9 +403,17 @@ def test_escape_only_session_retains_exact_reverse_for_later_boundary_replan(
     request = object()
     escape = object()
     clearance = object()
+    pools = []
+
+    def plan_supported(received, *, planner_pool, progress):
+        assert received is request
+        assert callable(progress)
+        pools.append(planner_pool)
+        return escape
+
     monkeypatch.setattr(
         "g1_dex3_tabletop.planning.tabletop_session.plan_supported_escape",
-        lambda received, progress: escape,
+        plan_supported,
     )
     monkeypatch.setattr(
         "g1_dex3_tabletop.planning.tabletop_session.request_at_clearance",
@@ -418,6 +427,60 @@ def test_escape_only_session_retains_exact_reverse_for_later_boundary_replan(
     assert session._clearance_request is clearance
     assert session._execution is None
     assert session._retention_validator is None
+    assert pools == [session._planner_pool]
+
+
+def test_lifecycle_supported_escape_receives_session_pool(monkeypatch) -> None:
+    request = object()
+    escape = object()
+    clearance = object()
+    task = object()
+    execution = SimpleNamespace(task=task)
+    validator = SimpleNamespace(cache_build_s=0.0)
+    pools = []
+
+    def plan_supported(received, *, planner_pool, progress):
+        assert received is request
+        assert callable(progress)
+        pools.append(planner_pool)
+        return escape
+
+    monkeypatch.setattr(tabletop_session, "plan_supported_escape", plan_supported)
+    monkeypatch.setattr(
+        tabletop_session,
+        "request_at_clearance",
+        lambda received, received_escape: (
+            clearance if (received, received_escape) == (request, escape) else None
+        ),
+    )
+    monkeypatch.setattr(
+        tabletop_session,
+        "plan_tabletop_task",
+        lambda received, *, planner_pool, progress: (
+            task
+            if received is clearance
+            and planner_pool is session._planner_pool
+            and callable(progress)
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        tabletop_session,
+        "assemble_execution_plan",
+        lambda **_kwargs: (clearance, execution),
+    )
+    session = TabletopPlanningSession()
+    monkeypatch.setattr(
+        session._planner_pool,
+        "retention_validator",
+        lambda received, received_task: (
+            validator if (received, received_task) == (clearance, task) else None
+        ),
+    )
+
+    assert session.plan_lifecycle(request) is execution
+    assert pools == [session._planner_pool]
+    assert session._retention_validator is validator
 
 
 def test_runtime_warmup_populates_pool_without_installing_nominal_task(

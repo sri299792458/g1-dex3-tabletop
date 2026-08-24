@@ -15,7 +15,9 @@ from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
     RetentionRouteValidator,
     TabletopPlannerPool,
-    analyze_tabletop_pick_place_endpoints,
+    _pick_place_endpoint_analysis,
+    _pick_place_endpoint_analysis_report,
+    _PickPlaceEndpointAnalysis,
     plan_moving_grasp_continuation,
     plan_supported_escape,
     plan_tabletop_pick_place,
@@ -60,6 +62,7 @@ class TabletopPlanningSession:
         self._pick_place_request: TabletopPickPlaceRequest | None = None
         self._pick_place_plan: TabletopPickPlacePlan | None = None
         self._pick_place_retention_validator: PickPlaceRetentionRouteValidator | None = None
+        self._pending_pick_place_endpoint_analysis: _PickPlaceEndpointAnalysis | None = None
         self._phase_mpc: MovingGraspMPC | None = None
         self._active_phase_mpc: MovingGraspMPC | None = None
         self._planner_pool = TabletopPlannerPool()
@@ -71,7 +74,11 @@ class TabletopPlanningSession:
         progress: Callable[[str], None] | None = None,
     ) -> TabletopExecutionPlan:
         report = progress or (lambda _message: None)
-        escape = plan_supported_escape(request, progress=report)
+        escape = plan_supported_escape(
+            request,
+            planner_pool=self._planner_pool,
+            progress=report,
+        )
         clearance_request = request_at_clearance(request, escape)
         task = plan_tabletop_task(
             clearance_request,
@@ -109,7 +116,11 @@ class TabletopPlanningSession:
         """Freeze only the supported lift and exact reverse needed to reach clearance."""
 
         report = progress or (lambda _message: None)
-        escape = plan_supported_escape(request, progress=report)
+        escape = plan_supported_escape(
+            request,
+            planner_pool=self._planner_pool,
+            progress=report,
+        )
         # The provisional moving-grasp MPC owns no executable route. Keep its
         # CUDA graph alive while the fresh loaded-state escape is planned.
         self._active_phase_mpc = None
@@ -236,8 +247,16 @@ class TabletopPlanningSession:
             controller.close()
         self._phase_mpc = None
         self._active_phase_mpc = None
+        endpoint_analysis = self._pending_pick_place_endpoint_analysis
+        self._pending_pick_place_endpoint_analysis = None
+        if (
+            endpoint_analysis is not None
+            and endpoint_analysis.request_sha256 != request.content_sha256
+        ):
+            endpoint_analysis = None
         plan = plan_tabletop_pick_place(
             request,
+            endpoint_analysis=endpoint_analysis,
             planner_pool=self._planner_pool,
             progress=progress,
         )
@@ -254,11 +273,14 @@ class TabletopPlanningSession:
     ) -> dict:
         """Run only the shared source/destination endpoint feasibility pass."""
 
-        return analyze_tabletop_pick_place_endpoints(
+        self._pending_pick_place_endpoint_analysis = None
+        analysis = _pick_place_endpoint_analysis(
             request,
             planner_pool=self._planner_pool,
             progress=progress,
         )
+        self._pending_pick_place_endpoint_analysis = analysis
+        return _pick_place_endpoint_analysis_report(analysis)
 
     def validate_pick_place_retention_route(
         self,
@@ -284,9 +306,11 @@ class TabletopPlanningSession:
         ):
             self._pick_place_request = request.pick_place_request
             self._pick_place_plan = request.pick_place_plan
-            self._pick_place_retention_validator = PickPlaceRetentionRouteValidator(
-                request.pick_place_request,
-                request.pick_place_plan,
+            self._pick_place_retention_validator = (
+                self._planner_pool.pick_place_retention_validator(
+                    request.pick_place_request,
+                    request.pick_place_plan,
+                )
             )
         return self._pick_place_retention_validator.validate(request, progress=progress)
 

@@ -531,6 +531,98 @@ def test_direct_stack_submits_one_yaw_goalset_before_route_planning(
     assert attempts[0]["selected_destination_index"] == 2
 
 
+def test_pick_place_session_consumes_matching_endpoint_analysis_once(monkeypatch) -> None:
+    request = SimpleNamespace(content_sha256="a" * 64)
+    analysis = SimpleNamespace(request_sha256=request.content_sha256)
+    plan = object()
+    received = []
+
+    monkeypatch.setattr(
+        tabletop_session,
+        "_pick_place_endpoint_analysis",
+        lambda received_request, **_kwargs: analysis if received_request is request else None,
+    )
+    monkeypatch.setattr(
+        tabletop_session,
+        "_pick_place_endpoint_analysis_report",
+        lambda received_analysis: {"request_sha256": received_analysis.request_sha256},
+    )
+
+    def fake_plan(received_request, *, endpoint_analysis, **_kwargs):
+        received.append((received_request, endpoint_analysis))
+        return plan
+
+    monkeypatch.setattr(tabletop_session, "plan_tabletop_pick_place", fake_plan)
+    session = TabletopPlanningSession()
+
+    assert session.analyze_pick_place_endpoints(request) == {
+        "request_sha256": request.content_sha256
+    }
+    assert session.plan_pick_place(request) is plan
+    assert session._pending_pick_place_endpoint_analysis is None
+    assert session.plan_pick_place(request) is plan
+    assert received == [(request, analysis), (request, None)]
+
+
+def test_pick_place_session_never_reuses_another_request_analysis(monkeypatch) -> None:
+    analyzed_request = SimpleNamespace(content_sha256="a" * 64)
+    planned_request = SimpleNamespace(content_sha256="b" * 64)
+    analysis = SimpleNamespace(request_sha256=analyzed_request.content_sha256)
+    received = []
+
+    monkeypatch.setattr(
+        tabletop_session,
+        "_pick_place_endpoint_analysis",
+        lambda _request, **_kwargs: analysis,
+    )
+    monkeypatch.setattr(
+        tabletop_session,
+        "_pick_place_endpoint_analysis_report",
+        lambda _analysis: {},
+    )
+    monkeypatch.setattr(
+        tabletop_session,
+        "plan_tabletop_pick_place",
+        lambda _request, *, endpoint_analysis, **_kwargs: received.append(endpoint_analysis),
+    )
+    session = TabletopPlanningSession()
+
+    session.analyze_pick_place_endpoints(analyzed_request)
+    session.plan_pick_place(planned_request)
+
+    assert received == [None]
+    assert session._pending_pick_place_endpoint_analysis is None
+
+
+def test_pick_place_session_clears_endpoint_analysis_when_planning_fails(
+    monkeypatch,
+) -> None:
+    request = SimpleNamespace(content_sha256="a" * 64)
+    analysis = SimpleNamespace(request_sha256=request.content_sha256)
+    monkeypatch.setattr(
+        tabletop_session,
+        "_pick_place_endpoint_analysis",
+        lambda _request, **_kwargs: analysis,
+    )
+    monkeypatch.setattr(
+        tabletop_session,
+        "_pick_place_endpoint_analysis_report",
+        lambda _analysis: {},
+    )
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("planning failed")
+
+    monkeypatch.setattr(tabletop_session, "plan_tabletop_pick_place", fail)
+    session = TabletopPlanningSession()
+    session.analyze_pick_place_endpoints(request)
+
+    with pytest.raises(RuntimeError, match="planning failed"):
+        session.plan_pick_place(request)
+
+    assert session._pending_pick_place_endpoint_analysis is None
+
+
 def test_pick_place_tries_next_grasp_when_first_cannot_place(monkeypatch) -> None:
     source = _request("left", _observation(0.20, 0.0, 0.020), 0.040)
     source_T_destination = np.eye(4)
@@ -692,6 +784,86 @@ def test_pick_place_orders_common_grasps_by_endpoint_joint_distance(monkeypatch)
         "candidate_a": {"source": 2.0, "destination": 1.5, "total": 3.5},
         "candidate_b": {"source": 0.4, "destination": 0.5, "total": 0.9},
     }
+
+
+def test_pick_place_reuses_matching_analysis_and_its_endpoint_branches(monkeypatch) -> None:
+    source = _request("left", _observation(0.20, 0.0, 0.020), 0.040)
+    source_T_destination = np.eye(4)
+    source_T_destination[0, 3] = 0.10
+    request = TabletopPickPlaceRequest(
+        source_request=source,
+        source_T_destination_objects=(source_T_destination,),
+    )
+    source_feasibility = tabletop_planner._EndpointFeasibility(
+        candidate_branch_counts={"candidate_a": 1},
+        candidate_best_joint_distance_rad={"candidate_a": 1.0},
+        fixed_close_viable_candidate_count=1,
+        rejections=(),
+        elapsed_s=0.1,
+    )
+    destination_feasibility = tabletop_planner._EndpointFeasibility(
+        candidate_branch_counts={"candidate_a": 1},
+        candidate_best_joint_distance_rad={"candidate_a": 2.0},
+        fixed_close_viable_candidate_count=1,
+        rejections=(),
+        elapsed_s=0.1,
+    )
+    analysis = tabletop_planner._PickPlaceEndpointAnalysis(
+        request_sha256=request.content_sha256,
+        candidate_ids=("candidate_a",),
+        source=source_feasibility,
+        destination=destination_feasibility,
+    )
+    endpoints = (0.10, 0.20, 0.30, 0.40, 0.30, 0.20, 0.10, 0.0)
+    received = []
+
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_pick_place_endpoint_analysis",
+        lambda *_args, **_kwargs: pytest.fail("matching endpoint analysis was recomputed"),
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "plan_tabletop_task",
+        lambda current, *, endpoint_feasibility, **_kwargs: (
+            received.append(("source", endpoint_feasibility))
+            or _task(current, candidate_id="candidate_a", endpoints=endpoints)
+        ),
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_plan_tabletop_task_goalset",
+        lambda requests, *, endpoint_feasibility, **_kwargs: (
+            received.append(("destination", endpoint_feasibility))
+            or _task(
+                requests[0],
+                candidate_id="candidate_a",
+                endpoints=endpoints,
+                goalset_index=0,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        tabletop_planner,
+        "_plan_attached_transfer",
+        lambda _request, source_task, destination_task, **_kwargs: (
+            _trajectory(
+                "payload_lift",
+                "payload_transfer",
+                source_task.trajectories[3].command_q_rad[-1][0],
+                destination_task.trajectories[3].command_q_rad[-1][0],
+            ),
+            {"test": True},
+        ),
+    )
+
+    plan = plan_tabletop_pick_place(request, endpoint_analysis=analysis)
+
+    assert received == [
+        ("destination", destination_feasibility),
+        ("source", source_feasibility),
+    ]
+    assert plan.planner_provenance["endpoint_analysis_reused"] is True
 
 
 def test_pick_place_skips_candidates_pruned_by_batched_endpoint_intersection(
@@ -894,8 +1066,12 @@ def test_pick_place_checker_is_built_only_for_the_selected_execution(monkeypatch
         "plan_tabletop_pick_place",
         lambda request, **_kwargs: planned_plan,
     )
-    monkeypatch.setattr(tabletop_session, "PickPlaceRetentionRouteValidator", FakeValidator)
     session = TabletopPlanningSession()
+    monkeypatch.setattr(
+        session._planner_pool,
+        "pick_place_retention_validator",
+        lambda request, plan: FakeValidator(request, plan),
+    )
 
     assert session.plan_pick_place(planned_request) is planned_plan
     assert builds == []
