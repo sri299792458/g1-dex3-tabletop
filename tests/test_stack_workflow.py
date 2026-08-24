@@ -9,8 +9,9 @@ from scipy.spatial.transform import Rotation
 from g1_aprilcube_calibration.joint_map import arm_indices
 from g1_dex3_tabletop import hardware_stack, tabletop_perception
 from g1_dex3_tabletop.hardware_stack import (
-    _active_clearance_snapshot,
+    _command_bound_snapshot,
     _dual_arm_command_snapshot,
+    _install_plan_at_current_boundary,
     _nearest_cube_move,
 )
 from g1_dex3_tabletop.planning import tabletop_planner, tabletop_session
@@ -99,25 +100,120 @@ def test_right_escape_snapshot_uses_held_command_instead_of_tracking_measurement
     np.testing.assert_array_equal(q29[np.asarray(arm_indices("left"))], left_command)
 
 
-def test_active_clearance_snapshot_keeps_unused_arm_at_supported_command() -> None:
-    state = SimpleNamespace(position=np.full(29, 0.9))
+def test_command_bound_snapshot_reproduces_latest_right_elbow_regression() -> None:
+    measured = np.zeros(29)
+    right_indices = np.asarray(arm_indices("right"))
+    measured[right_indices] = (
+        -0.038637143,
+        0.002565425,
+        -0.151228935,
+        -0.022518359,
+        0.124492131,
+        -0.177773997,
+        0.164135948,
+    )
+    state = SimpleNamespace(position=measured)
     hands = SimpleNamespace(
         left=SimpleNamespace(position=np.zeros(7)),
         right=SimpleNamespace(position=np.ones(7)),
     )
-    escape = SimpleNamespace(outbound=SimpleNamespace(command_q_rad=((0.0,) * 7, (0.25,) * 7)))
+    left_command = np.full(7, 0.25)
+    right_command = np.asarray(
+        (
+            -0.033471942,
+            0.004554804,
+            -0.151420683,
+            -0.001498028,
+            0.124492131,
+            -0.171242595,
+            0.163572684,
+        )
+    )
 
-    snapshot = _active_clearance_snapshot(
+    snapshot = _command_bound_snapshot(
         state,
         hands,
-        arm="right",
-        escape=escape,
-        inactive_command_q_rad=np.full(7, -0.1),
+        np.concatenate((left_command, right_command)),
     )
 
     q29 = np.asarray(snapshot.measured_q29_rad)
-    np.testing.assert_array_equal(q29[np.asarray(arm_indices("left"))], -0.1)
-    np.testing.assert_array_equal(q29[np.asarray(arm_indices("right"))], 0.25)
+    np.testing.assert_array_equal(q29[np.asarray(arm_indices("left"))], left_command)
+    np.testing.assert_array_equal(q29[right_indices], right_command)
+    assert abs(measured[right_indices[3]] - right_command[3]) == pytest.approx(0.021020331)
+
+
+def test_handoff_stack_plan_preserves_exact_active_command(monkeypatch) -> None:
+    replacement = object()
+    monkeypatch.setattr(
+        hardware_stack,
+        "pose_set_from_trajectories",
+        lambda **_kwargs: replacement,
+    )
+    calls = []
+
+    class FakeExecutor:
+        current_pose_id = "__handoff__"
+        pose_set = SimpleNamespace(calibration_arm="left")
+        dual_arm_command_q = np.zeros(14)
+
+        @staticmethod
+        def install_validated_plan(**kwargs) -> None:
+            calls.append(kwargs)
+
+    outbound = _trajectory("__handoff__", "clearance", 0.0, 0.1)
+    result = _install_plan_at_current_boundary(
+        FakeExecutor(),
+        arm="left",
+        trajectories=(outbound,),
+        plan_sha256="a" * 64,
+        validated_reference_state=SimpleNamespace(position=np.zeros(29)),
+        model=SimpleNamespace(name="g1", sha256="b" * 64),
+    )
+
+    assert result == (outbound,)
+    assert len(calls) == 1
+    assert calls[0]["pose_set"] is replacement
+    assert calls[0]["preserve_current_command"] is True
+
+
+def test_stack_plan_install_rejects_measured_right_elbow_start() -> None:
+    command_right = np.asarray(
+        (
+            -0.033471942,
+            0.004554804,
+            -0.151420683,
+            -0.001498028,
+            0.124492131,
+            -0.171242595,
+            0.163572684,
+        )
+    )
+    measured_right = command_right.copy()
+    measured_right[3] = -0.022518359
+
+    class FakeExecutor:
+        current_pose_id = "__handoff__"
+        pose_set = SimpleNamespace(calibration_arm="left")
+        dual_arm_command_q = np.concatenate((np.zeros(7), command_right))
+
+    outbound = PlannedTrajectory(
+        from_pose_id="__handoff__",
+        to_pose_id="clearance",
+        sample_time_s=(0.0, 1.0),
+        command_q_rad=(tuple(measured_right), tuple(measured_right + 0.1)),
+        model_q_rad=(tuple(measured_right), tuple(measured_right + 0.1)),
+        planning_time_s=0.1,
+    )
+
+    with pytest.raises(ValueError, match=r"active command by 0\.021020331rad"):
+        _install_plan_at_current_boundary(
+            FakeExecutor(),
+            arm="right",
+            trajectories=(outbound,),
+            plan_sha256="a" * 64,
+            validated_reference_state=SimpleNamespace(position=np.zeros(29)),
+            model=SimpleNamespace(name="g1", sha256="b" * 64),
+        )
 
 
 def test_clearance_perception_failure_is_recoverable_only_with_healthy_control() -> None:

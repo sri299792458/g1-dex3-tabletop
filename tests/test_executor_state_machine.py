@@ -617,6 +617,31 @@ def test_loaded_handoff_can_atomically_install_a_new_validated_plan() -> None:
     assert "validated plan installed" in executor.events[-1].reason
 
 
+def test_loaded_handoff_can_install_plan_without_rebasing_dual_arm_command() -> None:
+    clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    command_before = executor.dual_arm_command_q
+    loaded = transport.position.copy()
+    loaded[25] -= 0.021020331
+    transport.position[:] = loaded
+    clock.advance(0.01)
+    reference = transport.observe()
+
+    executor.install_validated_plan(
+        pose_set=pose_set(),
+        approved_validation_report_sha256="c" * 64,
+        validated_reference_state=reference,
+        preserve_current_command=True,
+    )
+
+    np.testing.assert_array_equal(executor.dual_arm_command_q, command_before)
+    np.testing.assert_array_equal(transport.commands[-1].q14, command_before)
+    np.testing.assert_array_equal(executor.handoff_q, command_before[:7])
+    np.testing.assert_array_equal(executor.hold_q, command_before[7:])
+    assert "command preserved 0.0000rad" in executor.events[-1].reason
+
+
 def test_loaded_plan_install_rejects_state_drift_after_validation() -> None:
     clock, transport, executor = subject()
     executor.acquire(operator_confirmed=True)

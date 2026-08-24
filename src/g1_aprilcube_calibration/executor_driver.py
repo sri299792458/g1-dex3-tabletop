@@ -58,6 +58,9 @@ class SynchronizedPoseExecutor:
     def observe_control_input(self):
         return self._call("observe_control_input")
 
+    def observe_dual_arm_control_input(self):
+        return self._call("observe_dual_arm_control_input")
+
     def streaming_trajectory_status(self):
         return self._call("streaming_trajectory_status")
 
@@ -87,6 +90,10 @@ class SynchronizedPoseExecutor:
     @property
     def calibration_command_q(self):
         return self._call("calibration_command_q")
+
+    @property
+    def dual_arm_command_q(self):
+        return self._call("dual_arm_command_q")
 
     def start_streaming_trajectory(self, **kwargs):
         return self._call("start_streaming_trajectory", **kwargs)

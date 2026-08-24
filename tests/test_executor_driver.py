@@ -31,6 +31,9 @@ class Executor:
     def observe_state(self):
         return self.observed_state
 
+    def observe_dual_arm_control_input(self):
+        return self.observed_state, (0.2,) * 14
+
     def emergency_stop(self, reason):
         self.fault_reason = reason
 
@@ -49,6 +52,10 @@ class Executor:
     @property
     def calibration_command_q(self):
         return (0.1,) * 7
+
+    @property
+    def dual_arm_command_q(self):
+        return (0.2,) * 14
 
     def start_streaming_trajectory(self, **kwargs):
         self.streaming_trajectory = kwargs
@@ -100,6 +107,11 @@ def test_synchronized_executor_exposes_transport_style_observe():
 
     assert synchronized.observe() is raw.observed_state
     assert synchronized.observe_state() is raw.observed_state
+    assert synchronized.observe_dual_arm_control_input() == (
+        raw.observed_state,
+        (0.2,) * 14,
+    )
+    assert synchronized.dual_arm_command_q == (0.2,) * 14
 
 
 def test_synchronized_executor_forwards_frozen_trajectory() -> None:

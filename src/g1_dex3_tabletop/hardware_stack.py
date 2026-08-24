@@ -111,20 +111,17 @@ def _tuple_transform(value: np.ndarray) -> tuple[tuple[float, ...], ...]:
     return tuple(tuple(float(item) for item in row) for row in value)
 
 
-def _active_clearance_snapshot(
-    state,
-    hands,
-    *,
-    arm: str,
-    escape: SupportedEscapePlan,
-    inactive_command_q_rad,
-) -> RobotSnapshot:
-    endpoint = escape.outbound.command_q_rad[-1]
+def _command_bound_snapshot(state, hands, command_q14) -> RobotSnapshot:
+    """Keep measured body/fingers while binding both arms to the active command."""
+
+    command = np.asarray(command_q14, dtype=np.float64).reshape(-1)
+    if command.shape != (14,) or not np.all(np.isfinite(command)):
+        raise ValueError("command-bound snapshot requires 14 finite arm commands")
     return _dual_arm_command_snapshot(
         state,
         hands,
-        left_command_q_rad=endpoint if arm == "left" else inactive_command_q_rad,
-        right_command_q_rad=endpoint if arm == "right" else inactive_command_q_rad,
+        left_command_q_rad=command[:7],
+        right_command_q_rad=command[7:],
     )
 
 
@@ -272,6 +269,17 @@ def _install_plan_at_current_boundary(
     current_id = synchronized.current_pose_id
     if current_id is None:
         raise RuntimeError("stack plan installation requires a named settled boundary")
+    command_q14 = np.asarray(synchronized.dual_arm_command_q, dtype=np.float64).reshape(-1)
+    if command_q14.shape != (14,) or not np.all(np.isfinite(command_q14)):
+        raise RuntimeError("stack executor returned an invalid dual-arm command")
+    active_command = command_q14[:7] if arm == "left" else command_q14[7:]
+    start_error = float(
+        np.max(np.abs(np.asarray(trajectories[0].command_q_rad[0]) - active_command))
+    )
+    if start_error > 1.0e-9:
+        raise ValueError(
+            f"stack plan starts away from the active command by {start_error:.9f}rad"
+        )
     selected_is_current = synchronized.pose_set.calibration_arm == arm
     executable = trajectories
     if selected_is_current and trajectories[0].from_pose_id != current_id:
@@ -285,10 +293,13 @@ def _install_plan_at_current_boundary(
         )
     boundary_id = current_id if selected_is_current else trajectories[0].from_pose_id
     all_routes = (*executable, *recovery_trajectories)
+    command_reference = np.asarray(validated_reference_state.position, dtype=np.float64).copy()
+    command_reference[np.asarray(arm_indices("left"))] = command_q14[:7]
+    command_reference[np.asarray(arm_indices("right"))] = command_q14[7:]
     pose_set = pose_set_from_trajectories(
         arm=arm,
         trajectories=all_routes,
-        reference_full_q=validated_reference_state.position,
+        reference_full_q=command_reference,
         robot_model=model.name,
         urdf_sha256=model.sha256,
         source="NVlabs/curobo_fixed_two_cube_stack",
@@ -297,7 +308,14 @@ def _install_plan_at_current_boundary(
             executable[0].command_q_rad[0] if boundary_id != "__handoff__" else None
         ),
     )
-    if selected_is_current:
+    if selected_is_current and boundary_id == "__handoff__":
+        synchronized.install_validated_plan(
+            pose_set=pose_set,
+            approved_validation_report_sha256=plan_sha256,
+            validated_reference_state=validated_reference_state,
+            preserve_current_command=True,
+        )
+    elif selected_is_current:
         synchronized.replace_validated_remaining_plan(
             pose_set=pose_set,
             approved_validation_report_sha256=plan_sha256,
@@ -969,14 +987,18 @@ def run_stack(args) -> int:
             timeout_s=10.0,
             control_check=driver.check,
         )
-        loaded_state = synchronized.observe_state()
+        loaded_state, loaded_command_q14 = synchronized.observe_dual_arm_control_input()
         loaded_hands = dex_controller.observer.observe()
         loaded_upper, loaded_bottom = _observe_pair(
             frame_sets["loaded"],
             expected_camera=expected_camera,
             upper_detector=upper_detector,
             bottom_detector=bottom_detector,
-            snapshot=_snapshot(loaded_state, loaded_hands),
+            snapshot=_command_bound_snapshot(
+                loaded_state,
+                loaded_hands,
+                loaded_command_q14,
+            ),
             quality=quality,
         )
         if moving_cube == "secondary":
@@ -1005,27 +1027,21 @@ def run_stack(args) -> int:
         active_escape = SupportedEscapePlan.from_json(run_directory / "supported_escape.json")
         if selected_arm == "left":
             left_escape = active_escape
-            inactive_command_q_rad = loaded_state.right_q.copy()
         else:
             right_escape = active_escape
-            inactive_command_q_rad = loaded_state.left_q.copy()
-        active_pose_set = pose_set_from_trajectories(
+        executable_escape = _install_plan_at_current_boundary(
+            synchronized,
             arm=selected_arm,
-            trajectories=(active_escape.outbound, active_escape.inbound),
-            reference_full_q=loaded_state.position,
-            robot_model=model.name,
-            urdf_sha256=model.sha256,
-            source=f"NVlabs/curobo_stack_{selected_arm}_supported_escape",
-        )
-        synchronized.install_validated_plan(
-            pose_set=active_pose_set,
-            approved_validation_report_sha256=active_escape.content_sha256,
+            trajectories=(active_escape.outbound,),
+            recovery_trajectories=(active_escape.inbound,),
+            plan_sha256=active_escape.content_sha256,
             validated_reference_state=loaded_state,
+            model=model,
         )
         _execute_trajectory(
             synchronized,
             driver,
-            active_escape.outbound,
+            executable_escape[0],
             plan_sha256=active_escape.content_sha256,
             control_config=control_config,
         )
@@ -1072,14 +1088,14 @@ def run_stack(args) -> int:
             )
         except (RuntimeError, ValueError) as error:
             raise _clearance_perception_rejection(driver, error) from error
-        clearance_state = synchronized.observe_state()
+        clearance_state, clearance_command_q14 = (
+            synchronized.observe_dual_arm_control_input()
+        )
         clearance_hands = dex_controller.observer.observe()
-        clearance_snapshot = _active_clearance_snapshot(
+        clearance_snapshot = _command_bound_snapshot(
             clearance_state,
             clearance_hands,
-            arm=selected_arm,
-            escape=active_escape,
-            inactive_command_q_rad=inactive_command_q_rad,
+            clearance_command_q14,
         )
         try:
             clearance_upper, clearance_bottom = _observe_pair(
@@ -1221,14 +1237,14 @@ def run_stack(args) -> int:
                     timeout_s=10.0,
                     control_check=driver.check,
                 )
-                retry_state = synchronized.observe_state()
+                retry_state, retry_command_q14 = (
+                    synchronized.observe_dual_arm_control_input()
+                )
                 retry_hands = dex_controller.observer.observe()
-                retry_snapshot = _active_clearance_snapshot(
+                retry_snapshot = _command_bound_snapshot(
                     retry_state,
                     retry_hands,
-                    arm=selected_arm,
-                    escape=active_escape,
-                    inactive_command_q_rad=inactive_command_q_rad,
+                    retry_command_q14,
                 )
                 try:
                     retry_upper, retry_bottom = _observe_pair(

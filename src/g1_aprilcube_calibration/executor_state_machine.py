@@ -171,10 +171,23 @@ class PoseExecutor:
             return self._command_q14[:7].copy()
         return self._command_q14[7:].copy()
 
+    @property
+    def dual_arm_command_q(self) -> np.ndarray:
+        """Return the exact 14-joint arm command active in the control loop."""
+
+        if self._command_q14 is None:
+            raise RuntimeError("executor has no acquired arm command")
+        return self._command_q14.copy()
+
     def observe_control_input(self) -> tuple[RobotStateSample, np.ndarray]:
         """Return one fresh measurement paired with the exact active command."""
 
         return self.observe_state(), self.calibration_command_q
+
+    def observe_dual_arm_control_input(self) -> tuple[RobotStateSample, np.ndarray]:
+        """Return one fresh measurement paired with both exact arm commands."""
+
+        return self.observe_state(), self.dual_arm_command_q
 
     def streaming_trajectory_status(self) -> dict[str, float | int | bool]:
         if self._mpc_command_buffer is None:
@@ -562,14 +575,15 @@ class PoseExecutor:
         pose_set: PoseSet,
         approved_validation_report_sha256: str,
         validated_reference_state: RobotStateSample,
+        preserve_current_command: bool = False,
     ) -> None:
         """Atomically install a plan validated at the loaded handoff state.
 
         This is intentionally narrower than a general runtime replan.  It is
         only legal before the first move, while holding the handoff pose at
         full command weight.  The newly validated handoff becomes the command
-        origin, so the first changing target follows the exact pose set and
-        edge report that were produced after ownership acquisition.
+        origin. Command-bound callers may instead preserve the exact command
+        from which their first trajectory was planned.
         """
 
         if self.state not in {ExecutorState.READY, ExecutorState.HOLDING}:
@@ -604,9 +618,13 @@ class PoseExecutor:
                 f"{self.config.settled_position_spread_rad:.4f}rad"
             )
 
-        command_q14 = dual_arm_vector(
-            validated_reference_state.left_q,
-            validated_reference_state.right_q,
+        command_q14 = (
+            self._command_q14.copy()
+            if preserve_current_command
+            else dual_arm_vector(
+                validated_reference_state.left_q,
+                validated_reference_state.right_q,
+            )
         )
         command_change = float(np.max(np.abs(command_q14 - self._command_q14)))
         if command_change > self.config.ownership_transition_position_tolerance_rad:
@@ -618,9 +636,15 @@ class PoseExecutor:
 
         self.pose_set = pose_set
         self.approved_validation_report_sha256 = approved_validation_report_sha256
-        self.handoff_q = validated_reference_state.arm_q(pose_set.calibration_arm).copy()
         hold_arm = opposite_arm(pose_set.calibration_arm)
-        self.hold_q = validated_reference_state.arm_q(hold_arm).copy()
+        self.handoff_q = (
+            command_q14[:7].copy()
+            if pose_set.calibration_arm == "left"
+            else command_q14[7:].copy()
+        )
+        self.hold_q = (
+            command_q14[:7].copy() if hold_arm == "left" else command_q14[7:].copy()
+        )
         self._opposite_hold = OppositeArmHold(
             calibration_arm=pose_set.calibration_arm,
             command_q=self.hold_q,
@@ -637,7 +661,8 @@ class PoseExecutor:
             self.state,
             "post-acquisition validated plan installed at loaded handoff; "
             f"live reference drift {reference_drift:.4f}rad; "
-            f"command rebase {command_change:.4f}rad",
+            f"command {'preserved' if preserve_current_command else 'rebase'} "
+            f"{command_change:.4f}rad",
             now,
         )
 
