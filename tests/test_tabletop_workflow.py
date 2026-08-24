@@ -1416,54 +1416,91 @@ def test_failure_frames_preserve_explicit_image_timing(tmp_path: Path) -> None:
     }
 
 
-def test_tabletop_detection_names_the_cube_not_the_hand(monkeypatch) -> None:
-    solve_modes = []
+def test_tabletop_detection_names_the_cube_not_the_hand() -> None:
+    calls = 0
 
-    def reject(_image, _camera_info, _detector, **kwargs):
-        assert kwargs["target_label"] == "tabletop AprilCube"
-        assert kwargs["minimum_tag_short_side_px"] == 25.0
-        assert kwargs["maximum_reprojection_error_px"] == 3.0
-        solve_modes.append(kwargs["single_best_face"])
-        raise ValueError("tabletop AprilCube was not detected")
-
-    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", reject)
+    class Detector:
+        def detect(self, _image):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(valid=False, duplicate_tag_ids=())
 
     with pytest.raises(ValueError, match="tabletop AprilCube was not detected"):
         observe_resting_cube(
             [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
             camera_info=object(),
-            detector=object(),
+            detector=Detector(),
             snapshot=_observation().snapshot,
             base_T_camera=np.eye(4),
         )
 
-    assert solve_modes == [True, False] * 5
+    assert calls == 5
 
 
-def test_resting_cube_retries_multi_face_when_single_face_is_not_upright(
+def test_resting_cube_checks_all_pose_hypotheses_from_one_detection(
     monkeypatch,
 ) -> None:
-    solve_modes = []
+    detection_calls = 0
+    hypothesis_calls = 0
 
-    def detect(image, _camera_info, _detector, **kwargs):
-        single_best_face = kwargs["single_best_face"]
-        solve_modes.append(single_best_face)
-        transform = np.eye(4)
-        if single_best_face:
-            transform[:3, :3] = Rotation.from_euler("x", 30.0, degrees=True).as_matrix()
-        transform[0, 3] = 0.0002 * int(image[0, 0, 0])
-        return SimpleNamespace(camera_T_target=transform)
+    class Detector:
+        def detect(self, image):
+            nonlocal detection_calls
+            detection_calls += 1
+            observation = SimpleNamespace(
+                tag_id=int(image[0, 0, 0]),
+                face_name="+Z",
+                shortest_side_px=50.0,
+            )
+            return SimpleNamespace(
+                valid=True,
+                duplicate_tag_ids=(),
+                observations=(observation,),
+                image_size_wh=(8, 8),
+                ignored_tag_ids=(),
+                opencv_rejected_candidates=0,
+                quality_rejected_detections=0,
+            )
 
-    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", detect)
+    def hypotheses(result, _camera_matrix, _distortion):
+        nonlocal hypothesis_calls
+        hypothesis_calls += 1
+        index = result.observations[0].tag_id
+        return (
+            SimpleNamespace(
+                rvec=Rotation.from_euler("x", 30.0, degrees=True)
+                .as_rotvec()
+                .reshape(3, 1),
+                tvec_mm=np.array([[0.2 * index], [0.0], [500.0]]),
+                reprojection_error_px=0.1,
+                source_tag_ids=(index,),
+            ),
+            SimpleNamespace(
+                rvec=np.zeros((3, 1)),
+                tvec_mm=np.array([[0.2 * index], [0.0], [500.0]]),
+                reprojection_error_px=0.2,
+                source_tag_ids=(index,),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.tabletop_perception.estimate_pose_hypotheses",
+        hypotheses,
+    )
     observation = observe_resting_cube(
         [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
-        camera_info=SimpleNamespace(profile_sha256="a" * 64),
-        detector=object(),
+        camera_info=SimpleNamespace(
+            profile_sha256="a" * 64,
+            rectified_camera_matrix=np.eye(3),
+            d=(0.0,) * 5,
+        ),
+        detector=Detector(),
         snapshot=_observation().snapshot,
         base_T_camera=np.eye(4),
     )
 
-    assert solve_modes == [True, False] * 5
+    assert detection_calls == 5
+    assert hypothesis_calls == 5
     assert len(observation.source_frame_sha256) == 5
     np.testing.assert_allclose(np.asarray(observation.camera_T_object)[:3, :3], np.eye(3))
 
@@ -1471,12 +1508,21 @@ def test_resting_cube_retries_multi_face_when_single_face_is_not_upright(
 def test_resting_cube_uses_largest_three_frame_pose_consensus(monkeypatch) -> None:
     translations_m = (0.000, 0.001, -0.001, 0.002, 0.020)
 
-    def detect(image, _camera_info, _detector, **_kwargs):
+    def detect(image, **_kwargs):
         transform = np.eye(4)
         transform[0, 3] = translations_m[int(image[0, 0, 0])]
-        return SimpleNamespace(camera_T_target=transform)
+        return (
+            SimpleNamespace(
+                camera_T_object=transform,
+                reprojection_error_px=0.1,
+                source_tag_ids=(1,),
+            ),
+        )
 
-    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", detect)
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.tabletop_perception._detect_resting_pose_hypotheses",
+        detect,
+    )
     observation = observe_resting_cube(
         [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
         camera_info=SimpleNamespace(profile_sha256="a" * 64),
@@ -1490,15 +1536,66 @@ def test_resting_cube_uses_largest_three_frame_pose_consensus(monkeypatch) -> No
     assert observation.object_translation_spread_mm == pytest.approx(1.5)
 
 
+def test_resting_cube_consensus_selects_one_coherent_hypothesis_per_frame(
+    monkeypatch,
+) -> None:
+    coherent_translations_m = (0.000, 0.001, -0.001, 0.002, -0.002)
+    inconsistent_translations_m = (0.030, 0.045, 0.060, 0.075, 0.090)
+
+    def detect(image, **_kwargs):
+        index = int(image[0, 0, 0])
+        inconsistent = np.eye(4)
+        inconsistent[0, 3] = inconsistent_translations_m[index]
+        coherent = np.eye(4)
+        coherent[0, 3] = coherent_translations_m[index]
+        return (
+            SimpleNamespace(
+                camera_T_object=inconsistent,
+                reprojection_error_px=0.1,
+                source_tag_ids=(1,),
+            ),
+            SimpleNamespace(
+                camera_T_object=coherent,
+                reprojection_error_px=0.2,
+                source_tag_ids=(2,),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.tabletop_perception._detect_resting_pose_hypotheses",
+        detect,
+    )
+    observation = observe_resting_cube(
+        [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
+        camera_info=SimpleNamespace(profile_sha256="a" * 64),
+        detector=object(),
+        snapshot=_observation().snapshot,
+        base_T_camera=np.eye(4),
+    )
+
+    assert len(observation.source_frame_sha256) == 5
+    assert np.asarray(observation.camera_T_object)[0, 3] == pytest.approx(0.0)
+    assert observation.object_translation_spread_mm == pytest.approx(2.0)
+
+
 def test_resting_cube_rejects_when_no_three_frame_pose_consensus_exists(monkeypatch) -> None:
     translations_m = (0.000, 0.012, 0.024, 0.036, 0.048)
 
-    def detect(image, _camera_info, _detector, **_kwargs):
+    def detect(image, **_kwargs):
         transform = np.eye(4)
         transform[0, 3] = translations_m[int(image[0, 0, 0])]
-        return SimpleNamespace(camera_T_target=transform)
+        return (
+            SimpleNamespace(
+                camera_T_object=transform,
+                reprojection_error_px=0.1,
+                source_tag_ids=(1,),
+            ),
+        )
 
-    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", detect)
+    monkeypatch.setattr(
+        "g1_dex3_tabletop.tabletop_perception._detect_resting_pose_hypotheses",
+        detect,
+    )
     with pytest.raises(
         ValueError,
         match=r"no 3-frame cube pose consensus passed: best translation spread is 12\.000mm",

@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+import heapq
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from itertools import combinations
 
+import cv2
 import numpy as np
-from aprilcube import CorrespondenceDetector
+from aprilcube import (
+    CorrespondenceDetector,
+    CorrespondenceResult,
+    estimate_pose_hypotheses,
+)
 from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.camera_models import RectifiedCameraInfo
@@ -17,6 +24,13 @@ from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.tabletop_contracts import TabletopObservation
 
 _MAXIMUM_RESTING_FACE_TILT_DEG = 20.0
+
+
+@dataclass(frozen=True, slots=True)
+class _RestingPoseHypothesis:
+    camera_T_object: np.ndarray
+    reprojection_error_px: float
+    source_tag_ids: tuple[int, ...]
 
 
 def observe_live_cube_frame(
@@ -77,95 +91,140 @@ def _transform_spread(transforms: Sequence[np.ndarray]) -> tuple[np.ndarray, flo
     return center, translation_mm, rotation_deg
 
 
-def _largest_transform_consensus(
-    transforms: Sequence[np.ndarray],
+def _hypothesis_products_by_error(
+    candidate_sets: Sequence[Sequence[_RestingPoseHypothesis]],
+) -> Iterator[tuple[_RestingPoseHypothesis, ...]]:
+    """Yield the Cartesian product in increasing total reprojection error."""
+
+    ordered = [
+        tuple(sorted(items, key=lambda item: item.reprojection_error_px))
+        for items in candidate_sets
+    ]
+    start = (0,) * len(ordered)
+
+    def error(indices: tuple[int, ...]) -> float:
+        return float(
+            sum(
+                ordered[axis][index].reprojection_error_px
+                for axis, index in enumerate(indices)
+            )
+        )
+
+    queue = [(error(start), start)]
+    visited = {start}
+    while queue:
+        _error, indices = heapq.heappop(queue)
+        yield tuple(ordered[axis][index] for axis, index in enumerate(indices))
+        for axis, index in enumerate(indices):
+            next_index = index + 1
+            if next_index >= len(ordered[axis]):
+                continue
+            neighbor = (*indices[:axis], next_index, *indices[axis + 1 :])
+            if neighbor in visited:
+                continue
+            visited.add(neighbor)
+            heapq.heappush(queue, (error(neighbor), neighbor))
+
+
+def _largest_hypothesis_consensus(
+    hypotheses_by_frame: Sequence[Sequence[_RestingPoseHypothesis]],
     *,
+    base_T_camera: np.ndarray,
     minimum_frames: int,
     maximum_translation_spread_mm: float,
     maximum_rotation_spread_deg: float,
 ) -> tuple[tuple[int, ...], np.ndarray, float, float]:
-    """Select the largest pose-consistent set grown from every minimum-size seed."""
+    """Select one ordered hypothesis per frame in the largest consistent subset."""
 
-    passing: list[tuple[int, float, tuple[int, ...], np.ndarray, float, float]] = []
     best_seed: tuple[float, float, float] | None = None
-    for seed in combinations(range(len(transforms)), minimum_frames):
-        center, translation_mm, rotation_deg = _transform_spread(
-            [transforms[index] for index in seed]
-        )
-        score = max(
-            translation_mm / maximum_translation_spread_mm,
-            rotation_deg / maximum_rotation_spread_deg,
-        )
-        seed_diagnostic = (score, translation_mm, rotation_deg)
-        if best_seed is None or seed_diagnostic < best_seed:
-            best_seed = seed_diagnostic
-        if score > 1.0:
-            continue
-
-        indices = list(seed)
-        remaining = [index for index in range(len(transforms)) if index not in seed]
-        while remaining:
-            additions = []
-            for index in remaining:
-                candidate_indices = tuple(sorted((*indices, index)))
-                candidate_center, candidate_translation, candidate_rotation = _transform_spread(
-                    [transforms[item] for item in candidate_indices]
-                )
-                candidate_score = max(
-                    candidate_translation / maximum_translation_spread_mm,
-                    candidate_rotation / maximum_rotation_spread_deg,
-                )
-                if candidate_score <= 1.0:
-                    additions.append(
-                        (
-                            candidate_score,
-                            index,
-                            candidate_indices,
-                            candidate_center,
-                            candidate_translation,
-                            candidate_rotation,
+    frame_range = range(len(hypotheses_by_frame))
+    for frame_count in range(len(hypotheses_by_frame), minimum_frames - 1, -1):
+        passing = []
+        for frame_indices in combinations(frame_range, frame_count):
+            candidate_sets = [hypotheses_by_frame[index] for index in frame_indices]
+            for selected in _hypothesis_products_by_error(candidate_sets):
+                transforms = [item.camera_T_object for item in selected]
+                # A set within a radius limit cannot contain a pair separated
+                # by more than twice that limit.  This inexpensive necessary
+                # check removes most opposing planar branches before averaging.
+                pairwise_valid = all(
+                    1000.0
+                    * float(
+                        np.linalg.norm(
+                            transforms[first][:3, 3] - transforms[second][:3, 3]
                         )
                     )
-            if not additions:
-                break
-            _score, added, candidate_indices, center, translation_mm, rotation_deg = min(
-                additions, key=lambda item: item[:2]
-            )
-            indices = list(candidate_indices)
-            remaining.remove(added)
-        final_indices = tuple(indices)
-        center, translation_mm, rotation_deg = _transform_spread(
-            [transforms[index] for index in final_indices]
-        )
-        final_score = max(
-            translation_mm / maximum_translation_spread_mm,
-            rotation_deg / maximum_rotation_spread_deg,
-        )
-        passing.append(
+                    <= 2.0 * maximum_translation_spread_mm
+                    and _rotation_error_deg(transforms[first], transforms[second])
+                    <= 2.0 * maximum_rotation_spread_deg
+                    for first, second in combinations(range(len(transforms)), 2)
+                )
+                if not pairwise_valid:
+                    if frame_count == minimum_frames:
+                        _, translation_mm, rotation_deg = _transform_spread(transforms)
+                        score = max(
+                            translation_mm / maximum_translation_spread_mm,
+                            rotation_deg / maximum_rotation_spread_deg,
+                        )
+                        diagnostic = (score, translation_mm, rotation_deg)
+                        if best_seed is None or diagnostic < best_seed:
+                            best_seed = diagnostic
+                    continue
+                center, translation_mm, rotation_deg = _transform_spread(transforms)
+                score = max(
+                    translation_mm / maximum_translation_spread_mm,
+                    rotation_deg / maximum_rotation_spread_deg,
+                )
+                diagnostic = (score, translation_mm, rotation_deg)
+                if frame_count == minimum_frames and (
+                    best_seed is None or diagnostic < best_seed
+                ):
+                    best_seed = diagnostic
+                if score <= 1.0:
+                    center_tilt = _resting_face_tilt_deg(
+                        center,
+                        base_T_camera=base_T_camera,
+                    )
+                    if center_tilt > _MAXIMUM_RESTING_FACE_TILT_DEG:
+                        continue
+                    # AprilCube orders each frame's candidates by reprojection
+                    # error. The first passing product is therefore the
+                    # lowest-total-error assignment for this frame subset.
+                    passing.append(
+                        (
+                            float(
+                                np.mean(
+                                    [item.reprojection_error_px for item in selected]
+                                )
+                            ),
+                            score,
+                            frame_indices,
+                            center,
+                            translation_mm,
+                            rotation_deg,
+                        )
+                    )
+                    break
+        if passing:
             (
-                -len(final_indices),
-                final_score,
-                final_indices,
+                _error,
+                _score,
+                frame_indices,
                 center,
                 translation_mm,
                 rotation_deg,
-            )
-        )
+            ) = min(passing, key=lambda item: item[:3])
+            return frame_indices, center, translation_mm, rotation_deg
 
-    if not passing:
-        assert best_seed is not None
-        _score, translation_mm, rotation_deg = best_seed
-        raise ValueError(
-            f"no {minimum_frames}-frame cube pose consensus passed: best translation spread "
-            f"is {translation_mm:.3f}mm (limit {maximum_translation_spread_mm:.3f}mm), "
-            f"best rotation spread is {rotation_deg:.3f}deg "
-            f"(limit {maximum_rotation_spread_deg:.3f}deg)"
-        )
-
-    _count, _score, indices, center, translation_mm, rotation_deg = min(
-        passing, key=lambda item: item[:3]
+    if best_seed is None:
+        raise ValueError("no cube pose hypotheses were available for consensus")
+    _score, translation_mm, rotation_deg = best_seed
+    raise ValueError(
+        f"no {minimum_frames}-frame cube pose consensus passed: best translation spread "
+        f"is {translation_mm:.3f}mm (limit {maximum_translation_spread_mm:.3f}mm), "
+        f"best rotation spread is {rotation_deg:.3f}deg "
+        f"(limit {maximum_rotation_spread_deg:.3f}deg)"
     )
-    return indices, center, translation_mm, rotation_deg
 
 
 def _resting_face_tilt_deg(
@@ -178,7 +237,7 @@ def _resting_face_tilt_deg(
     return float(np.degrees(np.arccos(np.clip(best_alignment, -1.0, 1.0))))
 
 
-def _detect_resting_camera_T_object(
+def _detect_resting_pose_hypotheses(
     image_bgr: np.ndarray,
     *,
     camera_info: RectifiedCameraInfo,
@@ -186,33 +245,75 @@ def _detect_resting_camera_T_object(
     base_T_camera: np.ndarray,
     minimum_tag_short_side_px: float,
     maximum_reprojection_error_px: float,
-) -> np.ndarray:
-    failures = []
-    for label, single_best_face in (("single-face", True), ("multi-face", False)):
-        try:
-            estimate = detect_hand_target_pose(
-                image_bgr,
-                camera_info,
-                detector,
-                target_label="tabletop AprilCube",
-                minimum_visible_faces=1,
-                minimum_tag_short_side_px=minimum_tag_short_side_px,
-                maximum_reprojection_error_px=maximum_reprojection_error_px,
-                single_best_face=single_best_face,
+) -> tuple[_RestingPoseHypothesis, ...]:
+    result: CorrespondenceResult = detector.detect(image_bgr)
+    if not result.valid:
+        if result.duplicate_tag_ids:
+            raise ValueError(
+                "tabletop AprilCube has duplicate tag IDs: "
+                f"{list(result.duplicate_tag_ids)}"
             )
-        except ValueError as error:
-            failures.append(f"{label} solve failed: {error}")
+        raise ValueError("tabletop AprilCube was not detected")
+    observations = tuple(
+        item
+        for item in result.observations
+        if item.shortest_side_px >= minimum_tag_short_side_px
+    )
+    if not observations:
+        largest = max(item.shortest_side_px for item in result.observations)
+        raise ValueError(
+            f"tabletop AprilCube marker is only {largest:.1f}px; need "
+            f"{minimum_tag_short_side_px:.1f}px"
+        )
+    pose_result = CorrespondenceResult(
+        image_size_wh=result.image_size_wh,
+        observations=observations,
+        ignored_tag_ids=result.ignored_tag_ids,
+        opencv_rejected_candidates=result.opencv_rejected_candidates,
+        quality_rejected_detections=result.quality_rejected_detections,
+    )
+    diagnostics = estimate_pose_hypotheses(
+        pose_result,
+        camera_info.rectified_camera_matrix,
+        np.asarray(camera_info.d, dtype=np.float64),
+    )
+    accepted = []
+    best_reprojection = float("inf")
+    best_tilt = float("inf")
+    for diagnostic in diagnostics:
+        best_reprojection = min(
+            best_reprojection,
+            diagnostic.reprojection_error_px,
+        )
+        if diagnostic.reprojection_error_px > maximum_reprojection_error_px:
             continue
+        transform = np.eye(4, dtype=np.float64)
+        transform[:3, :3], _ = cv2.Rodrigues(diagnostic.rvec)
+        transform[:3, 3] = diagnostic.tvec_mm.reshape(3) / 1000.0
         tilt = _resting_face_tilt_deg(
-            estimate.camera_T_target,
+            transform,
             base_T_camera=base_T_camera,
         )
+        best_tilt = min(best_tilt, tilt)
         if tilt <= _MAXIMUM_RESTING_FACE_TILT_DEG:
-            return estimate.camera_T_target
-        failures.append(f"{label} resting tilt is {tilt:.3f} degrees")
+            accepted.append(
+                _RestingPoseHypothesis(
+                    camera_T_object=transform,
+                    reprojection_error_px=diagnostic.reprojection_error_px,
+                    source_tag_ids=diagnostic.source_tag_ids,
+                )
+            )
+    if accepted:
+        return tuple(accepted)
+    reprojection_text = (
+        "n/a" if not np.isfinite(best_reprojection) else f"{best_reprojection:.3f}px"
+    )
+    tilt_text = "n/a" if not np.isfinite(best_tilt) else f"{best_tilt:.3f} degrees"
     raise ValueError(
-        "; ".join(failures)
-        + f"; limit is {_MAXIMUM_RESTING_FACE_TILT_DEG:.0f} degrees"
+        f"no resting pose hypothesis passed: {len(diagnostics)} candidates; "
+        f"best reprojection error {reprojection_text} "
+        f"(limit {maximum_reprojection_error_px:.3f}px); best resting tilt "
+        f"{tilt_text} (limit {_MAXIMUM_RESTING_FACE_TILT_DEG:.0f} degrees)"
     )
 
 
@@ -259,7 +360,7 @@ def observe_resting_cube(
     if len(images_bgr) < minimum_frames:
         raise ValueError(f"need at least {minimum_frames} cube frames")
     base_T_camera = validate_transform(np.asarray(base_T_camera, dtype=np.float64))
-    transforms: list[np.ndarray] = []
+    hypotheses_by_frame: list[tuple[_RestingPoseHypothesis, ...]] = []
     hashes: list[str] = []
     rejections: list[str] = []
     for index, image in enumerate(images_bgr):
@@ -272,7 +373,7 @@ def observe_resting_cube(
             rejections.append(f"frame {index}: duplicate image")
             continue
         try:
-            transform = _detect_resting_camera_T_object(
+            hypotheses = _detect_resting_pose_hypotheses(
                 value,
                 camera_info=camera_info,
                 detector=detector,
@@ -283,15 +384,16 @@ def observe_resting_cube(
         except ValueError as error:
             rejections.append(f"frame {index}: {error}")
             continue
-        transforms.append(transform)
+        hypotheses_by_frame.append(hypotheses)
         hashes.append(digest)
-    if len(transforms) < minimum_frames:
+    if len(hypotheses_by_frame) < minimum_frames:
         raise ValueError(
-            f"only {len(transforms)}/{len(images_bgr)} cube frames passed; "
+            f"only {len(hypotheses_by_frame)}/{len(images_bgr)} cube frames passed; "
             + "; ".join(rejections)
         )
-    indices, center, translation_spread, rotation_spread = _largest_transform_consensus(
-        transforms,
+    indices, center, translation_spread, rotation_spread = _largest_hypothesis_consensus(
+        hypotheses_by_frame,
+        base_T_camera=base_T_camera,
         minimum_frames=minimum_frames,
         maximum_translation_spread_mm=maximum_translation_spread_mm,
         maximum_rotation_spread_deg=maximum_rotation_spread_deg,

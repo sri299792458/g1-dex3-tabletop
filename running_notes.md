@@ -5268,7 +5268,7 @@ Primary references:
   release filter, or alternate shortlist was restored. The Friday 57-candidate
   shortlist remains unchanged.
 
-## 2026-08-24 — Resting-cube single-face fallback
+## 2026-08-24 — Resting-cube all-hypothesis disambiguation
 
 - Retained run `stack_20260824T163511Z` did not show physical cube motion. The
   secondary cube's largest marker was tag 24 on face `+Z` in all five loaded
@@ -5276,18 +5276,27 @@ Primary references:
   `29.35--29.89 deg` from every possible resting face, with only
   `2.834--2.957 px` reprojection error.
 - The already-supported multi-face solve on those same immutable images was
-  `3.51--4.77 deg` from face-up. This isolates a planar/corner-geometry failure
-  that additional identical-view frames cannot resolve by voting: the wrong
-  single-face answer is systematic, not an isolated temporal outlier.
-- Resting-cube observation still tries the commissioned largest-face solve
-  first. Only when it fails detection/quality or the existing 20-degree
-  resting-face condition does that frame retry the existing multi-face solve.
-  Both results remain subject to the unchanged `3 px` reprojection and
-  five-frame `5 mm / 2 deg`, minimum-three-frame consensus gates.
+  `3.51--4.77 deg` from face-up. Smaller visible faces also supplied the
+  physically correct planar branch. This isolates a planar ambiguity that
+  additional identical-view frames cannot resolve if only one branch is kept:
+  the wrong largest-face answer is systematic, not a temporal outlier.
+- AprilCube now exposes a stateless all-hypothesis API. Every visible face
+  contributes both positive-depth OpenCV IPPE branches, and a joint non-planar
+  solve is added when multiple faces are visible. The library reports these
+  candidates and their supporting tag IDs without embedding gravity, table,
+  pose-history, or application-specific selection policy.
+- Resting-cube observation decodes each frame once, removes candidates above
+  the unchanged `3 px` reprojection or 20-degree resting-face limits, and then
+  selects one candidate per frame in the largest subset passing the unchanged
+  `5 mm / 2 deg`, minimum-three-frame burst consensus. Thus a lower-error wrong
+  planar branch cannot defeat a slightly higher-error branch that agrees with
+  gravity and the rest of the burst.
 - The resting-face check uses the calibrated base-from-camera orientation at
   the exact command-bound snapshot. No table edge, torso-to-edge distance,
-  planner scene, motion limit, controller, or AprilCube submodule changed.
-- Command-free replay of the failed run now accepts all five loaded frames for
-  both cubes. The secondary result is `4.12 deg` from face-up with
-  `1.36 mm / 0.86 deg` spread. The post-clearance burst accepts four common
-  frames and yields `6.43 deg` with `0.64 mm / 1.04 deg` spread.
+  planner scene, motion limit, or controller behavior changed.
+- Command-free replay of the failed run now accepts all five loaded and all
+  five post-clearance frames for both cubes. Loaded secondary/primary results
+  are `5.35/4.28 deg` from face-up with `2.38 mm / 0.47 deg` and
+  `1.01 mm / 0.80 deg` spread. Post-clearance secondary/primary results are
+  `7.22/6.04 deg` from face-up with `1.93 mm / 0.47 deg` and
+  `0.25 mm / 0.27 deg` spread.
