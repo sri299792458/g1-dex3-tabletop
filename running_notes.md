@@ -5248,3 +5248,22 @@ Primary references:
   one or two bad frames without forward-filling stale commands or depth. A
   retained two-gap run reload-verified with 252 qualified frames and both
   rejected timestamps recorded exactly.
+
+## 2026-08-24 — Restored strict observation and retained-control stack episodes
+
+- Five-frame cube observation now accepts the largest pose-consistent subset
+  containing at least three frames without relaxing the existing `5 mm / 2 deg`
+  limits.
+- Every episode searches both cube directions for each fixed-waist arm, in
+  nearest-source order. Only one arm is lifted at a time; an unsuccessful arm
+  returns through its frozen supported escape before the other arm is tried.
+- A completed or safely rejected episode returns the selected arm to the
+  supported start and keeps the camera, CuRobo worker, 250 Hz controller, PC2
+  watchdog, and Dex3 transport alive. Each Space creates a normal independent
+  `runs/stack_<timestamp>/` directory with its own MCAP and artifacts.
+- Ctrl+C is a clean seated handback only while waiting between episodes.
+  Interruptions or controller, DDS, watchdog, and unknown-state failures during
+  an episode retain the existing Zero Torque cleanup.
+- No waist motion, gain experiment, compact-hand orchestration, simulated
+  release filter, or alternate shortlist was restored. The Friday 57-candidate
+  shortlist remains unchanged.

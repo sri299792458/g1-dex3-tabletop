@@ -491,8 +491,17 @@ The selected assignment picks one cube and places it directly on the other. The
 stationary cube remains a finite collision obstacle during pickup and becomes
 the finite placement support at the destination. No midpoint, preliminary cube
 relocation, table boundary, separate board, or second pick is involved. The
-selected arm finally reverses its exact supported escape and seated control is
-restored. Only one arm is ever away from its supported start at a time.
+selected arm finally reverses its exact supported escape; the unused arm never
+leaves its supported start. Only one arm is ever away from its supported start
+at a time.
+
+After a completed or safely rejected episode, `run-stack` keeps the warmed
+planner, camera, 250 Hz controller, PC2 watchdog, and Dex3 transport alive at
+the supported start. Reposition both cubes and press Space to create another
+ordinary `runs/stack_<timestamp>/` run with its own status, images, plans,
+planner log, and MCAP. Ctrl+C while waiting between episodes performs the one
+clean seated handback and exits. Ctrl+C during observation, planning, or motion
+remains a fault and follows the existing Zero Torque cleanup path.
 
 During the attached transfer, CuRobo retains full-robot self-collision and the
 stationary support cube as an explicit obstacle. It does not add a whole-robot

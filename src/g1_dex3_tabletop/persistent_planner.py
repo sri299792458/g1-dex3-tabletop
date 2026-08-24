@@ -35,6 +35,7 @@ class PersistentTabletopPlanner:
         self.log_path = log_path
         self._process: subprocess.Popen[str] | None = None
         self._log = None
+        self._log_lock = threading.Lock()
         self._lines: queue.Queue[str] = queue.Queue()
         self._reader: threading.Thread | None = None
         self._next_request_id = 1
@@ -75,6 +76,20 @@ class PersistentTabletopPlanner:
             daemon=True,
         )
         self._reader.start()
+
+    def set_log_path(self, path: Path) -> None:
+        """Route subsequent worker output to one episode-local planner log."""
+
+        self._require_alive()
+        selected = Path(path)
+        selected.parent.mkdir(parents=True, exist_ok=True)
+        replacement = selected.open("w", encoding="utf-8", buffering=1)
+        with self._log_lock:
+            previous = self._log
+            self._log = replacement
+            self.log_path = selected
+        if previous is not None:
+            previous.close()
 
     def wait_until_ready(self, *, timeout_s: float = 60.0) -> None:
         """Wait for the already-launched worker's CUDA readiness event."""
@@ -262,10 +277,12 @@ class PersistentTabletopPlanner:
             self._reader.join(timeout=2.0)
         if process.stdout is not None:
             process.stdout.close()
-        if self._log is not None:
-            self._log.close()
+        with self._log_lock:
+            log = self._log
+            self._log = None
+        if log is not None:
+            log.close()
         self._process = None
-        self._log = None
         self._reader = None
         self._ready = False
         self._pending = None
@@ -275,8 +292,9 @@ class PersistentTabletopPlanner:
         if process is None or process.stdout is None:
             return
         for line in process.stdout:
-            if self._log is not None:
-                self._log.write(line)
+            with self._log_lock:
+                if self._log is not None:
+                    self._log.write(line)
             self._lines.put(line)
 
     def _require_alive(self) -> subprocess.Popen[str]:

@@ -304,20 +304,24 @@ def _wait_for_space_with_preview(
     *,
     arm: str,
     no_window: bool,
+    prompt: str | None = None,
+    overlay: str = "READ-ONLY - SPACE starts complete task",
+    control_check=None,
 ) -> None:
     if not sys.stdin.isatty():
         raise RuntimeError("operator approval requires an interactive terminal")
-    print(
+    message = prompt or (
         "START — G1 seated; both arms supported and still; AprilCube resting "
-        f"upright and visible; complete {arm}-arm sweep clear. Press SPACE once: ",
-        end="",
-        flush=True,
+        f"upright and visible; complete {arm}-arm sweep clear. Press SPACE once: "
     )
+    print(message, end="", flush=True)
     descriptor = sys.stdin.fileno()
     previous = termios.tcgetattr(descriptor)
     try:
         tty.setraw(descriptor)
         while True:
+            if control_check is not None:
+                control_check()
             rclpy.spin_once(node, timeout_sec=0.01)
             if not no_window:
                 frame = camera.frames.latest
@@ -325,7 +329,7 @@ def _wait_for_space_with_preview(
                     rendered = frame.image_bgr.copy()
                     cv2.putText(
                         rendered,
-                        "READ-ONLY - SPACE starts complete task",
+                        overlay,
                         (24, 42),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.9,

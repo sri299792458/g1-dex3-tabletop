@@ -98,6 +98,24 @@ def test_persistent_planner_can_launch_before_waiting_for_cuda_ready(tmp_path: P
     planner.close()
 
 
+def test_persistent_planner_rotates_output_into_the_current_episode(tmp_path: Path) -> None:
+    worker = tmp_path / "worker"
+    _fake_worker(worker)
+    startup_log = tmp_path / "startup.log"
+    episode_log = tmp_path / "episode" / "planner.log"
+    planner = PersistentTabletopPlanner(executable=worker, log_path=startup_log)
+
+    planner.start()
+    planner.set_log_path(episode_log)
+    planner.request_payload("step", payload={"episode": 2})
+    planner.close()
+
+    assert '"type": "ready"' in startup_log.read_text(encoding="utf-8")
+    episode_text = episode_log.read_text(encoding="utf-8")
+    assert '"message": "working"' in episode_text
+    assert '"episode": 2' in episode_text
+
+
 def test_persistent_planner_request_can_run_before_parent_waits(tmp_path: Path) -> None:
     worker = tmp_path / "worker"
     _fake_worker(worker)

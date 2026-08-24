@@ -142,7 +142,7 @@ def test_command_bound_snapshot_reproduces_latest_right_elbow_regression() -> No
     assert abs(measured[right_indices[3]] - right_command[3]) == pytest.approx(0.021020331)
 
 
-def test_handoff_stack_plan_preserves_exact_active_command(monkeypatch) -> None:
+def test_new_episode_installs_same_arm_plan_at_retained_handoff(monkeypatch) -> None:
     replacement = object()
     monkeypatch.setattr(
         hardware_stack,
@@ -158,9 +158,21 @@ def test_handoff_stack_plan_preserves_exact_active_command(monkeypatch) -> None:
 
         @staticmethod
         def install_validated_plan(**kwargs) -> None:
-            calls.append(kwargs)
+            calls.append(("install", kwargs))
 
-    outbound = _trajectory("__handoff__", "clearance", 0.0, 0.1)
+        @staticmethod
+        def replace_validated_remaining_plan(**kwargs) -> None:
+            calls.append(("replace", kwargs))
+
+        @staticmethod
+        def switch_validated_arm_plan(**kwargs) -> None:
+            calls.append(("switch", kwargs))
+
+    outbound = SimpleNamespace(
+        from_pose_id="__handoff__",
+        to_pose_id="clearance",
+        command_q_rad=((0.0,) * 7, (0.1,) * 7),
+    )
     result = _install_plan_at_current_boundary(
         FakeExecutor(),
         arm="left",
@@ -171,12 +183,47 @@ def test_handoff_stack_plan_preserves_exact_active_command(monkeypatch) -> None:
     )
 
     assert result == (outbound,)
+    assert [name for name, _kwargs in calls] == ["install"]
+    assert calls[0][1]["pose_set"] is replacement
+    assert calls[0][1]["preserve_current_command"] is True
+
+
+def test_new_episode_can_switch_selected_arm_at_retained_handoff(monkeypatch) -> None:
+    monkeypatch.setattr(
+        hardware_stack,
+        "pose_set_from_trajectories",
+        lambda **_kwargs: object(),
+    )
+    calls = []
+
+    class FakeExecutor:
+        current_pose_id = "__handoff__"
+        pose_set = SimpleNamespace(calibration_arm="left")
+        dual_arm_command_q = np.zeros(14)
+
+        @staticmethod
+        def switch_validated_arm_plan(**kwargs) -> None:
+            calls.append(kwargs)
+
+    outbound = SimpleNamespace(
+        from_pose_id="__handoff__",
+        to_pose_id="clearance",
+        command_q_rad=((0.0,) * 7, (0.1,) * 7),
+    )
+    _install_plan_at_current_boundary(
+        FakeExecutor(),
+        arm="right",
+        trajectories=(outbound,),
+        plan_sha256="a" * 64,
+        validated_reference_state=SimpleNamespace(position=np.zeros(29)),
+        model=SimpleNamespace(name="g1", sha256="b" * 64),
+    )
+
     assert len(calls) == 1
-    assert calls[0]["pose_set"] is replacement
-    assert calls[0]["preserve_current_command"] is True
+    assert calls[0]["boundary_pose_id"] == "__handoff__"
 
 
-def test_stack_plan_install_rejects_measured_right_elbow_start() -> None:
+def test_stack_plan_install_rejects_latest_measured_right_elbow_start() -> None:
     command_right = np.asarray(
         (
             -0.033471942,
@@ -196,13 +243,10 @@ def test_stack_plan_install_rejects_measured_right_elbow_start() -> None:
         pose_set = SimpleNamespace(calibration_arm="left")
         dual_arm_command_q = np.concatenate((np.zeros(7), command_right))
 
-    outbound = PlannedTrajectory(
+    outbound = SimpleNamespace(
         from_pose_id="__handoff__",
         to_pose_id="clearance",
-        sample_time_s=(0.0, 1.0),
         command_q_rad=(tuple(measured_right), tuple(measured_right + 0.1)),
-        model_q_rad=(tuple(measured_right), tuple(measured_right + 0.1)),
-        planning_time_s=0.1,
     )
 
     with pytest.raises(ValueError, match=r"active command by 0\.021020331rad"):
