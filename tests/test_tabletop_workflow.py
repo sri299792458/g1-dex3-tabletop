@@ -1291,6 +1291,48 @@ def test_tabletop_detection_names_the_cube_not_the_hand(monkeypatch) -> None:
         )
 
 
+def test_resting_cube_uses_largest_three_frame_pose_consensus(monkeypatch) -> None:
+    translations_m = (0.000, 0.001, -0.001, 0.002, 0.020)
+
+    def detect(image, _camera_info, _detector, **_kwargs):
+        transform = np.eye(4)
+        transform[0, 3] = translations_m[int(image[0, 0, 0])]
+        return SimpleNamespace(camera_T_target=transform)
+
+    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", detect)
+    observation = observe_resting_cube(
+        [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
+        camera_info=SimpleNamespace(profile_sha256="a" * 64),
+        detector=object(),
+        snapshot=_observation().snapshot,
+    )
+
+    assert len(observation.source_frame_sha256) == 4
+    assert np.asarray(observation.camera_T_object)[0, 3] == pytest.approx(0.0005)
+    assert observation.object_translation_spread_mm == pytest.approx(1.5)
+
+
+def test_resting_cube_rejects_when_no_three_frame_pose_consensus_exists(monkeypatch) -> None:
+    translations_m = (0.000, 0.012, 0.024, 0.036, 0.048)
+
+    def detect(image, _camera_info, _detector, **_kwargs):
+        transform = np.eye(4)
+        transform[0, 3] = translations_m[int(image[0, 0, 0])]
+        return SimpleNamespace(camera_T_target=transform)
+
+    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", detect)
+    with pytest.raises(
+        ValueError,
+        match=r"no 3-frame cube pose consensus passed: best translation spread is 12\.000mm",
+    ):
+        observe_resting_cube(
+            [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
+            camera_info=object(),
+            detector=object(),
+            snapshot=_observation().snapshot,
+        )
+
+
 def test_task_config_uses_only_a_local_open_transit_table_patch() -> None:
     bundle_path = (
         Path(__file__).resolve().parents[1]

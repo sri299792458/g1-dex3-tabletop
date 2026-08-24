@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from itertools import combinations
 
 import numpy as np
 from aprilcube import CorrespondenceDetector
@@ -63,6 +64,106 @@ def _average(transforms: Sequence[np.ndarray]) -> np.ndarray:
 def _rotation_error_deg(first: np.ndarray, second: np.ndarray) -> float:
     relative = first[:3, :3].T @ second[:3, :3]
     return float(np.rad2deg(Rotation.from_matrix(relative).magnitude()))
+
+
+def _transform_spread(transforms: Sequence[np.ndarray]) -> tuple[np.ndarray, float, float]:
+    center = _average(transforms)
+    translation_mm = max(
+        1000.0 * float(np.linalg.norm(item[:3, 3] - center[:3, 3])) for item in transforms
+    )
+    rotation_deg = max(_rotation_error_deg(center, item) for item in transforms)
+    return center, translation_mm, rotation_deg
+
+
+def _largest_transform_consensus(
+    transforms: Sequence[np.ndarray],
+    *,
+    minimum_frames: int,
+    maximum_translation_spread_mm: float,
+    maximum_rotation_spread_deg: float,
+) -> tuple[tuple[int, ...], np.ndarray, float, float]:
+    """Select the largest pose-consistent set grown from every minimum-size seed."""
+
+    passing: list[tuple[int, float, tuple[int, ...], np.ndarray, float, float]] = []
+    best_seed: tuple[float, float, float] | None = None
+    for seed in combinations(range(len(transforms)), minimum_frames):
+        center, translation_mm, rotation_deg = _transform_spread(
+            [transforms[index] for index in seed]
+        )
+        score = max(
+            translation_mm / maximum_translation_spread_mm,
+            rotation_deg / maximum_rotation_spread_deg,
+        )
+        seed_diagnostic = (score, translation_mm, rotation_deg)
+        if best_seed is None or seed_diagnostic < best_seed:
+            best_seed = seed_diagnostic
+        if score > 1.0:
+            continue
+
+        indices = list(seed)
+        remaining = [index for index in range(len(transforms)) if index not in seed]
+        while remaining:
+            additions = []
+            for index in remaining:
+                candidate_indices = tuple(sorted((*indices, index)))
+                candidate_center, candidate_translation, candidate_rotation = _transform_spread(
+                    [transforms[item] for item in candidate_indices]
+                )
+                candidate_score = max(
+                    candidate_translation / maximum_translation_spread_mm,
+                    candidate_rotation / maximum_rotation_spread_deg,
+                )
+                if candidate_score <= 1.0:
+                    additions.append(
+                        (
+                            candidate_score,
+                            index,
+                            candidate_indices,
+                            candidate_center,
+                            candidate_translation,
+                            candidate_rotation,
+                        )
+                    )
+            if not additions:
+                break
+            _score, added, candidate_indices, center, translation_mm, rotation_deg = min(
+                additions, key=lambda item: item[:2]
+            )
+            indices = list(candidate_indices)
+            remaining.remove(added)
+        final_indices = tuple(indices)
+        center, translation_mm, rotation_deg = _transform_spread(
+            [transforms[index] for index in final_indices]
+        )
+        final_score = max(
+            translation_mm / maximum_translation_spread_mm,
+            rotation_deg / maximum_rotation_spread_deg,
+        )
+        passing.append(
+            (
+                -len(final_indices),
+                final_score,
+                final_indices,
+                center,
+                translation_mm,
+                rotation_deg,
+            )
+        )
+
+    if not passing:
+        assert best_seed is not None
+        _score, translation_mm, rotation_deg = best_seed
+        raise ValueError(
+            f"no {minimum_frames}-frame cube pose consensus passed: best translation spread "
+            f"is {translation_mm:.3f}mm (limit {maximum_translation_spread_mm:.3f}mm), "
+            f"best rotation spread is {rotation_deg:.3f}deg "
+            f"(limit {maximum_rotation_spread_deg:.3f}deg)"
+        )
+
+    _count, _score, indices, center, translation_mm, rotation_deg = min(
+        passing, key=lambda item: item[:3]
+    )
+    return indices, center, translation_mm, rotation_deg
 
 
 def camera_motion_from_fixed_cube(
@@ -139,21 +240,13 @@ def observe_resting_cube(
             f"only {len(transforms)}/{len(images_bgr)} cube frames passed; "
             + "; ".join(rejections)
         )
-    center = _average(transforms)
-    translation_spread = max(
-        1000.0 * float(np.linalg.norm(item[:3, 3] - center[:3, 3])) for item in transforms
+    indices, center, translation_spread, rotation_spread = _largest_transform_consensus(
+        transforms,
+        minimum_frames=minimum_frames,
+        maximum_translation_spread_mm=maximum_translation_spread_mm,
+        maximum_rotation_spread_deg=maximum_rotation_spread_deg,
     )
-    rotation_spread = max(_rotation_error_deg(center, item) for item in transforms)
-    if translation_spread > maximum_translation_spread_mm:
-        raise ValueError(
-            f"cube translation spread is {translation_spread:.3f}mm; limit is "
-            f"{maximum_translation_spread_mm:.3f}mm"
-        )
-    if rotation_spread > maximum_rotation_spread_deg:
-        raise ValueError(
-            f"cube rotation spread is {rotation_spread:.3f}deg; limit is "
-            f"{maximum_rotation_spread_deg:.3f}deg"
-        )
+    hashes = [hashes[index] for index in indices]
     return TabletopObservation(
         snapshot=snapshot,
         camera_T_object=tuple(tuple(float(value) for value in row) for row in center),
