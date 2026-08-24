@@ -136,6 +136,25 @@ def test_executor_rejects_changed_owned_command() -> None:
         executor.adopt_owned_control(previous_command_q14=changed)
 
 
+def test_control_tick_accepts_state_received_during_observe() -> None:
+    clock, transport, executor = subject()
+    executor.acquire(operator_confirmed=True)
+    advance_until(transport, executor, ExecutorState.READY)
+    original_observe = transport.observe
+
+    def observe_after_callback() -> object:
+        # Reproduce a LowState callback landing after tick() sampled its
+        # scheduling timestamp but before it read the observer's latest state.
+        clock.advance(0.000001)
+        return original_observe()
+
+    transport.observe = observe_after_callback
+    transport.step(0.02)
+
+    assert executor.tick() is ExecutorState.READY
+    assert executor.fault_reason is None
+
+
 def advance_until(
     transport: FakeArmTransport,
     executor: PoseExecutor,

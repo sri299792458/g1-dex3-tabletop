@@ -241,9 +241,7 @@ class PoseExecutor:
             raise RuntimeError("control can only be acquired from observing")
         if not operator_confirmed:
             raise ValueError("operator confirmation is required before acquisition")
-        now = self.clock.monotonic()
-        sample = self.transport.observe()
-        self._validate_fresh_state(sample, now)
+        sample, now = self._observe_fresh_state()
         hold_arm = opposite_arm(self.pose_set.calibration_arm)
         hold_error = float(np.max(np.abs(sample.arm_q(hold_arm) - self.hold_q)))
         if hold_error > self.config.activation_position_tolerance_rad:
@@ -305,9 +303,7 @@ class PoseExecutor:
                 "owned-control handoff command differs from the authored handoff "
                 f"by {command_change:.6f}rad"
             )
-        now = self.clock.monotonic()
-        sample = self.transport.observe()
-        self._validate_fresh_state(sample, now)
+        sample, now = self._observe_fresh_state()
         self._opposite_hold.rebase_monitor(sample)
         self._calibration_goal_q = self.handoff_q.copy()
         self._command_q14 = previous.copy()
@@ -597,9 +593,7 @@ class PoseExecutor:
         if not validated_reference_state.is_mode5:
             raise ValueError("validated plan reference is not mode_machine=5")
 
-        now = self.clock.monotonic()
-        live_state = self.transport.observe()
-        self._validate_fresh_state(live_state, now)
+        live_state, now = self._observe_fresh_state()
         reference_drift = float(
             np.max(np.abs(live_state.position - validated_reference_state.position))
         )
@@ -694,9 +688,7 @@ class PoseExecutor:
                 f"replacement boundary differs from the current command by {boundary_error:.9f}rad"
             )
 
-        now = self.clock.monotonic()
-        live_state = self.transport.observe()
-        self._validate_fresh_state(live_state, now)
+        live_state, now = self._observe_fresh_state()
         reference_drift = float(
             np.max(np.abs(live_state.position - validated_reference_state.position))
         )
@@ -778,9 +770,7 @@ class PoseExecutor:
                     f"{boundary_error:.9f}rad"
                 )
 
-        now = self.clock.monotonic()
-        live_state = self.transport.observe()
-        self._validate_fresh_state(live_state, now)
+        live_state, now = self._observe_fresh_state()
         reference_drift = float(
             np.max(np.abs(live_state.position - validated_reference_state.position))
         )
@@ -844,6 +834,10 @@ class PoseExecutor:
 
         try:
             sample = self.transport.observe()
+            # LowState is updated by a DDS callback. A callback may publish a
+            # newer sample after the tick timestamp above was read, so age must
+            # be checked against a clock value obtained after observe().
+            now = self.clock.monotonic()
             self._validate_fresh_state(sample, now)
             ownership_transition = self.state in {
                 ExecutorState.ACQUIRING,
@@ -1064,9 +1058,7 @@ class PoseExecutor:
     def observe_state(self) -> RobotStateSample:
         """Return one fresh measured state without changing the command."""
 
-        now = self.clock.monotonic()
-        sample = self.transport.observe()
-        self._validate_fresh_state(sample, now)
+        sample, _now = self._observe_fresh_state()
         return sample
 
     def motion_diagnostic(self, *, prefix: str = "motion status") -> str:
@@ -1136,9 +1128,7 @@ class PoseExecutor:
             raise ValueError("operator confirmation is required for clean release")
         if self.current_pose_id != HANDOFF_POSE_ID:
             raise ValueError("executor is not at the measured handoff pose")
-        now = self.clock.monotonic()
-        sample = self.transport.observe()
-        self._validate_fresh_state(sample, now)
+        _sample, now = self._observe_fresh_state()
         self._phase_started_s = now
         self._transition(ExecutorState.RELEASING, "clean release approved", now)
 
@@ -1189,6 +1179,19 @@ class PoseExecutor:
             raise ValueError(
                 f"robot state age {age:.3f}s exceeds {self.config.state_freshness_timeout_s:.3f}s"
             )
+
+    def _observe_fresh_state(self) -> tuple[RobotStateSample, float]:
+        """Observe first, then timestamp the freshness check.
+
+        The hardware observer is fed asynchronously. Reading the clock before
+        observe() permits a DDS callback in between to return a sample whose
+        receipt timestamp is newer than that clock value.
+        """
+
+        sample = self.transport.observe()
+        now = self.clock.monotonic()
+        self._validate_fresh_state(sample, now)
+        return sample, now
 
     def _reset_settle_window(self) -> None:
         self._settle_started_s = None
