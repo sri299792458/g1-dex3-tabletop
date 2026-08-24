@@ -1,0 +1,29 @@
+{
+  "acquisition": {
+    "camera_handoff": "tools/g1_realsense_pc2.sh",
+    "librealsense_version": "2.50.0",
+    "repository_head": "de44e5857b597b0ed72ce188055eb2ab5cfd3c3a",
+    "realsense_ros_version": "4.51.1",
+    "source": "live ROS /tf_static on G1 PC2"
+  },
+  "camera_serial": "348522074178",
+  "color_T_optical": [
+    [0.0, 0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "color_frame": "camera_color_frame",
+  "content_sha256": "0057c30f6e9c3523f5215e804e6d2bfdacd4c455a795549ac48c2e81b28aa8ed",
+  "measured_at_utc": "2026-08-24T19:08:45Z",
+  "optical_frame": "camera_color_optical_frame",
+  "parent_T_color": [
+    [0.9999774043196132, 0.005152790605350331, 0.004317360210368922, -0.0005032537155784667],
+    [-0.005103139947476943, 0.9999216147038597, -0.011433390166636588, 0.014834854751825333],
+    [-0.004375935658248237, 0.011411099728049465, 0.9999253162062212, -0.00037528990651480854],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "parent_frame": "camera_link",
+  "schema_version": 1,
+  "urdf_parent_link": "d435_link"
+}

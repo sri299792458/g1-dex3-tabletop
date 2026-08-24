@@ -14,12 +14,21 @@ import numpy as np
 from g1_aprilcube_calibration.joint_map import (
     LEFT_ARM_INDICES,
     RIGHT_ARM_INDICES,
+    arm_indices,
     arm_joint_names,
 )
 from g1_aprilcube_calibration.pose_schema import HANDOFF_POSE_ID
 from g1_aprilcube_calibration.transforms import invert_transform
 from g1_aprilcube_calibration.transports.unitree_dex3 import (
     DEX3_MOTOR_JOINT_SUFFIXES,
+)
+from g1_dex3_tabletop.calibration.execution import BilateralPlannedTransition
+from g1_dex3_tabletop.calibration.planning import (
+    BilateralCalibrationPlanningRequest,
+    BilateralFeasiblePose,
+    BilateralIKResult,
+    BilateralRoutePlanningRequest,
+    BilateralRoutePlanningResult,
 )
 from g1_dex3_tabletop.calibration_candidates import (
     CandidateDesignConfig,
@@ -60,6 +69,7 @@ def _clearance_from_activation_cost(cost: np.ndarray, activation_distance_m: flo
             0.5 * activation - values,
         ),
     )
+
 
 IK_SEEDS = 16
 IK_RETURN_SEEDS = 4
@@ -601,9 +611,7 @@ class CuroboWorldCollisionChecker:
         clearance = _clearance_from_activation_cost(values, activation)
         sample_index = int(np.argmin(clearance))
         selected_sphere = int(sphere_index[sample_index].item())
-        link_index = int(
-            kinematics_config.link_sphere_idx_map.reshape(-1)[selected_sphere].item()
-        )
+        link_index = int(kinematics_config.link_sphere_idx_map.reshape(-1)[selected_sphere].item())
         index_to_name = {
             value: name for name, value in kinematics_config.link_name_to_idx_map.items()
         }
@@ -839,6 +847,287 @@ def plan_calibration(
                 "direct_edges_with_frozen_via_handoff_fallback; direct_return"
             ),
         },
+    )
+
+
+def solve_bilateral_calibration_ik(
+    request: BilateralCalibrationPlanningRequest,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> BilateralIKResult:
+    """Run collision-aware batched IK for both active-arm candidate pools."""
+
+    report = progress or (lambda _message: None)
+    poses: list[BilateralFeasiblePose] = []
+    provenance: dict[str, Any] = {
+        **model_source_hashes(),
+        "self_collision_check": True,
+        "collision_activation_distance_m": COLLISION_ACTIVATION_DISTANCE_M,
+        "ik_batch_size": request.ik_batch_size,
+        "ik_seeds": IK_SEEDS,
+        "ik_return_seeds": IK_RETURN_SEEDS,
+        "ik_position_tolerance_m": IK_POSITION_TOLERANCE_M,
+        "ik_rotation_tolerance_rad": IK_ROTATION_TOLERANCE_RAD,
+        "candidate_count_by_arm": {},
+        "feasible_ik_count_by_arm": {},
+        "ik_elapsed_s_by_arm": {},
+    }
+    devices: set[str] = set()
+    for side in ("left", "right"):
+        candidates = request.candidates_by_arm[side]
+        side_request = CalibrationPlanRequest(
+            arm=side,
+            snapshot=request.snapshot,
+            torso_T_camera=request.nominal_torso_T_camera,
+            palm_T_marker=request.nominal_hand_T_targets[side],
+            joint_position_offsets_rad=request.joint_position_offsets_rad,
+            candidates=candidates,
+            selection_config={"selector": "bilateral_full_model_in_parent"},
+            target_count=1,
+            ik_batch_size=request.ik_batch_size,
+            random_seed=request.random_seed,
+        )
+        robot, reference_tuple = build_locked_robot_config(
+            arm=side,
+            snapshot=request.snapshot,
+            joint_position_offsets_rad=request.joint_position_offsets_rad,
+        )
+        feasible, elapsed_s, device_name = _batched_ik(
+            request=side_request,
+            robot=robot,
+            reference=np.asarray(reference_tuple, dtype=np.float64),
+            progress=lambda message, selected=side: report(f"{selected}: {message}"),
+        )
+        devices.add(device_name)
+        provenance["candidate_count_by_arm"][side] = len(candidates)
+        provenance["feasible_ik_count_by_arm"][side] = len(feasible)
+        provenance["ik_elapsed_s_by_arm"][side] = elapsed_s
+        indices = np.asarray(arm_indices(side), dtype=np.int64)
+        for item in feasible:
+            candidate = candidates[item.source_index]
+            command_q = command_from_model_q(
+                item.model_q,
+                arm=side,
+                joint_position_offsets_rad=request.joint_position_offsets_rad,
+            )
+            full_q = np.asarray(request.snapshot.measured_q29_rad, dtype=np.float64).copy()
+            full_q[indices] = command_q
+            poses.append(
+                BilateralFeasiblePose(
+                    candidate_id=candidate.candidate_id,
+                    active_arm=side,
+                    active_model_q_rad=tuple(item.model_q),
+                    active_command_q_rad=tuple(command_q),
+                    full_command_q29_rad=tuple(full_q),
+                    ik_position_error_m=item.position_error_m,
+                    ik_rotation_error_rad=item.rotation_error_rad,
+                    candidate_metadata=candidate.selection_metadata,
+                )
+            )
+        report(f"{side}: retained {len(feasible)}/{len(candidates)} collision-free IK poses")
+    provenance["device"] = ",".join(sorted(devices))
+    return BilateralIKResult(
+        request_sha256=request.content_sha256,
+        poses=tuple(poses),
+        planner_provenance=provenance,
+    )
+
+
+def plan_bilateral_calibration_route(
+    request: BilateralRoutePlanningRequest,
+    *,
+    progress: Callable[[str], None] | None = None,
+) -> BilateralRoutePlanningResult:
+    """Certify every selected edge, falling back through the frozen anchor."""
+
+    import torch
+    from curobo.motion_planner import MotionPlanner, MotionPlannerCfg
+    from curobo.types import DeviceCfg
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CuRobo bilateral route planning requires a CUDA device")
+    report = progress or (lambda _message: None)
+    device_cfg = DeviceCfg(device=torch.device("cuda:0"), dtype=torch.float32)
+    planners: dict[str, Any] = {}
+    star_paths: dict[str, dict[str, PlannedTrajectory]] = {"left": {}, "right": {}}
+    disconnected: list[str] = []
+    star_diagnostics: list[dict[str, str]] = []
+    planning_started = time.monotonic()
+    try:
+        for side in ("left", "right"):
+            robot, reference_tuple = build_locked_robot_config(
+                arm=side,
+                snapshot=request.snapshot,
+                joint_position_offsets_rad=request.joint_position_offsets_rad,
+            )
+            config = MotionPlannerCfg.create(
+                robot=robot,
+                device_cfg=device_cfg,
+                num_ik_seeds=IK_SEEDS,
+                num_trajopt_seeds=4,
+                self_collision_check=True,
+                use_cuda_graph=True,
+                random_seed=request.random_seed,
+                optimizer_collision_activation_distance=COLLISION_ACTIVATION_DISTANCE_M,
+                interpolation_dt=TRAJECTORY_INTERPOLATION_DT_S,
+                interpolation_buffer_size=1000,
+            )
+            planner = MotionPlanner(config)
+            planners[side] = planner
+            reference = np.asarray(reference_tuple, dtype=np.float64)
+            for candidate in (
+                item for item in request.selection.candidates if item.active_arm == side
+            ):
+                target_q = _route_model_q(request, candidate.candidate_id, side)
+                star, diagnostics = _plan_edge(
+                    planner=planner,
+                    device_cfg=device_cfg,
+                    names=list(arm_joint_names(side)),
+                    arm=side,
+                    source_id=HANDOFF_POSE_ID,
+                    target_id=candidate.candidate_id,
+                    source_q=reference,
+                    target_q=target_q,
+                    joint_position_offsets_rad=request.joint_position_offsets_rad,
+                )
+                if star is None:
+                    disconnected.append(candidate.candidate_id)
+                    star_diagnostics.append(
+                        {"candidate_id": candidate.candidate_id, "reason": diagnostics}
+                    )
+                    report(
+                        f"{side}: CuRobo rejected anchor connectivity for "
+                        f"{candidate.candidate_id}: {diagnostics}"
+                    )
+                else:
+                    star_paths[side][candidate.candidate_id] = star
+                    report(
+                        f"{side}: anchor connectivity "
+                        f"{len(star_paths[side])}/"
+                        f"{sum(item.active_arm == side for item in request.selection.candidates)}"
+                    )
+        if disconnected:
+            return BilateralRoutePlanningResult(
+                request_sha256=request.content_sha256,
+                transitions=(),
+                disconnected_candidate_ids=tuple(sorted(disconnected)),
+                planner_provenance={
+                    **model_source_hashes(),
+                    "device": torch.cuda.get_device_name(device_cfg.device),
+                    "route_elapsed_s": time.monotonic() - planning_started,
+                    "anchor_connectivity_rejections": star_diagnostics,
+                    "route_policy": "reject_and_reselect_on_missing_anchor_connectivity",
+                },
+            )
+
+        transitions: list[BilateralPlannedTransition] = []
+        fallback_edges = 0
+        for edge_index in range(len(request.schedule) - 1):
+            start = request.schedule[edge_index]
+            end = request.schedule[edge_index + 1]
+            side = request.transition_arm(edge_index)
+            source_anchor = start.capture_role == "anchor"
+            target_anchor = end.capture_role == "anchor"
+            if source_anchor:
+                trajectory = _rename_trajectory(
+                    star_paths[side][end.candidate_id],
+                    from_pose_id=start.occurrence_id,
+                    to_pose_id=end.occurrence_id,
+                )
+            elif target_anchor:
+                trajectory = _rename_trajectory(
+                    _reverse_trajectory(star_paths[side][start.candidate_id]),
+                    from_pose_id=start.occurrence_id,
+                    to_pose_id=end.occurrence_id,
+                )
+            else:
+                trajectory, diagnostics = _plan_edge(
+                    planner=planners[side],
+                    device_cfg=device_cfg,
+                    names=list(arm_joint_names(side)),
+                    arm=side,
+                    source_id=start.occurrence_id,
+                    target_id=end.occurrence_id,
+                    source_q=_route_model_q(request, start.candidate_id, side),
+                    target_q=_route_model_q(request, end.candidate_id, side),
+                    joint_position_offsets_rad=request.joint_position_offsets_rad,
+                )
+                if trajectory is None:
+                    first = _reverse_trajectory(star_paths[side][start.candidate_id])
+                    second = star_paths[side][end.candidate_id]
+                    trajectory = _concatenate_trajectories(
+                        first,
+                        second,
+                        from_pose_id=start.occurrence_id,
+                        to_pose_id=end.occurrence_id,
+                    )
+                    fallback_edges += 1
+                    report(
+                        f"{side}: froze {start.occurrence_id}->{end.occurrence_id} "
+                        f"through the anchor after direct failure: {diagnostics}"
+                    )
+            transitions.append(BilateralPlannedTransition(arm=side, trajectory=trajectory))
+            report(
+                f"bilateral route {edge_index + 1}/{len(request.schedule) - 1}: "
+                f"{start.occurrence_id}->{end.occurrence_id}; "
+                f"duration={trajectory.sample_time_s[-1]:.2f}s"
+            )
+        return BilateralRoutePlanningResult(
+            request_sha256=request.content_sha256,
+            transitions=tuple(transitions),
+            disconnected_candidate_ids=(),
+            planner_provenance={
+                **model_source_hashes(),
+                "device": torch.cuda.get_device_name(device_cfg.device),
+                "route_elapsed_s": time.monotonic() - planning_started,
+                "route_edge_count": len(transitions),
+                "route_via_anchor_fallback_edges": fallback_edges,
+                "trajectory_interpolation_dt_s": TRAJECTORY_INTERPOLATION_DT_S,
+                "execution_maximum_velocity_rad_s": EXECUTION_MAXIMUM_VELOCITY_RAD_S,
+                "self_collision_check": True,
+                "collision_activation_distance_m": COLLISION_ACTIVATION_DISTANCE_M,
+                "mounted_plate_spheres_per_hand": 30,
+                "route_policy": "direct_edges_with_frozen_via_anchor_fallback",
+            },
+        )
+    finally:
+        for planner in planners.values():
+            planner.destroy()
+        planners.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _route_model_q(
+    request: BilateralRoutePlanningRequest,
+    candidate_id: str,
+    side: str,
+) -> np.ndarray:
+    full_q = np.asarray(request.waypoint_joint_positions_rad[candidate_id], dtype=np.float64)
+    command_q = full_q[np.asarray(arm_indices(side), dtype=np.int64)]
+    return np.asarray(
+        [
+            value + request.joint_position_offsets_rad.get(name, 0.0)
+            for name, value in zip(arm_joint_names(side), command_q, strict=True)
+        ],
+        dtype=np.float64,
+    )
+
+
+def _rename_trajectory(
+    trajectory: PlannedTrajectory,
+    *,
+    from_pose_id: str,
+    to_pose_id: str,
+) -> PlannedTrajectory:
+    return PlannedTrajectory(
+        from_pose_id=from_pose_id,
+        to_pose_id=to_pose_id,
+        sample_time_s=trajectory.sample_time_s,
+        command_q_rad=trajectory.command_q_rad,
+        model_q_rad=trajectory.model_q_rad,
+        planning_time_s=trajectory.planning_time_s,
     )
 
 

@@ -9,14 +9,20 @@ from pathlib import Path
 
 import numpy as np
 
+from g1_dex3_tabletop.calibration.planning import (
+    BilateralCalibrationPlanningRequest,
+    BilateralRoutePlanningRequest,
+)
 from g1_dex3_tabletop.planning.contracts import (
     CalibrationPlanRequest,
     Dex3PreparationRequest,
 )
 from g1_dex3_tabletop.planning.curobo_backend import (
     inspect_model,
+    plan_bilateral_calibration_route,
     plan_calibration,
     plan_dex3_preparation,
+    solve_bilateral_calibration_ik,
 )
 from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
@@ -52,6 +58,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan_parser.add_argument("--request", type=Path, required=True)
     plan_parser.add_argument("--output", type=Path, required=True)
+    for command, help_text in (
+        (
+            "solve-bilateral-calibration-ik",
+            "run collision-aware batched IK for both bilateral candidate pools",
+        ),
+        (
+            "plan-bilateral-calibration-route",
+            "certify every edge in one selected bilateral calibration schedule",
+        ),
+    ):
+        bilateral = subparsers.add_parser(command, help=help_text)
+        bilateral.add_argument("--request", type=Path, required=True)
+        bilateral.add_argument("--output", type=Path, required=True)
     preparation_parser = subparsers.add_parser(
         "plan-dex3-preparation",
         help="plan shoulder clearance and validate the complete Dex3 finger sweep",
@@ -431,6 +450,34 @@ def main(argv: list[str] | None = None) -> int:
                 "plan_sha256": result.content_sha256,
                 "outward_offset_rad": result.outward_offset_rad,
                 "finger_sweep_sample_count": result.finger_sweep_sample_count,
+            }
+        elif args.command == "solve-bilateral-calibration-ik":
+            request = BilateralCalibrationPlanningRequest.from_json(args.request)
+            result = solve_bilateral_calibration_ik(
+                request,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            summary = {
+                "commands_robot": False,
+                "output": str(args.output.resolve()),
+                "result_sha256": result.content_sha256,
+                "feasible_pose_count": len(result.poses),
+                "operation": args.command,
+            }
+        elif args.command == "plan-bilateral-calibration-route":
+            request = BilateralRoutePlanningRequest.from_json(args.request)
+            result = plan_bilateral_calibration_route(
+                request,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            summary = {
+                "commands_robot": False,
+                "output": str(args.output.resolve()),
+                "result_sha256": result.content_sha256,
+                "connected": result.connected,
+                "trajectory_count": len(result.transitions),
+                "disconnected_candidate_ids": list(result.disconnected_candidate_ids),
+                "operation": args.command,
             }
         else:
             request = CalibrationPlanRequest.from_json(args.request)

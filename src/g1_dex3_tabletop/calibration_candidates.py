@@ -596,6 +596,32 @@ def _target_object_points_m(target: dict[str, Any]) -> np.ndarray:
     return np.vstack(points) / 1000.0
 
 
+def target_object_points_m(target: dict[str, Any]) -> np.ndarray:
+    """Return target tag corners in detector order, expressed in metres."""
+
+    result = _target_object_points_m(target).copy()
+    result.setflags(write=False)
+    return result
+
+
+def target_corner_tag_ids(target: dict[str, Any]) -> tuple[int, ...]:
+    """Return one tag ID per target corner in detector/object-point order."""
+
+    markers = target.get("markers")
+    if not isinstance(markers, list) or not markers:
+        raise ValueError("target markers must be a non-empty list")
+    result: list[int] = []
+    for marker in markers:
+        corners = np.asarray(marker.get("corners_mm"), dtype=np.float64)
+        if corners.shape != (4, 3) or not np.all(np.isfinite(corners)):
+            raise ValueError("every marker must contain four finite 3D corners")
+        marker_id = marker.get("id")
+        if isinstance(marker_id, bool) or not isinstance(marker_id, int) or marker_id < 0:
+            raise ValueError("every target marker must have a non-negative integer ID")
+        result.extend((marker_id,) * 4)
+    return tuple(result)
+
+
 def _unit(vector: np.ndarray) -> np.ndarray:
     array = np.asarray(vector, dtype=np.float64)
     norm = float(np.linalg.norm(array))

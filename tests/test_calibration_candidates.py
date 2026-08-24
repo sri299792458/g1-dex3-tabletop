@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import yaml
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
@@ -10,6 +11,8 @@ from g1_dex3_tabletop.calibration_candidates import (
     camera_info_from_hardware,
     generate_calibration_candidates,
     select_information_candidates,
+    target_corner_tag_ids,
+    target_object_points_m,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,3 +64,14 @@ def test_candidate_design_config_rejects_incomplete_serialized_policy() -> None:
         assert "fields do not match" in str(error)
     else:
         raise AssertionError("incomplete design policy was accepted")
+
+
+def test_target_geometry_helpers_preserve_detector_corner_order() -> None:
+    target = json.loads(
+        (ROOT / "config/dex3_left_dorsal_aruco_id5_target.json").read_text(encoding="utf-8")
+    )
+    points = target_object_points_m(target)
+
+    assert points.shape == (4, 3)
+    assert points[0] == pytest.approx((-0.02, 0.02, 0.0))
+    assert target_corner_tag_ids(target) == (5, 5, 5, 5)

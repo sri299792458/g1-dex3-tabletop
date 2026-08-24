@@ -111,7 +111,7 @@ fi
 
 cd "${workspace_root}"
 case "${hardware_command}" in
-    collect-calibration|run-tabletop|run-stack|measure-seat-compliance)
+    collect-calibration|collect-bilateral-calibration|run-tabletop|run-stack|measure-seat-compliance)
         "${workspace_root}/tools/g1_realsense_pc2.sh" stop
         "${workspace_root}/tools/g1_realsense_pc2.sh" start
         ;;

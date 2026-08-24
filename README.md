@@ -138,6 +138,41 @@ dataset, computes holdout residuals and bootstrap observability, and writes
 select it with `--calibration-bundle`, or remove that argument to return cleanly
 to the repository default. It never rewrites the base URDF.
 
+### Same-frame bilateral calibration pilot
+
+The replacement calibration route is planned completely offline from an exact
+stationary, shoulder-cleared snapshot with both Dex3 marker plates already at
+the commissioned middle-close posture:
+
+```bash
+./tools/g1_tabletop.sh plan-bilateral-calibration \
+  --snapshot /absolute/path/to/prepared_snapshot.json \
+  --output-directory /absolute/path/to/bilateral_plan
+```
+
+This command does not create ROS nodes or publishers. It performs bilateral
+collision-aware IK, full-model information selection, handoff-connectivity
+reselection, and complete CuRobo edge certification. It emits mutually
+hash-bound `pose_design.json` and `execution_plan.json` plus all intermediate
+planning evidence. The execution plan includes the exact Dex3 joint posture
+used for collision checking.
+
+After inspecting those artifacts, the separate hardware collector consumes
+them without doing any online planning:
+
+```bash
+./tools/g1_tabletop_hardware.sh collect-bilateral-calibration \
+  --network-interface enp134s0 \
+  --pose-design /absolute/path/to/bilateral_plan/pose_design.json \
+  --execution-plan /absolute/path/to/bilateral_plan/execution_plan.json \
+  --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
+```
+
+Every accepted frame must contain both hand targets. This remains a pilot path;
+the deployed bundle and the older single-arm command stay available until the
+new data passes the replay, observability, hardware, and later-day gates in
+[`docs/calibration-redesign.md`](docs/calibration-redesign.md).
+
 ## Cushion-versus-rigid seat diagnostic
 
 This is deliberately separate from grasping and calibration validation. Tape
