@@ -1417,11 +1417,13 @@ def test_failure_frames_preserve_explicit_image_timing(tmp_path: Path) -> None:
 
 
 def test_tabletop_detection_names_the_cube_not_the_hand(monkeypatch) -> None:
+    solve_modes = []
+
     def reject(_image, _camera_info, _detector, **kwargs):
         assert kwargs["target_label"] == "tabletop AprilCube"
         assert kwargs["minimum_tag_short_side_px"] == 25.0
         assert kwargs["maximum_reprojection_error_px"] == 3.0
-        assert kwargs["single_best_face"] is True
+        solve_modes.append(kwargs["single_best_face"])
         raise ValueError("tabletop AprilCube was not detected")
 
     monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", reject)
@@ -1432,7 +1434,38 @@ def test_tabletop_detection_names_the_cube_not_the_hand(monkeypatch) -> None:
             camera_info=object(),
             detector=object(),
             snapshot=_observation().snapshot,
+            base_T_camera=np.eye(4),
         )
+
+    assert solve_modes == [True, False] * 5
+
+
+def test_resting_cube_retries_multi_face_when_single_face_is_not_upright(
+    monkeypatch,
+) -> None:
+    solve_modes = []
+
+    def detect(image, _camera_info, _detector, **kwargs):
+        single_best_face = kwargs["single_best_face"]
+        solve_modes.append(single_best_face)
+        transform = np.eye(4)
+        if single_best_face:
+            transform[:3, :3] = Rotation.from_euler("x", 30.0, degrees=True).as_matrix()
+        transform[0, 3] = 0.0002 * int(image[0, 0, 0])
+        return SimpleNamespace(camera_T_target=transform)
+
+    monkeypatch.setattr("g1_dex3_tabletop.tabletop_perception.detect_hand_target_pose", detect)
+    observation = observe_resting_cube(
+        [np.full((8, 8, 3), index, dtype=np.uint8) for index in range(5)],
+        camera_info=SimpleNamespace(profile_sha256="a" * 64),
+        detector=object(),
+        snapshot=_observation().snapshot,
+        base_T_camera=np.eye(4),
+    )
+
+    assert solve_modes == [True, False] * 5
+    assert len(observation.source_frame_sha256) == 5
+    np.testing.assert_allclose(np.asarray(observation.camera_T_object)[:3, :3], np.eye(3))
 
 
 def test_resting_cube_uses_largest_three_frame_pose_consensus(monkeypatch) -> None:
@@ -1449,6 +1482,7 @@ def test_resting_cube_uses_largest_three_frame_pose_consensus(monkeypatch) -> No
         camera_info=SimpleNamespace(profile_sha256="a" * 64),
         detector=object(),
         snapshot=_observation().snapshot,
+        base_T_camera=np.eye(4),
     )
 
     assert len(observation.source_frame_sha256) == 4
@@ -1474,6 +1508,7 @@ def test_resting_cube_rejects_when_no_three_frame_pose_consensus_exists(monkeypa
             camera_info=object(),
             detector=object(),
             snapshot=_observation().snapshot,
+            base_T_camera=np.eye(4),
         )
 
 

@@ -5267,3 +5267,27 @@ Primary references:
 - No waist motion, gain experiment, compact-hand orchestration, simulated
   release filter, or alternate shortlist was restored. The Friday 57-candidate
   shortlist remains unchanged.
+
+## 2026-08-24 — Resting-cube single-face fallback
+
+- Retained run `stack_20260824T163511Z` did not show physical cube motion. The
+  secondary cube's largest marker was tag 24 on face `+Z` in all five loaded
+  frames. Its single-face solve was internally consistent but falsely tilted
+  `29.35--29.89 deg` from every possible resting face, with only
+  `2.834--2.957 px` reprojection error.
+- The already-supported multi-face solve on those same immutable images was
+  `3.51--4.77 deg` from face-up. This isolates a planar/corner-geometry failure
+  that additional identical-view frames cannot resolve by voting: the wrong
+  single-face answer is systematic, not an isolated temporal outlier.
+- Resting-cube observation still tries the commissioned largest-face solve
+  first. Only when it fails detection/quality or the existing 20-degree
+  resting-face condition does that frame retry the existing multi-face solve.
+  Both results remain subject to the unchanged `3 px` reprojection and
+  five-frame `5 mm / 2 deg`, minimum-three-frame consensus gates.
+- The resting-face check uses the calibrated base-from-camera orientation at
+  the exact command-bound snapshot. No table edge, torso-to-edge distance,
+  planner scene, motion limit, controller, or AprilCube submodule changed.
+- Command-free replay of the failed run now accepts all five loaded frames for
+  both cubes. The secondary result is `4.12 deg` from face-up with
+  `1.36 mm / 0.86 deg` spread. The post-clearance burst accepts four common
+  frames and yields `6.43 deg` with `0.64 mm / 1.04 deg` spread.

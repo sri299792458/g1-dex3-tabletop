@@ -16,6 +16,8 @@ from g1_aprilcube_calibration.transforms import invert_transform, validate_trans
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.tabletop_contracts import TabletopObservation
 
+_MAXIMUM_RESTING_FACE_TILT_DEG = 20.0
+
 
 def observe_live_cube_frame(
     image_bgr: np.ndarray,
@@ -166,6 +168,54 @@ def _largest_transform_consensus(
     return indices, center, translation_mm, rotation_deg
 
 
+def _resting_face_tilt_deg(
+    camera_T_object: np.ndarray,
+    *,
+    base_T_camera: np.ndarray,
+) -> float:
+    base_T_object = base_T_camera @ camera_T_object
+    best_alignment = float(np.max(np.abs(base_T_object[:3, :3][2, :])))
+    return float(np.degrees(np.arccos(np.clip(best_alignment, -1.0, 1.0))))
+
+
+def _detect_resting_camera_T_object(
+    image_bgr: np.ndarray,
+    *,
+    camera_info: RectifiedCameraInfo,
+    detector: CorrespondenceDetector,
+    base_T_camera: np.ndarray,
+    minimum_tag_short_side_px: float,
+    maximum_reprojection_error_px: float,
+) -> np.ndarray:
+    failures = []
+    for label, single_best_face in (("single-face", True), ("multi-face", False)):
+        try:
+            estimate = detect_hand_target_pose(
+                image_bgr,
+                camera_info,
+                detector,
+                target_label="tabletop AprilCube",
+                minimum_visible_faces=1,
+                minimum_tag_short_side_px=minimum_tag_short_side_px,
+                maximum_reprojection_error_px=maximum_reprojection_error_px,
+                single_best_face=single_best_face,
+            )
+        except ValueError as error:
+            failures.append(f"{label} solve failed: {error}")
+            continue
+        tilt = _resting_face_tilt_deg(
+            estimate.camera_T_target,
+            base_T_camera=base_T_camera,
+        )
+        if tilt <= _MAXIMUM_RESTING_FACE_TILT_DEG:
+            return estimate.camera_T_target
+        failures.append(f"{label} resting tilt is {tilt:.3f} degrees")
+    raise ValueError(
+        "; ".join(failures)
+        + f"; limit is {_MAXIMUM_RESTING_FACE_TILT_DEG:.0f} degrees"
+    )
+
+
 def camera_motion_from_fixed_cube(
     reference_camera_T_object,
     current_camera_T_object,
@@ -197,6 +247,7 @@ def observe_resting_cube(
     camera_info: RectifiedCameraInfo,
     detector: CorrespondenceDetector,
     snapshot: RobotSnapshot,
+    base_T_camera: np.ndarray,
     minimum_frames: int = 3,
     maximum_translation_spread_mm: float = 5.0,
     maximum_rotation_spread_deg: float = 2.0,
@@ -207,6 +258,7 @@ def observe_resting_cube(
 
     if len(images_bgr) < minimum_frames:
         raise ValueError(f"need at least {minimum_frames} cube frames")
+    base_T_camera = validate_transform(np.asarray(base_T_camera, dtype=np.float64))
     transforms: list[np.ndarray] = []
     hashes: list[str] = []
     rejections: list[str] = []
@@ -220,20 +272,18 @@ def observe_resting_cube(
             rejections.append(f"frame {index}: duplicate image")
             continue
         try:
-            estimate = detect_hand_target_pose(
+            transform = _detect_resting_camera_T_object(
                 value,
-                camera_info,
-                detector,
-                target_label="tabletop AprilCube",
-                minimum_visible_faces=1,
+                camera_info=camera_info,
+                detector=detector,
+                base_T_camera=base_T_camera,
                 minimum_tag_short_side_px=minimum_tag_short_side_px,
                 maximum_reprojection_error_px=maximum_reprojection_error_px,
-                single_best_face=True,
             )
         except ValueError as error:
             rejections.append(f"frame {index}: {error}")
             continue
-        transforms.append(estimate.camera_T_target)
+        transforms.append(transform)
         hashes.append(digest)
     if len(transforms) < minimum_frames:
         raise ValueError(
@@ -264,6 +314,7 @@ def observe_resting_cube_pair(
     first_detector: CorrespondenceDetector,
     second_detector: CorrespondenceDetector,
     snapshot: RobotSnapshot,
+    base_T_camera: np.ndarray,
     minimum_frames: int = 3,
     maximum_translation_spread_mm: float = 5.0,
     maximum_rotation_spread_deg: float = 2.0,
@@ -277,6 +328,7 @@ def observe_resting_cube_pair(
     arguments = {
         "camera_info": camera_info,
         "snapshot": snapshot,
+        "base_T_camera": base_T_camera,
         "minimum_frames": minimum_frames,
         "maximum_translation_spread_mm": maximum_translation_spread_mm,
         "maximum_rotation_spread_deg": maximum_rotation_spread_deg,

@@ -87,6 +87,7 @@ from g1_dex3_tabletop.stack_workflow import (
     build_direct_stack_request,
     request_base_T_camera,
     request_hand_positions,
+    snapshot_base_T_camera,
 )
 from g1_dex3_tabletop.tabletop_contracts import (
     PickPlaceRetentionRouteValidationRequest,
@@ -160,6 +161,8 @@ def _observe_pair(
     bottom_detector,
     snapshot: RobotSnapshot,
     quality: QualityThresholds,
+    model: URDFModel,
+    bundle: CalibrationBundle,
 ) -> tuple[TabletopObservation, TabletopObservation]:
     return observe_resting_cube_pair(
         [item.image_bgr for item in frames],
@@ -167,6 +170,12 @@ def _observe_pair(
         first_detector=upper_detector,
         second_detector=bottom_detector,
         snapshot=snapshot,
+        base_T_camera=snapshot_base_T_camera(
+            snapshot,
+            torso_T_camera=bundle.torso_T_camera,
+            joint_position_offsets_rad=bundle.joint_position_offsets_rad,
+            model=model,
+        ),
         minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
         maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
         first_label="secondary cube (tag IDs 20-25)",
@@ -795,6 +804,8 @@ def run_stack(args) -> int:
             bottom_detector=bottom_detector,
             snapshot=preflight_snapshot,
             quality=quality,
+            model=model,
+            bundle=bundle,
         )
         print(
             "READ-ONLY STACK PREFLIGHT PASSED — both uniquely tagged cubes are visible "
@@ -1020,6 +1031,8 @@ def run_stack(args) -> int:
                         loaded_command_q14,
                     ),
                     quality=quality,
+                    model=model,
+                    bundle=bundle,
                 )
                 reference_request = build_request("left", loaded_upper, upper_profile)
                 arm_choices = _ordered_arm_choices(
@@ -1227,6 +1240,8 @@ def run_stack(args) -> int:
                             bottom_detector=bottom_detector,
                             snapshot=clearance_snapshot,
                             quality=quality,
+                            model=model,
+                            bundle=bundle,
                         )
                     except (RuntimeError, ValueError) as error:
                         rejection = _clearance_perception_rejection(driver, error)
@@ -1328,6 +1343,8 @@ def run_stack(args) -> int:
                                 loaded_command_q14,
                             ),
                             quality=quality,
+                            model=model,
+                            bundle=bundle,
                         )
                 atomic_write_json(
                     run_directory / "feasibility_search.json",
@@ -1431,6 +1448,8 @@ def run_stack(args) -> int:
                                 bottom_detector=bottom_detector,
                                 snapshot=retry_snapshot,
                                 quality=quality,
+                                model=model,
+                                bundle=bundle,
                             )
                             retry_metadata, retry_request = direct_request(
                                 retry_upper,

@@ -307,6 +307,7 @@ def test_paired_cube_observation_names_the_failed_detector(monkeypatch) -> None:
             first_detector="secondary-detector",
             second_detector="primary-detector",
             snapshot=RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7),
+            base_T_camera=np.eye(4),
             first_label="secondary cube (tag IDs 20-25)",
             second_label="primary cube (tag IDs 10-15)",
         )

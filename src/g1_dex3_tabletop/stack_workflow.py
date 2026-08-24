@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 
 import numpy as np
@@ -10,6 +11,7 @@ from scipy.spatial.transform import Rotation
 from g1_aprilcube_calibration.joint_map import G1_29_JOINT_NAMES
 from g1_aprilcube_calibration.transforms import invert_transform, validate_transform
 from g1_aprilcube_calibration.urdf_model import URDFModel
+from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.tabletop_contracts import (
     TabletopCuboid,
     TabletopObservation,
@@ -49,17 +51,34 @@ def request_base_T_camera(
 ) -> np.ndarray:
     """Resolve the calibrated camera pose from the request's measured body state."""
 
+    return snapshot_base_T_camera(
+        request.planning_snapshot,
+        torso_T_camera=request.torso_T_camera,
+        joint_position_offsets_rad=request.joint_position_offsets_rad,
+        model=model,
+    )
+
+
+def snapshot_base_T_camera(
+    snapshot: RobotSnapshot,
+    *,
+    torso_T_camera: Sequence[Sequence[float]] | np.ndarray,
+    joint_position_offsets_rad: Mapping[str, float],
+    model: URDFModel,
+) -> np.ndarray:
+    """Resolve the calibrated camera pose for one command-bound snapshot."""
+
     positions = {
-        name: float(value) + request.joint_position_offsets_rad.get(name, 0.0)
+        name: float(value) + joint_position_offsets_rad.get(name, 0.0)
         for name, value in zip(
             G1_29_JOINT_NAMES,
-            request.planning_snapshot.measured_q29_rad,
+            snapshot.measured_q29_rad,
             strict=True,
         )
     }
     return validate_transform(
         model.transform("pelvis", "torso_link", positions)
-        @ np.asarray(request.torso_T_camera, dtype=np.float64)
+        @ np.asarray(torso_T_camera, dtype=np.float64)
     )
 
 

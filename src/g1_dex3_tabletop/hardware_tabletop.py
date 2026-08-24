@@ -88,6 +88,7 @@ from g1_dex3_tabletop.planning.tabletop_mpc import (
     MPC_KNOT_DT_S,
 )
 from g1_dex3_tabletop.raw_episode_recording import RawEpisodeRecorder, tabletop_raw_topics
+from g1_dex3_tabletop.stack_workflow import snapshot_base_T_camera
 from g1_dex3_tabletop.state_estimation import (
     AnchoredCameraPoseEstimators,
     AnchoredCameraStateEstimator,
@@ -1161,11 +1162,18 @@ def run_tabletop(args) -> int:
             )
             if preflight_frames[-1].camera_info.profile_sha256 != expected_camera.profile_sha256:
                 raise ValueError("live camera profile differs from hardware.yaml")
+            preflight_snapshot = _snapshot(activation.reference_state, hands)
             preflight_observation = observe_resting_cube(
                 [item.image_bgr for item in preflight_frames],
                 camera_info=expected_camera,
                 detector=detector,
-                snapshot=_snapshot(activation.reference_state, hands),
+                snapshot=preflight_snapshot,
+                base_T_camera=snapshot_base_T_camera(
+                    preflight_snapshot,
+                    torso_T_camera=bundle.torso_T_camera,
+                    joint_position_offsets_rad=bundle.joint_position_offsets_rad,
+                    model=model,
+                ),
                 minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
                 maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
             )
@@ -1329,11 +1337,18 @@ def run_tabletop(args) -> int:
                 control_check=driver.check,
             )
             loaded_state = synchronized.observe_state()
+            loaded_snapshot = _snapshot(loaded_state, held_hands)
             loaded_observation = observe_resting_cube(
                 [item.image_bgr for item in loaded_frames],
                 camera_info=expected_camera,
                 detector=detector,
-                snapshot=_snapshot(loaded_state, held_hands),
+                snapshot=loaded_snapshot,
+                base_T_camera=snapshot_base_T_camera(
+                    loaded_snapshot,
+                    torso_T_camera=bundle.torso_T_camera,
+                    joint_position_offsets_rad=bundle.joint_position_offsets_rad,
+                    model=model,
+                ),
                 minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
                 maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
             )
@@ -1454,11 +1469,18 @@ def run_tabletop(args) -> int:
                     f"{np.max(np.abs(measured_empty_open_q_rad - acquisition_empty_open_q_rad)):.4f}rad",
                     flush=True,
                 )
+                boundary_snapshot = _snapshot(boundary_state, boundary_hands)
                 boundary_observation = observe_resting_cube(
                     [item.image_bgr for item in clearance_frames],
                     camera_info=expected_camera,
                     detector=detector,
-                    snapshot=_snapshot(boundary_state, boundary_hands),
+                    snapshot=boundary_snapshot,
+                    base_T_camera=snapshot_base_T_camera(
+                        boundary_snapshot,
+                        torso_T_camera=bundle.torso_T_camera,
+                        joint_position_offsets_rad=bundle.joint_position_offsets_rad,
+                        model=model,
+                    ),
                     minimum_tag_short_side_px=quality.minimum_tag_short_side_px,
                     maximum_reprojection_error_px=quality.pnp_reject_reprojection_px,
                 )
