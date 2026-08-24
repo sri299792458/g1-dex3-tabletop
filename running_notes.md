@@ -5203,3 +5203,22 @@ Primary references:
   destination goal-set index `2`. It created no robot command. Ruff passed;
   the control environment passed `431` tests with `7` skipped and the CUDA
   planner environment passed `431` tests with `1` skipped.
+
+## 2026-08-24 — Rebuild from the physically successful Friday baseline
+
+- `feature/friday-stack-rebuild` starts at `0a0fa0c`, retaining the complete
+  57-candidate shortlist. Later experiments are preserved separately at
+  `b6266d4` on `archive/post-friday-stack-experiments-20260824`; the invalid
+  34-candidate release filter was not carried forward.
+- LowState freshness now timestamps after the asynchronous observation. This
+  removes the race that produced `now_monotonic_s precedes the state receipt
+  time` without changing the 100 ms freshness limit or fault behavior.
+- Every stack planning observation now combines measured body and Dex3 state
+  with the exact 14-joint arm command being published. Initial plan
+  installation preserves that command and retains the exact `1e-9 rad`
+  trajectory-start invariant. This directly covers the retained
+  `0.021020331 rad` measured-versus-command right-elbow failure.
+- No waist motion, gain experiment, three-frame outlier tolerance,
+  four-assignment search, compact-hand experiment, or multi-episode retention
+  was included. The two correctness fixes are isolated as `c0d0b87` and
+  `c235760`; verification passed Ruff and `435 passed, 7 skipped`.
