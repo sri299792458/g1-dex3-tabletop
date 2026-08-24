@@ -467,30 +467,32 @@ cd /home/kanth042/g1-dex3-tabletop
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
-The read-only preflight assigns each cube to its nearest hand and selects the
-globally nearest cube/arm pair. The controller then plans and executes only that
-arm's supported escape and opens only that Dex3 hand. The unused arm and hand
-remain at their exact supported initial commands. At clearance, the planner
+The read-only preflight orders both arms by their nearest cube but does not
+discard any assignment. After ownership, the controller lifts only the first
+arm and tests both directed tasks: primary onto secondary and secondary onto
+primary. If neither has a complete plan, that hand and arm return to their exact
+supported starts before the other arm is lifted and both directions are tested
+again. Execution stops at the first complete plan. At clearance, the planner
 first checks all source/destination grasp endpoints, then performs expensive
 route planning only for a grasp that is viable at both endpoints. Common
 candidates are tried in ascending order of their best source-plus-destination
 IK joint distance from the measured clearance state. This reuses the existing
-IK solutions; it does not add route solves, a wrist-specific weight, or a new
-acceptance threshold.
+IK solutions; it does not add a wrist-specific weight or a new acceptance
+threshold.
 
 CuRobo launches as soon as `run-stack` starts. After the read-only two-cube
-observation, the persistent CUDA worker warms only the selected arm's open-hand
+observation, the persistent CUDA worker warms both fixed-waist arms' open-hand
 and attached-60-mm-cube MotionGen models while the camera preview remains
 active. Pressing Space still creates no publisher until that command-free
 warmup has completed. Live supported-escape and task solves remain after
 ownership because their joint and object states do not exist beforehand.
 
-The selected arm picks one cube and places it directly on the other. The
+The selected assignment picks one cube and places it directly on the other. The
 stationary cube remains a finite collision obstacle during pickup and becomes
 the finite placement support at the destination. No midpoint, preliminary cube
 relocation, table boundary, separate board, or second pick is involved. The
 selected arm finally reverses its exact supported escape and seated control is
-restored; the unused arm never leaves its supported start.
+restored. Only one arm is ever away from its supported start at a time.
 
 During the attached transfer, CuRobo retains full-robot self-collision and the
 stationary support cube as an explicit obstacle. It does not add a whole-robot

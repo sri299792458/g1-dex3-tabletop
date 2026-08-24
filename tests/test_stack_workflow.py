@@ -12,7 +12,7 @@ from g1_dex3_tabletop.hardware_stack import (
     _command_bound_snapshot,
     _dual_arm_command_snapshot,
     _install_plan_at_current_boundary,
-    _nearest_cube_move,
+    _ordered_arm_choices,
 )
 from g1_dex3_tabletop.planning import tabletop_planner, tabletop_session
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, RobotSnapshot
@@ -268,7 +268,7 @@ def test_paired_cube_observation_names_the_failed_detector(monkeypatch) -> None:
         )
 
 
-def test_nearest_cube_move_selects_one_global_cube_arm_pair() -> None:
+def test_ordered_arm_choices_keep_both_cube_directions_for_each_arm() -> None:
     class FakeModel:
         @staticmethod
         def transform(_parent, child, _positions):
@@ -282,17 +282,22 @@ def test_nearest_cube_move_selects_one_global_cube_arm_pair() -> None:
     upper = _observation(0.24, 0.0, 0.030)
     bottom = _observation(-0.05, 0.0, 0.030)
 
-    selected = _nearest_cube_move(
+    selected = _ordered_arm_choices(
         reference_request=_request("left", upper, 0.060),
         upper_observation=upper,
         bottom_observation=bottom,
         model=FakeModel(),
     )
 
-    assert selected["moving_cube"] == "secondary"
-    assert selected["support_cube"] == "primary"
-    assert selected["arm"] == "right"
-    assert selected["source_hand_distance_m"] == pytest.approx(np.hypot(0.06, 0.03))
+    assert selected[0]["arm"] == "right"
+    assert selected[0]["moving_cube_order"] == ("secondary", "primary")
+    assert selected[0]["source_hand_distances_m"]["secondary"] == pytest.approx(
+        np.hypot(0.06, 0.03)
+    )
+    assert selected[1]["arm"] == "left"
+    assert selected[1]["moving_cube_order"] == ("primary", "secondary")
+    assert set(selected[0]["moving_cube_order"]) == {"primary", "secondary"}
+    assert set(selected[1]["moving_cube_order"]) == {"primary", "secondary"}
 
 
 def _task(

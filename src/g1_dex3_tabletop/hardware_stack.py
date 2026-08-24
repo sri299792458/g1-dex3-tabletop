@@ -10,6 +10,7 @@ import json
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -181,14 +182,14 @@ def _clearance_perception_rejection(driver, error: Exception) -> TabletopTaskRej
     )
 
 
-def _nearest_cube_move(
+def _ordered_arm_choices(
     *,
     reference_request: TabletopTaskRequest,
     upper_observation: TabletopObservation,
     bottom_observation: TabletopObservation,
     model: URDFModel,
-) -> dict[str, object]:
-    """Choose the globally nearest cube/arm pair from the supported start."""
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Order both arms and retain both directed cube tasks for each arm."""
 
     base_T_camera = request_base_T_camera(reference_request, model)
     left_hand, right_hand = request_hand_positions(reference_request, model)
@@ -197,29 +198,35 @@ def _nearest_cube_move(
         "secondary": upper_observation,
         "primary": bottom_observation,
     }
+    cube_positions = {
+        name: (base_T_camera @ np.asarray(observation.camera_T_object, dtype=np.float64))[:3, 3]
+        for name, observation in observations.items()
+    }
     choices: list[dict[str, object]] = []
-    for moving_cube, observation in observations.items():
-        cube_position = (
-            base_T_camera @ np.asarray(observation.camera_T_object, dtype=np.float64)
-        )[:3, 3]
-        arm = min(
-            ("left", "right"),
-            key=lambda side: float(np.linalg.norm(hand_positions[side] - cube_position)),
-        )
+    for arm in ("left", "right"):
+        distances = {
+            cube: float(np.linalg.norm(hand_positions[arm] - position))
+            for cube, position in cube_positions.items()
+        }
+        moving_cube_order = tuple(sorted(distances, key=lambda cube: (distances[cube], cube)))
         choices.append(
             {
-                "moving_cube": moving_cube,
-                "support_cube": "primary" if moving_cube == "secondary" else "secondary",
                 "arm": arm,
-                "source_hand_distance_m": float(
-                    np.linalg.norm(hand_positions[arm] - cube_position)
-                ),
+                "moving_cube_order": moving_cube_order,
+                "source_hand_distances_m": distances,
+                "nearest_source_hand_distance_m": distances[moving_cube_order[0]],
+                "ordering_policy": "nearest_source_orders_attempts_only",
             }
         )
-    return min(
-        choices,
-        key=lambda value: (float(value["source_hand_distance_m"]), str(value["moving_cube"])),
-    )
+    return tuple(
+        sorted(
+            choices,
+            key=lambda value: (
+                float(value["nearest_source_hand_distance_m"]),
+                str(value["arm"]),
+            ),
+        )
+    )  # type: ignore[return-value]
 
 
 class PickPlaceGraspRejected(TabletopTaskRejected):
@@ -799,61 +806,58 @@ def run_stack(args) -> int:
             "on the bare table and no command publisher exists",
             flush=True,
         )
-        preflight_reference = build_tabletop_request(
-            arm="left",
-            observation=preflight_upper,
-            calibration_bundle=bundle,
-            calibration_bundle_path=args.calibration_bundle,
-            grasp_shortlist_path=upper_profile.direct_grasp_shortlist_path,
-            task_config_path=args.task_config,
-            object_dimensions_m=upper_profile.dimensions_m,
-            maximum_arm_velocity_rad_s=velocity,
-            pregrasp_distance_m=args.pregrasp_distance_m,
-        )
+        def preflight_request(arm: str, observation, profile, other, other_profile):
+            return _with_other_cube(
+                build_tabletop_request(
+                    arm=arm,
+                    observation=observation,
+                    calibration_bundle=bundle,
+                    calibration_bundle_path=args.calibration_bundle,
+                    grasp_shortlist_path=profile.direct_grasp_shortlist_path,
+                    task_config_path=args.task_config,
+                    object_dimensions_m=profile.dimensions_m,
+                    maximum_arm_velocity_rad_s=velocity,
+                    pregrasp_distance_m=args.pregrasp_distance_m,
+                ),
+                other_id="support_cube",
+                other_observation=other,
+                other_dimensions_m=other_profile.dimensions_m,
+            )
+
+        preflight_warmup_requests = {
+            "left": preflight_request(
+                "left",
+                preflight_upper,
+                upper_profile,
+                preflight_bottom,
+                bottom_profile,
+            ),
+            "right": preflight_request(
+                "right",
+                preflight_bottom,
+                bottom_profile,
+                preflight_upper,
+                upper_profile,
+            ),
+        }
+        preflight_reference = preflight_warmup_requests["left"]
         status["pregrasp_distance_m"] = preflight_reference.pregrasp_distance_m
-        selected_move = _nearest_cube_move(
+        preflight_arm_choices = _ordered_arm_choices(
             reference_request=preflight_reference,
             upper_observation=preflight_upper,
             bottom_observation=preflight_bottom,
             model=model,
         )
-        selected_arm = str(selected_move["arm"])
-        moving_cube = str(selected_move["moving_cube"])
-        # Grasp validation depends on a physically measured empty-close
-        # reference for the selected hand. Resolve it before SPACE, ownership,
-        # or any arm motion—not after a complete task plan has been found.
-        selected_empty_close, selected_minimum_shortfall = dex3_empty_close_reference(
-            selected_arm
+        selected_arm = str(preflight_arm_choices[0]["arm"])
+        atomic_write_json(
+            run_directory / "preflight_assignment_order.json",
+            {"ordered_arms_with_both_cube_directions": list(preflight_arm_choices)},
         )
-        if moving_cube == "secondary":
-            preflight_moving = preflight_upper
-            preflight_moving_profile = upper_profile
-            preflight_support = preflight_bottom
-            preflight_support_profile = bottom_profile
-        else:
-            preflight_moving = preflight_bottom
-            preflight_moving_profile = bottom_profile
-            preflight_support = preflight_upper
-            preflight_support_profile = upper_profile
-        preflight_warmup_request = _with_other_cube(
-            build_tabletop_request(
-                arm=selected_arm,
-                observation=preflight_moving,
-                calibration_bundle=bundle,
-                calibration_bundle_path=args.calibration_bundle,
-                grasp_shortlist_path=preflight_moving_profile.direct_grasp_shortlist_path,
-                task_config_path=args.task_config,
-                object_dimensions_m=preflight_moving_profile.dimensions_m,
-                maximum_arm_velocity_rad_s=velocity,
-                pregrasp_distance_m=args.pregrasp_distance_m,
-            ),
-            other_id="support_cube",
-            other_observation=preflight_support,
-            other_dimensions_m=preflight_support_profile.dimensions_m,
-        )
-        atomic_write_json(run_directory / "preflight_selection.json", selected_move)
-        preflight_warmup_path = run_directory / "preflight_warmup_request.json"
-        preflight_warmup_request.write_json(preflight_warmup_path)
+        warmup_paths: dict[str, Path] = {}
+        for arm, request in preflight_warmup_requests.items():
+            path = run_directory / f"preflight_{arm}_warmup_request.json"
+            request.write_json(path)
+            warmup_paths[arm] = path
         empty_pose_set = PoseSet(
             robot_model=model.name,
             mode_machine=5,
@@ -866,17 +870,13 @@ def run_stack(args) -> int:
         # same activation invariant used by the single-cube workflow.
         recording = replace(recording, calibration_arm=selected_arm)
         runtime_warmup = planner.begin_payload_request(
-            "prewarm-tabletop-runtime",
-            payload={
-                "request": str(preflight_warmup_path.resolve()),
-                "moving_grasp_mpc": False,
-            },
+            "prewarm-tabletop-stack-runtime",
+            payload={"requests": {arm: str(path.resolve()) for arm, path in warmup_paths.items()}},
         )
         print(
-            "ACTIVE-ARM RUNTIME WARMUP QUEUED — "
-            f"the {selected_arm} arm is nearest to the {moving_cube} cube; only its "
-            "open-hand and attached-60-mm MotionGen models are warming during the "
-            "read-only preview. SPACE still authorizes only later command-publisher creation",
+            "DUAL-ARM RUNTIME WARMUP QUEUED — fixed-waist left/right open-hand and "
+            "attached-60-mm MotionGen models are warming during the read-only preview. "
+            "SPACE still authorizes only later command-publisher creation",
             flush=True,
         )
         _wait_for_space_with_preview(
@@ -888,7 +888,7 @@ def run_stack(args) -> int:
         )
         print(
             "SPACE RECORDED — no command publisher exists; completing any remaining "
-            "background active-arm warmup before ownership",
+            "background fixed-waist dual-arm warmup before ownership",
             flush=True,
         )
         warmup_event = planner.finish_request(runtime_warmup, timeout_s=300.0)
@@ -898,7 +898,7 @@ def run_stack(args) -> int:
             warmup_event["payload"],
         )
         print(
-            f"ACTIVE-ARM RUNTIME WARMUP READY — reusable {selected_arm}-arm MotionGen "
+            "DUAL-ARM RUNTIME WARMUP READY — reusable fixed-waist left/right MotionGen "
             "topologies completed before robot ownership",
             flush=True,
         )
@@ -962,7 +962,7 @@ def run_stack(args) -> int:
         )
         print(
             "CONTROL ACQUIRED — both arms are held at the exact measured state; "
-            f"planning only the selected {selected_arm}-arm supported escape",
+            "testing the ordered fixed-waist arm/cube assignments one arm at a time",
             flush=True,
         )
 
@@ -1001,121 +1001,33 @@ def run_stack(args) -> int:
             ),
             quality=quality,
         )
-        if moving_cube == "secondary":
-            loaded_moving = loaded_upper
-            loaded_moving_profile = upper_profile
-            loaded_support = loaded_bottom
-            loaded_support_profile = bottom_profile
-        else:
-            loaded_moving = loaded_bottom
-            loaded_moving_profile = bottom_profile
-            loaded_support = loaded_upper
-            loaded_support_profile = upper_profile
-        active_request = _with_other_cube(
-            build_request(selected_arm, loaded_moving, loaded_moving_profile),
-            other_id="support_cube",
-            other_observation=loaded_support,
-            other_dimensions_m=loaded_support_profile.dimensions_m,
-        )
-        active_request.write_json(run_directory / "supported_escape_request.json")
-        planner.request(
-            "plan-supported-escape",
-            request_path=run_directory / "supported_escape_request.json",
-            output_path=run_directory / "supported_escape.json",
-            control_check=driver.check,
-        )
-        active_escape = SupportedEscapePlan.from_json(run_directory / "supported_escape.json")
-        if selected_arm == "left":
-            left_escape = active_escape
-        else:
-            right_escape = active_escape
-        executable_escape = _install_plan_at_current_boundary(
-            synchronized,
-            arm=selected_arm,
-            trajectories=(active_escape.outbound,),
-            recovery_trajectories=(active_escape.inbound,),
-            plan_sha256=active_escape.content_sha256,
-            validated_reference_state=loaded_state,
+        reference_request = build_request("left", loaded_upper, upper_profile)
+        arm_choices = _ordered_arm_choices(
+            reference_request=reference_request,
+            upper_observation=loaded_upper,
+            bottom_observation=loaded_bottom,
             model=model,
         )
-        _execute_trajectory(
-            synchronized,
-            driver,
-            executable_escape[0],
-            plan_sha256=active_escape.content_sha256,
-            control_config=control_config,
-        )
-        left_at_clearance = selected_arm == "left"
-        right_at_clearance = selected_arm == "right"
-        print(
-            f"{selected_arm.upper()} CLEARANCE REACHED — opening only the selected Dex3 "
-            "hand; the unused arm and hand remain at their supported initial state",
-            flush=True,
-        )
-        active_open, _active_close = dex3_execution_profile(selected_arm)
-        open_pair = _command_fingers(
-            dex_controller,
-            driver,
-            guard,
-            left=active_open if selected_arm == "left" else initial_left,
-            right=active_open if selected_arm == "right" else initial_right,
-            label=f"{selected_arm}-hand stack empty-open acquisition",
-        )
-        measured_open_left = open_pair.left.position.copy()
-        measured_open_right = open_pair.right.position.copy()
         atomic_write_json(
-            run_directory / "dex3_run_local_open.json",
-            {
-                "active_side": selected_arm,
-                "left_command_q_rad": list(
-                    active_open if selected_arm == "left" else initial_left
-                ),
-                "right_command_q_rad": list(
-                    active_open if selected_arm == "right" else initial_right
-                ),
-                "left_measured_q_rad": measured_open_left.tolist(),
-                "right_measured_q_rad": measured_open_right.tolist(),
-            },
+            run_directory / "assignment_candidates.json",
+            {"ordered_arms_with_both_cube_directions": list(arm_choices)},
         )
-        try:
-            frame_sets["active_clearance"] = _collect_frames(
-                rclpy,
-                node,
-                camera,
-                count=args.observation_frames,
-                timeout_s=10.0,
-                control_check=driver.check,
-            )
-        except (RuntimeError, ValueError) as error:
-            raise _clearance_perception_rejection(driver, error) from error
-        clearance_state, clearance_command_q14 = (
-            synchronized.observe_dual_arm_control_input()
-        )
-        clearance_hands = dex_controller.observer.observe()
-        clearance_snapshot = _command_bound_snapshot(
-            clearance_state,
-            clearance_hands,
-            clearance_command_q14,
-        )
-        try:
-            clearance_upper, clearance_bottom = _observe_pair(
-                frame_sets["active_clearance"],
-                expected_camera=expected_camera,
-                upper_detector=upper_detector,
-                bottom_detector=bottom_detector,
-                snapshot=clearance_snapshot,
-                quality=quality,
-            )
-        except ValueError as error:
-            raise _clearance_perception_rejection(driver, error) from error
+        assignment_results: list[dict[str, object]] = []
+        selected = None
+        direct_request = None
 
-        def direct_request(
+        def direction_request(
             observed_upper: TabletopObservation,
             observed_bottom: TabletopObservation,
             *,
+            arm: str,
+            moving_cube_name: str,
+            arm_choice: dict[str, object],
+            arm_attempt_index: int,
+            direction_attempt_index: int,
             excluded_candidate_ids: tuple[str, ...] = (),
         ) -> tuple[dict[str, object], TabletopPickPlaceRequest]:
-            reference = build_request(selected_arm, observed_upper, upper_profile)
+            reference = build_request(arm, observed_upper, upper_profile)
             current_base_T_camera = request_base_T_camera(reference, model)
             left_hand, right_hand = request_hand_positions(reference, model)
             hand_positions = {"left": left_hand, "right": right_hand}
@@ -1127,19 +1039,24 @@ def run_stack(args) -> int:
                 name: (current_base_T_camera @ np.asarray(value[0].camera_T_object))[:3, 3]
                 for name, value in observed.items()
             }
-            support_cube = "primary" if moving_cube == "secondary" else "secondary"
-            moving_observation, moving_profile = observed[moving_cube]
-            support_observation = observed[support_cube][0]
-            distance = float(
-                np.linalg.norm(hand_positions[selected_arm] - cube_positions[moving_cube])
+            support_cube_name = (
+                "primary" if moving_cube_name == "secondary" else "secondary"
             )
-            moving_request = build_request(selected_arm, moving_observation, moving_profile)
+            moving_observation, moving_profile = observed[moving_cube_name]
+            support_observation = observed[support_cube_name][0]
+            distance = float(
+                np.linalg.norm(hand_positions[arm] - cube_positions[moving_cube_name])
+            )
+            moving_request = build_request(arm, moving_observation, moving_profile)
             return (
                 {
-                    "moving_cube": moving_cube,
-                    "support_cube": support_cube,
-                    "arm": selected_arm,
+                    **arm_choice,
+                    "moving_cube": moving_cube_name,
+                    "support_cube": support_cube_name,
+                    "arm": arm,
                     "source_hand_distance_m": distance,
+                    "arm_attempt_index": arm_attempt_index,
+                    "direction_attempt_index": direction_attempt_index,
                     "yaw_goalset_quarter_turns": list(DIRECT_STACK_YAW_QUARTER_TURNS),
                     "yaw_selected_by": "curobo_goalset",
                     "yaw_is_nominal_only": True,
@@ -1152,26 +1069,261 @@ def run_stack(args) -> int:
                 ),
             )
 
-        stack_metadata, stack_request = direct_request(clearance_upper, clearance_bottom)
-        selected, search_results = _find_direct_stack_plan(
-            planner=planner,
-            driver=driver,
-            metadata=stack_metadata,
-            request=stack_request,
-            directory=run_directory / "feasibility_search",
-        )
+        for arm_attempt_index, arm_choice in enumerate(arm_choices, start=1):
+            selected_arm = str(arm_choice["arm"])
+            moving_cube_order = tuple(str(value) for value in arm_choice["moving_cube_order"])
+            escape_cube = moving_cube_order[0]
+            escape_support_cube = "primary" if escape_cube == "secondary" else "secondary"
+            assignment_name = f"arm_{arm_attempt_index:02d}_{selected_arm}"
+            assignment_directory = run_directory / "assignments" / assignment_name
+            assignment_directory.mkdir(parents=True, exist_ok=True)
+            loaded_observed = {
+                "secondary": (loaded_upper, upper_profile),
+                "primary": (loaded_bottom, bottom_profile),
+            }
+            loaded_moving, loaded_moving_profile = loaded_observed[escape_cube]
+            loaded_support, loaded_support_profile = loaded_observed[escape_support_cube]
+            print(
+                f"STACK ARM {arm_attempt_index}/{len(arm_choices)} — lifting the "
+                f"{selected_arm} arm once; both cube directions will be tested from "
+                "its fresh clearance observation",
+                flush=True,
+            )
+            active_request = _with_other_cube(
+                build_request(selected_arm, loaded_moving, loaded_moving_profile),
+                other_id="support_cube",
+                other_observation=loaded_support,
+                other_dimensions_m=loaded_support_profile.dimensions_m,
+            )
+            escape_request_path = assignment_directory / "supported_escape_request.json"
+            escape_path = assignment_directory / "supported_escape.json"
+            active_request.write_json(escape_request_path)
+            try:
+                planner.request(
+                    "plan-supported-escape",
+                    request_path=escape_request_path,
+                    output_path=escape_path,
+                    control_check=driver.check,
+                )
+            except PlannerRequestRejected as error:
+                driver.check()
+                assignment_results.append(
+                    {
+                        **arm_choice,
+                        "arm_attempt_index": arm_attempt_index,
+                        "passed": False,
+                        "stage": "supported_escape",
+                        "reason": str(error),
+                    }
+                )
+                print(
+                    "STACK ARM REJECTED — supported escape was not feasible for "
+                    f"the {selected_arm} arm; trying the other arm",
+                    flush=True,
+                )
+                continue
+            active_escape = SupportedEscapePlan.from_json(escape_path)
+            if selected_arm == "left":
+                left_escape = active_escape
+            else:
+                right_escape = active_escape
+            executable_escape = _install_plan_at_current_boundary(
+                synchronized,
+                arm=selected_arm,
+                trajectories=(active_escape.outbound,),
+                recovery_trajectories=(active_escape.inbound,),
+                plan_sha256=active_escape.content_sha256,
+                validated_reference_state=loaded_state,
+                model=model,
+            )
+            _execute_trajectory(
+                synchronized,
+                driver,
+                executable_escape[0],
+                plan_sha256=active_escape.content_sha256,
+                control_config=control_config,
+            )
+            left_at_clearance = selected_arm == "left"
+            right_at_clearance = selected_arm == "right"
+            print(
+                f"{selected_arm.upper()} CLEARANCE REACHED — opening only the "
+                "candidate Dex3 hand and collecting its planning observation",
+                flush=True,
+            )
+            active_open, _active_close = dex3_execution_profile(selected_arm)
+            open_pair = _command_fingers(
+                dex_controller,
+                driver,
+                guard,
+                left=active_open if selected_arm == "left" else initial_left,
+                right=active_open if selected_arm == "right" else initial_right,
+                label=f"{selected_arm}-hand stack empty-open acquisition",
+            )
+            measured_open_left = open_pair.left.position.copy()
+            measured_open_right = open_pair.right.position.copy()
+            atomic_write_json(
+                assignment_directory / "dex3_run_local_open.json",
+                {
+                    "active_side": selected_arm,
+                    "left_command_q_rad": list(
+                        active_open if selected_arm == "left" else initial_left
+                    ),
+                    "right_command_q_rad": list(
+                        active_open if selected_arm == "right" else initial_right
+                    ),
+                    "left_measured_q_rad": measured_open_left.tolist(),
+                    "right_measured_q_rad": measured_open_right.tolist(),
+                },
+            )
+            clearance_key = f"{assignment_name}_clearance"
+            try:
+                frame_sets[clearance_key] = _collect_frames(
+                    rclpy,
+                    node,
+                    camera,
+                    count=args.observation_frames,
+                    timeout_s=10.0,
+                    control_check=driver.check,
+                )
+                clearance_state, clearance_command_q14 = (
+                    synchronized.observe_dual_arm_control_input()
+                )
+                clearance_hands = dex_controller.observer.observe()
+                clearance_upper, clearance_bottom = _observe_pair(
+                    frame_sets[clearance_key],
+                    expected_camera=expected_camera,
+                    upper_detector=upper_detector,
+                    bottom_detector=bottom_detector,
+                    snapshot=_command_bound_snapshot(
+                        clearance_state,
+                        clearance_hands,
+                        clearance_command_q14,
+                    ),
+                    quality=quality,
+                )
+            except (RuntimeError, ValueError) as error:
+                rejection = _clearance_perception_rejection(driver, error)
+                assignment_results.append(
+                    {
+                        **arm_choice,
+                        "arm_attempt_index": arm_attempt_index,
+                        "passed": False,
+                        "stage": "clearance_observation",
+                        "reason": str(rejection),
+                    }
+                )
+                selected = None
+            else:
+                for direction_attempt_index, moving_cube in enumerate(
+                    moving_cube_order,
+                    start=1,
+                ):
+                    support_cube = (
+                        "primary" if moving_cube == "secondary" else "secondary"
+                    )
+                    print(
+                        "STACK DIRECTION "
+                        f"{direction_attempt_index}/{len(moving_cube_order)} — testing "
+                        f"{selected_arm} arm: {moving_cube} onto {support_cube}",
+                        flush=True,
+                    )
+                    candidate_request = partial(
+                        direction_request,
+                        arm=selected_arm,
+                        moving_cube_name=moving_cube,
+                        arm_choice=arm_choice,
+                        arm_attempt_index=arm_attempt_index,
+                        direction_attempt_index=direction_attempt_index,
+                    )
+                    stack_metadata, stack_request = candidate_request(
+                        clearance_upper,
+                        clearance_bottom,
+                    )
+                    selected, search_results = _find_direct_stack_plan(
+                        planner=planner,
+                        driver=driver,
+                        metadata=stack_metadata,
+                        request=stack_request,
+                        directory=(
+                            assignment_directory
+                            / "directions"
+                            / f"direction_{direction_attempt_index:02d}_{moving_cube}"
+                        ),
+                    )
+                    assignment_results.extend(search_results)
+                    if selected is not None:
+                        direct_request = candidate_request
+                        break
+            if selected is not None:
+                atomic_write_json(run_directory / "selection.json", selected[0])
+                break
+            print(
+                "STACK ARM REJECTED — neither cube direction gave the "
+                f"{selected_arm} arm a complete plan; restoring the supported start "
+                "before testing the other arm",
+                flush=True,
+            )
+            _command_fingers(
+                dex_controller,
+                driver,
+                guard,
+                left=initial_left,
+                right=initial_right,
+                label="restore initial fingers before alternate stack arm",
+            )
+            left_at_clearance, right_at_clearance = _return_supported_arms(
+                synchronized=synchronized,
+                driver=driver,
+                model=model,
+                control_config=control_config,
+                left_escape=left_escape,
+                right_escape=right_escape,
+                left_at_clearance=left_at_clearance,
+                right_at_clearance=right_at_clearance,
+            )
+            if arm_attempt_index < len(arm_choices):
+                fallback_key = f"after_{assignment_name}_supported"
+                frame_sets[fallback_key] = _collect_frames(
+                    rclpy,
+                    node,
+                    camera,
+                    count=args.observation_frames,
+                    timeout_s=10.0,
+                    control_check=driver.check,
+                )
+                loaded_state, loaded_command_q14 = (
+                    synchronized.observe_dual_arm_control_input()
+                )
+                loaded_hands = dex_controller.observer.observe()
+                loaded_upper, loaded_bottom = _observe_pair(
+                    frame_sets[fallback_key],
+                    expected_camera=expected_camera,
+                    upper_detector=upper_detector,
+                    bottom_detector=bottom_detector,
+                    snapshot=_command_bound_snapshot(
+                        loaded_state,
+                        loaded_hands,
+                        loaded_command_q14,
+                    ),
+                    quality=quality,
+                )
         atomic_write_json(
             run_directory / "feasibility_search.json",
             {
-                "attempts": search_results,
+                "attempts": assignment_results,
                 "selected": None if selected is None else selected[0],
             },
         )
         if selected is None:
             raise TabletopTaskRejected(
-                f"the selected {selected_arm}-arm direct cube-on-cube transfer produced "
-                "no complete plan"
+                "none of the four fixed-waist arm/cube directions produced a complete "
+                "cube-on-cube plan"
             )
+        if direct_request is None:
+            raise RuntimeError("selected stack plan is missing its request builder")
+        selected_empty_close, selected_minimum_shortfall = dex3_empty_close_reference(
+            selected_arm
+        )
         selected_metadata, stack_request, stack_plan, selected_dir = selected
         selected_yaw_quarter_turns = DIRECT_STACK_YAW_QUARTER_TURNS[
             stack_plan.selected_destination_index
@@ -1321,7 +1473,8 @@ def run_stack(args) -> int:
         print(
             "DIRECT TWO-CUBE STACK PASSED — one 60 mm cube was placed directly on "
             f"the other, the {selected_arm} arm returned to its supported start, "
-            "the unused arm never moved, and seated FSM 3 was restored",
+            "any rejected candidate arm was restored before fallback, and seated FSM 3 "
+            "was restored",
             flush=True,
         )
     except TabletopTaskRejected as rejection:
@@ -1373,8 +1526,8 @@ def run_stack(args) -> int:
             "supported_return_completed": not left_at_clearance and not right_at_clearance,
         }
         print(
-            "STACK TASK REJECTED — the selected arm returned through its frozen "
-            "supported route, the unused arm remained at its start, and seated FSM 3 "
+            "STACK TASK REJECTED — every lifted arm returned through its frozen "
+            "supported route and seated FSM 3 "
             f"was restored. Reason: {rejection}",
             flush=True,
         )
