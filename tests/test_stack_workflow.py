@@ -289,6 +289,40 @@ def test_clearance_perception_failure_is_recoverable_only_with_healthy_control()
         )
 
 
+def test_supported_perception_failure_rejects_episode_only_with_healthy_control() -> None:
+    checks = []
+
+    class HealthyDriver:
+        @staticmethod
+        def check() -> None:
+            checks.append("healthy")
+
+    rejection = hardware_stack._supported_perception_rejection(
+        HealthyDriver(),
+        ValueError("secondary cube passed only 2/5 frames"),
+    )
+
+    assert isinstance(rejection, hardware_stack.StackPerceptionBlocked)
+    assert isinstance(rejection, hardware_stack.TabletopTaskRejected)
+    assert checks == ["healthy"]
+    assert str(rejection) == (
+        "PERCEPTION BLOCKED — both arms remain supported. Remove any occlusion, "
+        "reposition the cubes, and press SPACE to try again."
+    )
+    assert rejection.detail == "secondary cube passed only 2/5 frames"
+
+    class FaultedDriver:
+        @staticmethod
+        def check() -> None:
+            raise RuntimeError("controller fault")
+
+    with pytest.raises(RuntimeError, match="controller fault"):
+        hardware_stack._supported_perception_rejection(
+            FaultedDriver(),
+            ValueError("camera failed"),
+        )
+
+
 def test_paired_cube_observation_names_the_failed_detector(monkeypatch) -> None:
     def fail_first(_images, *, detector, **_kwargs):
         if detector == "secondary-detector":

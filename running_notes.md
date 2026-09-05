@@ -5300,3 +5300,581 @@ Primary references:
   `1.01 mm / 0.80 deg` spread. Post-clearance secondary/primary results are
   `7.22/6.04 deg` from face-up with `1.93 mm / 0.47 deg` and
   `0.25 mm / 0.27 deg` spread.
+
+## 2026-08-27 — Bilateral calibration rebuilt as a Ready-to-Ready experiment
+
+- The offline input is now a stationary normal Ready snapshot. The manually
+  prepared bilateral anchor and inherited middle-close precondition were
+  removed from the planning and hardware contracts.
+- CuRobo chooses a both-visible left/right anchor pair from its feasible IK
+  pools starting from the closed-hand bilateral shoulder-clearance state,
+  rejects a pair if the combined full model collides or cannot connect to that
+  clearance, and freezes every arm edge from Ready through capture and back.
+- The execution artifact separately binds the measured Ready hand posture,
+  descriptor-defined fixed full-close commands, and commissioned measured
+  empty-close collision geometry. The closing sweep and the reverse
+  empty-close-to-measured-Ready restoration sweep are certified at bilateral
+  shoulder clearance.
+- Non-capture Ready/preparation waypoints are explicit in the route. Hardware
+  reaches right-then-bilateral shoulder clearance with the startup hands,
+  closes both hands there, moves to the selected anchor, and captures only
+  anchor and excitation waypoints. It returns to bilateral clearance with
+  closed hands, restores the frozen measured Ready hand posture there, and
+  follows the exact reverse shoulder-clearance trajectories to Ready before
+  clean release. This retains the proven hand lifecycle from the previous
+  calibration workflow rather than substituting a canonical open posture.
+- Left and right excitation blocks are interleaved with the same repeated
+  bilateral anchor. Every accepted measurement still comes from one physical
+  image and state, with Ferguson's two observation aliases sharing the same
+  camera parameterization.
+- The solve remains a declared static camera/hand-target/joint-zero-offset
+  model. Pose-dependent residuals are diagnostics for a later study, not free
+  parameters in this calibration.
+- Command-free CUDA replay from the frozen post-reboot Ready snapshot accepted
+  the first `0.08 rad` shoulder-clearance candidate, certified 27 close-sweep
+  and 29 measured-Ready restoration samples, selected 9 left plus 9 right
+  excitations after bounded candidate reselection, and froze all 32 route
+  trajectories. The final left and right returns are byte-for-byte the command
+  samples from the frozen reverse preparation paths; no canonical-open field or
+  open action remains in either hardware artifact.
+
+## 2026-08-27 — Bilateral planner restored to the proven graph design
+
+- Removed the experimental select-first star planner and its bounded
+  candidate-reselection loop. It repeatedly required every statistically
+  selected excitation to connect directly to the anchor and constructed
+  trajectory optimizers before learning that the design was disconnected.
+- Anchor search now projects each arm candidate once instead of re-running
+  full FK/projection for every Cartesian left/right pair. Anchor sources must
+  pass the complete `0.005 rad` shoulder-clearance-to-candidate sweep under the
+  real closed-phase self-clearance policy before a bilateral pair is eligible.
+- One reusable two-arm CuRobo checker batch-validates a k-nearest joint-space
+  graph over the complete same-frame-visible pool. Statistical selection sees
+  only the component rooted at the immutable bilateral anchor. A second small
+  complete graph over the selected poses produces the shortest-valid-edge
+  execution tree, matching the structure of the previous automatic
+  AprilCube calibration planner.
+- The selected tree is pruned into short alternating left/right DFS blocks.
+  Tree ancestors and backtracks are explicit non-capturing preparation
+  occurrences; each selected excitation is captured exactly once and every
+  block returns to the repeated bilateral anchor.
+- Command-free replay of the retained 1,600-candidate smoke input certified 49
+  left and 10 right anchor-source sweeps, rooted 35 left and 22 right visible
+  poses, and connected all selected 9+9 poses. The final full route and
+  self-clearance certificate passed. Before DFS-order compaction it contained
+  80 transitions; deterministic tree-order replay reduces the same frozen
+  selected trees to 60 transitions. No ROS node, publisher, or hardware command
+  was created during these checks.
+
+## 2026-08-27 — Selected graph traversal replaces DFS backtracking
+
+- Kept the fixed bilateral anchor, connected-component selection, batched
+  CuRobo clearance checks, repeated-anchor blocks, and independent frozen-edge
+  replay unchanged.
+- The selected-pose collision pass now retains every certified edge and assigns
+  it the actual synchronous-motion cost: maximum moving-joint delta. It no
+  longer discards valid shortcuts after extracting a tree.
+- Each interleaved arm block is now a minimum-cost closed walk over that graph.
+  The route-search state records both the current pose and which block poses
+  have been visited, so it may use direct pose-to-pose or pose-to-anchor edges
+  and introduces a non-capturing intermediate pose only when the valid graph
+  requires one.
+- Every excitation remains captured exactly once, every block still returns to
+  the shared anchor before switching arms, and the final anchor-to-Ready
+  preparation envelope is unchanged.
+- Command-free GPU replay of the same retained 9+9 smoke design reduced the
+  frozen route from 60 to 35 transitions and its commanded duration from
+  `246.986 s` to `217.509 s` (29.477 s, 11.9%). All 18 excitation captures and
+  7 repeated-anchor captures remain, the independent edge replay passed, and
+  the combined self-clearance certificate passed. The worker explicitly
+  reported `commands_robot=false`.
+
+## 2026-08-27 — Graceful Q return is distinct from emergency Damp
+
+- The bilateral preview now binds lowercase `q` to a latched graceful finish.
+  It does not interrupt an active trajectory or relax any executor gate.
+- If `q` arrives during a capture, that attempt is recorded as `aborted` rather
+  than as a perception rejection. Further captures are skipped while the
+  already-frozen block edges continue to the next repeated bilateral anchor.
+- Every anchor is the same joint command. The execution-plan hash now binds the
+  final anchor-to-Ready transition IDs and all legal anchor occurrences. From
+  an earlier anchor, execution reuses the exact certified command samples,
+  changing only the first transition's occurrence label.
+- The graceful suffix returns the closed hands to bilateral shoulder clearance,
+  restores the frozen measured Ready hand posture, executes the frozen reverse
+  shoulder-clearance paths, reaches Ready, and performs a clean weight-zero
+  release. A stop before any accepted capture returns safely but leaves the
+  session unfinalized.
+- `Ctrl+C`, watchdog faults, stale state, tracking faults, and any failure of
+  the graceful return remain on the verified Damp path. The UI states the
+  distinction directly: `Q: FINISH SAFELY | CTRL+C: DAMP`.
+
+## 2026-08-27 — Ready binding removed from the reusable bilateral core
+
+- The preceding Ready-to-Ready artifact design was rejected because Regular/
+  Ready is not an exactly repeatable 29-joint command. Requiring a later run to
+  match one planning snapshot within `0.01 rad` made an otherwise reusable
+  calibration design brittle.
+- The expensive offline artifact is now only the closed-hand visual-anchor
+  core. Its first and last executor boundary are the identical bilateral
+  anchor. It contains no Ready waypoint, shoulder-clearance trajectory, hand
+  action, or measured-Ready hand posture.
+- Hardware now reuses the commissioned calibration lifecycle already present
+  in `hardware_calibration.py`. Before SPACE and before any publisher exists,
+  the isolated CuRobo worker plans a short reversible adapter from the current
+  measured Ready state: right shoulder clearance, left shoulder clearance,
+  right arm to the fixed anchor, then left arm to the fixed anchor. Only the
+  non-arm locked body joints are checked against the core reference, with the
+  explicit ownership-transition tolerance.
+- Both hands close and verify against the commissioned empty-close model at
+  bilateral shoulder clearance. After the reusable core, the exact adapter is
+  reversed to shoulder clearance, both hands are commanded to the commissioned
+  open posture, and the exact live preparation paths are reversed to the same
+  run's measured Ready state. The original measured hand posture is not
+  restored.
+- `q` now does the small thing it needs to do: stop capture at the next repeated
+  identical anchor. It does not splice an offline reference-Ready suffix. The
+  normal live adapter return then handles both early and complete runs.
+- The new request/plan pair is hash-bound and retained as
+  `adapter_request.json` and `adapter_plan.json` in the raw session evidence.
+  The adapter also records the observed locked-body mismatch and binds the
+  reusable execution-plan hash.
+- Verification after the refactor: `485 passed, 7 skipped` for the complete
+  command-free test suite and `34 passed` across the focused bilateral,
+  planning-contract, and hardware-calibration suites.
+
+
+## 2026-09-04 — Full standing bilateral collection prepared
+
+- User requested one full collection with no preceding pilot. The prepared
+  `work/bilateral_full_20260904` artifacts contain 34 excitation poses per arm
+  plus 11 repeated-anchor captures: 79 paired frames, 89 core transitions.
+  Planned arm motion totals 552.2 s; settling, capture and the live adapter add
+  time. The connected pool contains 615 left and 267 right candidates, and the
+  selected 25-parameter design has rank 25/25 and condition 59.91.
+- Fixed the planner's removed `maximum_route_reselections` argument access and
+  its stale success-summary provenance key. The real full operator CLI now
+  completes successfully and publishes the current schema-3 design/schema-5
+  execution pair.
+- The first full route exposed inconsistent clearance references: design
+  checks used shoulder clearance, final certification used the visual anchor.
+  Candidate and selected graphs now enforce the stricter requirement from both
+  references for every link pair. The final independent replay passed with
+  all existing clearance limits, tolerances and motion limits unchanged.
+- Failed plans now retain request/IK/route diagnostics and do not publish an
+  execution artifact. Regression coverage checks both successful publication
+  and failed-plan preservation, plus the per-pair reference combination.
+- Validation: 36 focused tests, lint, formatting and whitespace checks passed;
+  real full GPU planning and the collector's offline input validation passed.
+  No robot command was issued. Live standing Ready/camera/hand checks and the
+  reversible adapter still run before SPACE in the hardware collector.
+- Launch command and exact results:
+  `docs/full-bilateral-collection-2026-09-04.md`.
+  Execution hash:
+  `eac03211aceef0ec07b3c0fda0e569c8bdd6b494a04a984a92b6dee8f352d535`.
+
+
+## 2026-09-04 — Live calibration failures and lifecycle comparison
+
+- The first live adapter request rejected a 0.050132334 rad left-ankle-pitch
+  mismatch against the offline snapshot. This obsolete gate is removed. The
+  adapter and complete core replay use the current measured body geometry.
+- The second request repeatedly increased shoulder offset for invariant
+  internal right-hand contacts. The earlier selected-pair calibration policy
+  excluded these contacts, including during articulated finger sweeps. That
+  policy is restored through a shared model helper; external pairs remain.
+- The new return policy had also incorrectly opened the hands before reversing
+  shoulder paths certified with tightly closed hands. Independent replay found
+  29.571 mm modeled left-thumb/hip overlap on that actual open-hand return.
+  Return now restores the hash-bound measured starting fingers, and checks
+  both the return endpoint and complete shoulder paths with those fingers.
+- Both retained live snapshots now pass the first 0.08 rad candidate, both
+  finger sweeps, return arm certification, and all 89 frozen core transitions
+  under their live body states. No snapshot or core trajectory was altered.
+  Adapter requests are schema 2, with no old-body tolerance or open target.
+- 44 focused tests passed, 5 GPU-only tests skipped in the main environment;
+  both actual CuRobo replays passed in the planner environment. Lint and diff
+  checks passed. No hardware command or pilot collection was issued.
+- The broader audit found further omissions: isolated capture persistence,
+  loaded-state finger-sweep revalidation after shoulder motion, and preserving
+  executor faults during capture cleanup. Shoulder-roll/torso pair selection
+  and 5/10 mm clearance policies also differ from the old working collector.
+  These remain unresolved; a passing adapter does not make the collector ready.
+  See docs/calibration-lifecycle-audit-2026-09-04.md for evidence and status.
+
+
+## 2026-09-04 — Commissioned runtime reuse restored; full core recertified
+
+- User authorized fixing the remaining lifecycle omissions by reusing the
+  existing implementations. The bilateral collector now prewarms the existing
+  `IsolatedSessionStore` with a `BilateralSessionStore` factory before publishers.
+  Capture stays interlocked until durable commit while control health is polled.
+  Shared `finish_capture_or_raise_fault` preserves the original control fault.
+- The existing persistent planner handles both the live adapter and fresh
+  measured finger-sweep checks at loaded shoulder clearance. Both close and
+  restore require a bound passing 5 mm external-hand certificate and an
+  unchanged state before the existing posture controller is called. Return
+  restores this run's measured starting fingers; canonical-open is not used.
+- Calibration shares the tabletop same-hand and adjacent shoulder-roll/torso
+  exclusions. Both shoulder-yaw/torso pairs remain checked. The existing static
+  pair helper excludes invariant body/body pairs with locked legs/waist while
+  retaining both arm/hand subtrees and their cross-arm/body checks.
+- The working authored core required 10 mm; the earlier bilateral core used
+  5 mm with a close-reference exception. That difference is corrected. The
+  full core now requires strict 10 mm, with zero reference degradation. Ready
+  preparation retains its separate 5 mm/reference-bounded rule; finger sweeps
+  enforce 5 mm externally. CuRobo sphere geometry remains different from the
+  earlier G1Pilot overlay; these certificates report modeled clearances.
+- Reused the retained candidate IK, then reran connectivity, selection, route
+  generation, and independent certification. The replacement artifacts are in
+  `work/bilateral_full_20260904_reuse`: 34 excitation poses per arm, 11 repeated
+  anchors, 79 captures, 81 transitions; connected pool 756 left/626 right;
+  rank 25/25, condition 59.4054. Core arm motion is 570.923 s (9.5 minutes),
+  before settling, captures, retries, and adapter time. Minimum modeled core
+  gap is 10.587648 mm at left elbow/wrist yaw. No pilot collection was added.
+- The older `work/bilateral_full_20260904` plan is superseded. Hardware rejects
+  obsolete 5 mm cores during immutable-input checks before planner startup.
+  Original failed requests and archived IK/preparation evidence are untouched.
+- Both actual captured startup states pass the first 0.08 rad candidate,
+  both return shoulder checks, and all 81 new core transitions. Replay took
+  32.07 s and 31.10 s; live-body core gaps remain 10.588 mm. The first replay
+  retains the 0.050132334 rad ankle mismatch as a diagnostic, not a gate.
+  Offline close/restore sweeps through the real persistent worker passed with
+  20.959–22.439 mm external-hand gaps at nominal planned clearance. These are
+  not physical loaded measurements; hardware rechecks fresh measured states.
+- Final verification: 502 tests passed, 9 skipped in the main environment;
+  13 planner model tests passed. Lint, formatting, and whitespace checks passed.
+  No robot command or physical collection was issued during these fixes.
+- Current launch command: `docs/full-bilateral-collection-2026-09-04.md`.
+  Completed audit: `docs/calibration-lifecycle-audit-2026-09-04.md`.
+  Replay: `work/bilateral_plan_review_20260904/strict10_live_replay/summary.json`.
+  Execution hash:
+  `4f7f7b941c604d5b868793104c28075e579f57a7f83c455312f058ea274dfb15`.
+  Pose-design hash:
+  `7ce1384d6fafbd23c64c107a480d5d066238c8872d1182f25c0e658de8f81d87`.
+
+
+## 2026-09-04 — Reject fixed finger-limit errors before shoulder search
+
+- The next live startup (`20260905T005649Z`) measured
+  `left_hand_index_0_joint=-1.578415155 rad`, below the NVIDIA URDF lower
+  limit `-1.570796320 rad` by `0.007618835 rad` (0.4365 degrees). Both
+  commissioned close command/model targets were valid. The rejected target
+  was the exact measured starting posture requested for restoration.
+- This joint was within bounds in both previously replayed snapshots. The
+  original preflight allowed an out-of-limit measured start to recover inward
+  during close, but rejected that same reading as a return target only after
+  shoulder planning. The generic retry loop incorrectly increased shoulder
+  offsets for this invariant target failure. User interrupted; saved status
+  confirms no robot commands were sent.
+- Added named target checks using the existing `URDFModel.joint_limits` reader.
+  The collector retains the request and checks restoration before launching
+  CuRobo. Preparation checks close/return targets before any offset search;
+  loaded finger sweeps also check before CUDA. A dedicated fixed-target error
+  is never treated as a retryable shoulder-geometry rejection. Errors report
+  the phase, joint, exact target, and lower/upper limits.
+- User chose to adjust the hand physically after seeing the error instead of
+  introducing a clipped return target. Exact starting-posture restoration and
+  hard limits remain unchanged. Stop the collector, ease the indicated finger
+  away from its tightly closed endpoint, and restart the same command for a
+  fresh snapshot. No full core regeneration or pilot is needed.
+- Replayed this exact request through preparation: named rejection in 0.0036 s,
+  zero candidate attempts. Both earlier saved return targets still validate.
+  Evidence: `work/bilateral_plan_review_20260904/finger_limit_preflight_005649.json`.
+  Main suite: 505 passed, 9 skipped; lint and formatting passed. No robot motion
+  was commanded while diagnosing or fixing this issue.
+
+
+## 2026-09-04 — Live ownership-acquisition fault; comparison with working collector
+
+- Full run `20260905T010522Z` passed the live geometric preflight and created
+  motion publishers, then faulted before its first shoulder trajectory:
+  measured arm change 0.0526 rad against the 0.0500 rad acquisition allowance.
+  Captures are empty. Saved cleanup reports no cleanup errors.
+- User clarified the concern is expected measured-state variation, and asked
+  why earlier calibration runs did not show this error. Checked the earlier
+  prototype notes and `DualArmClearanceExecutor`: it has the same fresh-state
+  seeding and the same 0.05 rad test throughout acquisition. Current
+  `PoseExecutor.acquire` also seeds commands from a fresh observation, not the
+  old planning/SPACE reference. Both rebase their loaded hold monitor only
+  after the acquisition ramp completes.
+- Direct comparison confirms identical 80/3 shoulder-elbow gains, 40/1.5 wrist
+  gains, one-second acquisition ramp, 0.05 acquisition tolerance, locked-finger
+  gravity posture, and gravity URDF hash. Gravity implementation and arm
+  `send_command` are AST-equivalent between repos. This guard was not introduced
+  by the bilateral planner. Successful earlier acquisitions passed that guard;
+  their exact peak acquisition deviations were not found in retained artifacts.
+- Current manifest records only 0.000066959 rad difference between planning and
+  the post-SPACE state check. The reported 0.0526 rad occurred later, relative
+  to the fresh acquisition command, during takeover. It is not the historical
+  locked-body mismatch from the first planning failure. No evidence currently
+  identifies why takeover movement exceeded the threshold on this run.
+- The saved error lacked the failing joint, actual acquisition seed, measured
+  position, elapsed ramp time, and blend weight. Added those values to
+  acquisition faults and named per-joint reference/measurement to held-arm
+  faults. These diagnostics flow into the existing saved status error. No
+  limits, gains, reference rebasing, motion behavior, or watchdog rules changed.
+- Regression checks cover normal state change before acquisition, a fresh
+  zero-displacement command, allowed 0.04 rad takeover movement, and a named
+  0.0526 rad fault on either arm. 57 executor/driver tests passed.
+- Comparison evidence:
+  `work/bilateral_plan_review_20260904/acquisition_policy_comparison_010522.json`.
+  No robot commands were sent during this investigation. The live acquisition
+  cause is unresolved; the added diagnostics are not a demonstrated fix for it.
+
+
+## 2026-09-04 — Repeated right-elbow takeover fault; tabletop transport distinction
+
+- Diagnostic retry `20260905T011456Z` failed during initial acquisition before
+  any shoulder trajectory: right elbow seed 0.979770 rad, measured 1.031638 rad,
+  difference 0.051868 rad, elapsed 0.5317 s, last arm-SDK weight 0.5277,
+  state age 0.0007 s. The state was fresh and the command was still the fixed
+  measured acquisition hold. Another unchanged retry is not a diagnosis.
+- Recomputed right-elbow gravity feedforward at the retained preflight state:
+  -0.878098 Nm. This is a model calculation, not recorded motor torque or proof
+  of correct physical compensation. No complete acquisition command/state
+  time series was retained. No gains or thresholds were changed.
+- User asked why routine tabletop manipulation takes over without this problem.
+  Direct call-site comparison identifies a material difference that comparing
+  the common executor/gains alone misses: `hardware_tabletop.py` and
+  `hardware_stack.py` use `UnitreeDebugLowCmdTransport` in seated FSM 3. It
+  releases the motion service, holds the complete measured 29-joint body,
+  applies full configured arm PD gains immediately, and ramps only the local
+  arm gravity torque as `command.weight * tau_ff14`.
+- Standing bilateral calibration uses `UnitreeArmSDKTransport` in Ready FSM 4.
+  It retains the standing controller, writes arm-only commands to `rt/arm_sdk`,
+  sends gravity torque unscaled in the packet, and passes the changing ownership
+  weight in slot 29 to the robot. Actual robot-side blend internals are not
+  implemented in this repo. These are different handoff/control boundaries;
+  successful seated tabletop acquisition does not test this standing blend.
+- The earlier working standing calibration also uses `rt/arm_sdk`, so this
+  distinction does not explain why that earlier standing run stayed within the
+  guard while the current one exceeded it. The physical cause remains unproven.
+  Do not replace standing control with seated full-body lowcmd or relax the
+  acquisition guard based only on this comparison.
+- Evidence:
+  `work/bilateral_plan_review_20260904/takeover_transport_comparison_011456.json`.
+  This investigation was read-only apart from diagnostic documentation; no
+  robot command, control-setting change, or new collection was issued.
+
+
+## 2026-09-04 — Archived standing sessions and offline takeover command comparison
+
+- User correctly identified the earlier standing `arm_sdk` collector as the
+  relevant comparison. Checked its retained session artifacts explicitly,
+  including `dex3_auto_20260812T170649Z` and
+  `dex3_left_auto_20260812T182205Z` in the prototype repo. Their copied
+  `hardware.yaml` files confirm the same standing topic, 80/3 shoulder/elbow
+  gains, 40/1.5 wrist gains, 250 Hz command rate, one-second ownership ramp,
+  and 0.05 rad acquisition allowance. Their gravity provenance records
+  Pinocchio 2.7.0 and the same dual-Dex3 gravity URDF and locked fingers.
+- The archived left-arm session's initial right elbow was 0.980597 rad versus
+  0.979782 rad in the new preflight snapshot (0.979770 rad in the new actual
+  acquisition fault). Its first retained capture, after takeover/preparation
+  and six visual rejections, measured the held right elbow at
+  0.974749–0.974821 rad. This establishes earlier physical progress past
+  takeover; it does not provide that takeover's peak deviation.
+- These older runs were not entirely fault-free: the right-arm session later
+  stopped after 64 accepted captures on held-left-arm drift of 0.1022 rad;
+  the left-arm session later stopped after 41 accepted captures on held-right
+  drift of 0.1013 rad. Those later hold faults differ from the present initial
+  acquisition fault. Their runtime logs begin after clearance ownership was
+  already acquired, so they do not retain the initial command/state transient.
+- Executed the retained `DualArmClearanceExecutor` and current `PoseExecutor`
+  offline with identical synthetic state/time inputs, fake transports, actual
+  archived/current hardware settings, and real Pinocchio feedforward. Compared
+  every `ArmCommand` field exactly. Stationary and 0.04 rad movement cases each
+  produced 252 identical commands and reached READY. A synthetic 0.051868 rad
+  right-elbow change produced 134 identical commands and faulted both.
+- This comparison covers command generation under equal inputs, not DDS
+  delivery, live scheduling, firmware, or physical loading. Startup wrappers
+  do differ: the old collector creates the arm publisher before starting the
+  watchdog and maintains fingers in the wait loop; the new collector starts
+  the watchdog before creating the publisher and maintains fingers through
+  the control driver's heartbeat callback. No evidence yet attributes the
+  live elbow movement to either difference. The live cause remains unresolved.
+- Reproducible offline diagnostic and results:
+  `work/bilateral_plan_review_20260904/compare_standing_acquisition.py` and
+  `work/bilateral_plan_review_20260904/standing_acquisition_command_comparison.json`.
+  No control code, gains, limits, or physical collection changed in this check.
+
+
+## 2026-09-04 — Reuse existing rosbag recording for the next standing attempt
+
+- User requested reuse of the existing rosbag code. Removed the newly started
+  custom in-memory transport trace. Bilateral calibration now uses the same
+  `RawEpisodeRecorder`, external `ros2 bag record` process, plain MCAP, startup
+  subscription checks, shutdown, and metadata audit as tabletop manipulation.
+- Added a standing topic profile by reusing LowState and Dex3 topic contracts
+  and adding `/arm_sdk` (`unitree_hg/msg/LowCmd`). The six topics retain all
+  body positions/velocities/torque estimates, arm command positions/gains/torque
+  and slot-29 weight, and both hands' measured/commanded state. Camera images
+  continue through the existing calibration session capture path.
+- Recording starts after read-only planning, before SPACE or command publishers.
+  All six subscriptions must be ready. A process health check before publisher
+  creation detects recorder exit during the operator wait. Recording continues
+  through acquisition, the full collection, return, and control failure cleanup.
+  Bag/manifest/log/settings live in `work/<session>_collection/raw_episode`;
+  `status.json` includes the recorder's completion audit even if takeover fails.
+- The existing hardware launcher now loads/checks the same official Unitree
+  ROS message support and account-local MCAP plugin for bilateral calibration.
+  The full launch command, gains, ramp, tolerances, and finger behavior remain
+  unchanged. This collects missing evidence; the physical cause is not fixed.
+- Fixed the shared stage helper's failure cleanup: if acquisition or its wait
+  raises before the helper returns the driver, stop that driver locally, then
+  propagate the original error into the caller's existing watchdog cleanup.
+  Regression tests cover both acquisition/wait failures and Ctrl+C.
+- Real loopback-only DDS/MCAP check on domain 221 used native Unitree SDK
+  subscribers before creating any publishers. All six rosbag subscriptions
+  became ready; subsequent synthetic publication retained all 804 messages
+  (134 per topic). Deserializing the bag recovered the first weight-zero arm
+  command, the expected PD gains/feedforward, and the simulated final right
+  elbow at 1.031638 rad. No robot connection or robot motion was issued.
+  Script: `work/bilateral_plan_review_20260904/check_standing_rosbag.py`.
+  Bag: `work/bilateral_plan_review_20260904/standing_rosbag_loopback_1788572543716145748`.
+- Full main suite: 513 passed, 9 skipped. Lint, formatting, shell syntax, and
+  whitespace checks passed. No pilot collection added. MCAP timestamps are
+  laptop DDS receipt times; the bag does not acknowledge robot receipt or
+  directly instrument the controller thread.
+
+
+## 2026-09-04 — Bag identifies premature watchdog timeout; startup order corrected
+
+- Recorded retry `20260905T020319Z` failed at right elbow 0.980154 → 1.032177
+  rad, acquisition elapsed 0.5340 s, last weight 0.5300. Its MCAP finalized
+  without recording/cleanup errors: 52,358 messages over 19.265 s, including
+  135 arm commands. The bag now establishes the sequence that earlier status
+  errors alone could not show.
+- All outgoing arm positions, gains, velocity targets, and feedforward torques
+  were constant. Right elbow command: q=0.980153859 rad, dq=0, Kp=80, Kd=3,
+  tau=-0.919494927 Nm. Weight rose from zero to 0.530009866. Laptop DDS receipt
+  intervals were 3.984 ms median and 5.766 ms maximum. Elbow deviation remained
+  below 0.002349 rad through the first 0.44 s.
+- The decisive evidence precedes acquisition: both hands received three
+  zero-gain, zero-target timeout packets (mode 144–150) at about -0.109,
+  -0.098, and -0.087 s relative to the first arm command. These match the PC2
+  watchdog's `_Dex3TimeoutPublisher.timeout()` fallback. Normal measured hand
+  hold commands only began at -0.0043 s. Constructors do not send timeout
+  packets. At 0.460 s, summed absolute leg torque estimates collapsed from
+  roughly 46.26 to 6.84 Nm; both elbows then moved. The local elbow guard
+  tripped later, at 0.534 s. The reported arm fault follows premature safety
+  recovery; it is not evidence that a larger acquisition allowance is needed.
+- Root cause: both new standing collectors called `guard.start()` before
+  constructing `UnitreeArmSDKTransport` and `UnitreeDex3PostureController`.
+  The pinned SDK's `Channel.__Writer.Init` sleeps 0.2 s per publisher: one
+  arm plus two hands impose at least 0.6 s with no intervening heartbeat,
+  exceeding the configured 0.5 s deadline. PC2 starts its terminal recovery
+  after that deadline and cannot be rescued by subsequent PINGs. Its SSH
+  process can remain alive while the Damp RPC runs, allowing local acquisition
+  to start before the physical torque drop and secondary elbow error.
+- Earlier standing `collect-auto` constructed the publishers before starting
+  the watchdog. Restored that exact order in both current standing collectors.
+  All initialization still follows SPACE; watchdog arming still precedes the
+  first hand or arm command. No gains, ramp, thresholds, finger targets, or
+  watchdog timeout changed. No independent heartbeat thread was introduced.
+- Offline reproduction executes the actual startup statements from both
+  collectors, substituting only publisher boundaries with their 0.2 s SDK
+  initialization delays. It uses the actual watchdog agent and the existing
+  fake locomotion client, with no robot/network connection. Previous order:
+  `WATCHDOG_DAMPING heartbeat_timeout | heartbeat_count=1 last_gap_s=0.500164`.
+  Corrected bilateral and single-arm orders both completed initialization,
+  survived one second of heartbeats, and cleanly disarmed without damping.
+- Evidence directory: `work/bilateral_plan_review_20260904/takeover_020319`:
+  `signals.npz`, `bag_findings.json`, `takeover_timeline.png`/`.svg`, and
+  `watchdog_startup_order.json`. Reproduction script:
+  `work/bilateral_plan_review_20260904/check_watchdog_startup_order.py`.
+  Original bag and session artifacts were not modified.
+- Full suite: 513 passed, 9 skipped; lint, formatting, and whitespace passed.
+  The fix has not yet been physically exercised. The same full collection
+  command now uses corrected startup order and retains the rosbag; no pilot.
+- Historical cross-check requested by the user: the prototype repo's
+  `docs/g1_control_state_and_recovery.md` (2026-08-10 seated commissioning)
+  already documents this same startup-order failure. Its third zero-motion
+  run had a 0.922032 s heartbeat-send gap during local DDS initialization,
+  exceeding the 0.5 s lease. The recorded correction was to initialize every
+  non-commanding local DDS endpoint before arming PC2; the fourth run passed
+  with a 0.104117 s maximum ping gap. Current `hardware_tabletop.py` retains
+  that order. The standing fix restores an existing tabletop lesson as well
+  as the older standing collector's order. Tabletop's separate keepalive
+  covering MotionSwitcher release through the first lowcmd write remains
+  unchanged; watchdog arming still precedes control takeover.
+
+## 2026-09-04 — Reuse the stack's command-bound planning boundary
+
+- Retry `20260905T022735Z` recorded 256 arm packets and reached weight 1.0.
+  Every arm target remained constant. Before the first shoulder move, the
+  frozen preflight start differed from the acquired command by
+  0.000227704644 rad at right wrist roll, producing the reported trajectory
+  start error. The MCAP completed without cleanup errors.
+- User correctly identified this as a previously solved issue. The August 21
+  stack notes explicitly document the same exception and correction: plan
+  from both exact held commands, retaining measured body geometry, and
+  preserve those commands at installation. The older standing clearance
+  executor also started from its acquired command rather than requiring
+  preflight measurements to remain exactly identical.
+- The bilateral collector now imports `_command_bound_snapshot` and
+  `_install_plan_at_current_boundary` directly from `hardware_stack.py`.
+  Initial acquisition uses an empty pose set, then the existing persistent
+  planner refreshes the reversible adapter from the owned command. Its
+  existing live-body replay checks all 81 unchanged core transitions.
+  The installed command remains unchanged; the 1e-9 trajectory continuity
+  requirement, collision policies, gains, and ownership guards are unchanged.
+- The returned finger target is the actual measured-hold acquisition posture.
+  Preflight adapter files remain in work/; owned adapter files are separate.
+  Session creation now follows owned-plan validation and runs in the existing
+  prewarmed `IsolatedSessionStore`, with control health polling. The session's
+  immutable source artifacts bind the actual installed adapter. This change
+  is in the active bilateral collector; the unused single-arm collector has
+  not been migrated to this owned-adapter workflow.
+- Six focused cases use the real executor and stack installation helper:
+  recorded start mismatch, loaded measured/command offsets in both arms,
+  planner rejection, stale request binding, changed anchor, changed first
+  command, and drift during planning. Invalid results leave the command and
+  installed plan unchanged. Existing isolated bilateral persistence/replay
+  coverage now includes session creation in the worker process.
+- Full suite: 519 passed, 9 skipped. Lint, formatting, whitespace passed.
+  A real CuRobo controlled comparison retained recorded arm commands and
+  preflight body geometry: the adapter passed at 0.08 rad, all 81 core
+  transitions passed at 10.587642 mm minimum clearance, and the first shoulder
+  move completed through the in-memory transport. Start error was 8.67e-19 rad
+  and the opposite arm command was unchanged. Planner time was 31.75 s.
+- The actual recorded full-ownership body is a separate unresolved readiness
+  issue: waist roll/pitch differ from preflight by -0.022845/-0.020534 rad
+  around 1.003 s into acquisition, before the later cleanup. The checker finds
+  left index-1/left hip-roll clearance of -1.41 mm with measured arm positions
+  and -2.15 mm with held commands, compared with +2.60 mm at preflight.
+  The operator answered that they did not know which movement/contact occurred
+  and thought it should not be a problem. Do not record this as confirmed
+  physical contact. Do not describe the controlled preflight-body comparison
+  as a passing replay of the loaded body, or remove a collision check to make
+  that replay pass. Physical collection with the new boundary remains unrun.
+- Evidence: `work/bilateral_plan_review_20260904/takeover_022735/`, including
+  `signals.npz`, `start_mismatch.json`, `owned_boundary.json`,
+  `loaded_clearance_comparison.json`, and `owned_replay_preflight_body/`.
+  Scripts: `replay_owned_adapter_022735.py` and
+  `check_loaded_clearance_022735.py` in the parent review directory. No robot
+  command was sent during these checks.
+
+## 2026-09-04 — Preserve the current pipeline before replacing its runtime
+
+- Retry `20260905T025123Z` failed during the first 40 ms of acquisition:
+  right elbow 1.003978 -> 0.948456 rad; last blend weight 0.0351. The bag
+  retained 11 constant-position arm packets. Dex3 timeout packets started
+  about 0.498 s after the first arm packet, so this is not the earlier
+  watchdog-before-publisher initialization failure. The rapid physical
+  response is not yet explained.
+- Initial waist pitch was about -0.22187 rad (-12.7 degrees), compared with
+  -0.00727 rad (-0.4 degrees) at the preceding run. Right-elbow feedforward
+  was about -1.45155 Nm versus -0.79210 Nm. These are measured/model-input
+  differences, not proof that feedforward caused the transient. Read-only
+  extraction is retained in
+  `work/bilateral_plan_review_20260904/takeover_025123/signals.npz`.
+- User requested a calibration-pipeline rewrite, then explicitly requested
+  committing the current work first. Backward compatibility is not required:
+  the new bilateral calibration plan is the only calibration workflow to
+  support. Reuse the existing control, handoff, recording, and validation
+  implementations; remove duplicated calibration lifecycle orchestration.
+- This checkpoint retains the existing code and diagnostics with known
+  unresolved hardware readiness. The latest offline suite remains
+  519 passed, 9 skipped; no robot command was issued during the investigation
+  or checkpoint preparation.

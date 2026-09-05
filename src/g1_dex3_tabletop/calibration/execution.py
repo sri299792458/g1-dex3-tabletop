@@ -14,7 +14,7 @@ from typing import Any, Literal, Protocol
 import numpy as np
 
 from g1_aprilcube_calibration.executor_state_machine import ExecutorState
-from g1_aprilcube_calibration.joint_map import arm_indices
+from g1_aprilcube_calibration.joint_map import G1_29_JOINT_NAMES, arm_indices
 from g1_aprilcube_calibration.models import utc_now_iso
 from g1_aprilcube_calibration.pose_schema import (
     HANDOFF_POSE_ID,
@@ -22,8 +22,14 @@ from g1_aprilcube_calibration.pose_schema import (
     PoseRecord,
     PoseSet,
 )
-from g1_aprilcube_calibration.session_runner import RecoverableCaptureError
-from g1_dex3_tabletop.calibration.capture import BilateralFrameEvidence
+from g1_aprilcube_calibration.session_runner import (
+    RecoverableCaptureError,
+    finish_capture_or_raise_fault,
+)
+from g1_dex3_tabletop.calibration.capture import (
+    BilateralFrameEvidence,
+    BilateralGracefulStopRequested,
+)
 from g1_dex3_tabletop.calibration.design import BilateralPoseDesignArtifact
 from g1_dex3_tabletop.planning.contracts import PlannedTrajectory, atomic_write_json
 
@@ -82,35 +88,62 @@ class BilateralPlannedTransition:
 
 @dataclass(frozen=True, slots=True)
 class BilateralExecutionPlan:
-    """Exact per-arm trajectories bound to one frozen bilateral pose design."""
+    """Exact closed-hand trajectories bound to one reusable bilateral core."""
 
     pose_design_sha256: str
     robot_model: str
     urdf_sha256: str
-    dex3_joint_positions_rad: dict[str, tuple[float, ...]]
+    joint_position_offsets_rad: dict[str, float]
+    commanded_dex3_joint_positions_rad: dict[str, tuple[float, ...]]
+    modeled_dex3_joint_positions_rad: dict[str, tuple[float, ...]]
+    self_clearance_certificate: dict[str, Any]
     transitions: tuple[BilateralPlannedTransition, ...]
     planner_provenance: dict[str, Any]
-    schema_version: int = 1
+    schema_version: int = 5
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 5:
             raise ValueError("unsupported bilateral execution-plan schema version")
         for name in ("pose_design_sha256", "urdf_sha256"):
             if not _SHA256_PATTERN.fullmatch(getattr(self, name)):
                 raise ValueError(f"{name} must be lowercase SHA-256")
         if not self.robot_model.strip():
             raise ValueError("bilateral execution-plan robot model must be non-empty")
-        if set(self.dex3_joint_positions_rad) != set(_SIDES):
-            raise ValueError("bilateral execution plan must bind both Dex3 postures")
-        dex3: dict[str, tuple[float, ...]] = {}
-        for side in _SIDES:
-            values = np.asarray(
-                self.dex3_joint_positions_rad[side],
-                dtype=np.float64,
-            ).reshape(-1)
-            if values.shape != (7,) or not np.all(np.isfinite(values)):
-                raise ValueError(f"bilateral {side} Dex3 posture must contain seven values")
-            dex3[side] = tuple(float(value) for value in values)
+        offsets = {
+            str(name): float(value) for name, value in self.joint_position_offsets_rad.items()
+        }
+        if any(
+            name not in G1_29_JOINT_NAMES or not np.isfinite(value)
+            for name, value in offsets.items()
+        ):
+            raise ValueError("bilateral execution-plan joint offsets are invalid")
+        dex3_postures: dict[str, dict[str, tuple[float, ...]]] = {}
+        for field in (
+            "commanded_dex3_joint_positions_rad",
+            "modeled_dex3_joint_positions_rad",
+        ):
+            source = getattr(self, field)
+            if set(source) != set(_SIDES):
+                raise ValueError(f"bilateral execution plan {field} must bind both hands")
+            mapped: dict[str, tuple[float, ...]] = {}
+            for side in _SIDES:
+                values = np.asarray(source[side], dtype=np.float64).reshape(-1)
+                if values.shape != (7,) or not np.all(np.isfinite(values)):
+                    raise ValueError(f"bilateral {side} Dex3 posture must contain seven values")
+                mapped[side] = tuple(float(value) for value in values)
+            dex3_postures[field] = mapped
+        clearance = json.loads(
+            json.dumps(self.self_clearance_certificate, sort_keys=True, allow_nan=False)
+        )
+        if (
+            not isinstance(clearance, dict)
+            or clearance.get("passed") is not True
+            or float(clearance.get("hard_clearance_m", 0.0)) <= 0.0
+            or float(clearance.get("minimum_clearance_m", -1.0)) < -1.0e-6
+            or float(clearance.get("minimum_margin_to_required_clearance_m", -1.0)) < -1.0e-6
+            or not clearance.get("phases")
+        ):
+            raise ValueError("bilateral execution plan lacks a passing self-clearance certificate")
         transitions = tuple(
             item
             if isinstance(item, BilateralPlannedTransition)
@@ -128,7 +161,10 @@ class BilateralExecutionPlan:
         if not isinstance(provenance, dict) or not provenance:
             raise ValueError("bilateral execution-plan provenance must be non-empty")
         object.__setattr__(self, "transitions", transitions)
-        object.__setattr__(self, "dex3_joint_positions_rad", dex3)
+        object.__setattr__(self, "joint_position_offsets_rad", dict(sorted(offsets.items())))
+        for field, posture in dex3_postures.items():
+            object.__setattr__(self, field, posture)
+        object.__setattr__(self, "self_clearance_certificate", clearance)
         object.__setattr__(self, "planner_provenance", provenance)
 
     @property
@@ -186,6 +222,21 @@ class BilateralExecutionPlan:
                     f"bilateral trajectory endpoints differ from the pose design: "
                     f"{transition.transition_id}"
                 )
+        anchor_indices = [
+            index
+            for index, waypoint in enumerate(design.schedule)
+            if waypoint.capture_role == "anchor"
+        ]
+        graceful = self.planner_provenance.get("graceful_return")
+        expected_graceful = {
+            "policy": "latch_at_any_capture_then_stop_at_next_identical_anchor",
+            "anchor_occurrence_ids": [
+                design.schedule[index].occurrence_id for index in anchor_indices
+            ],
+            "terminal_boundary": HANDOFF_POSE_ID,
+        }
+        if graceful != expected_graceful:
+            raise ValueError("bilateral execution plan lacks its hash-bound graceful return")
 
     def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
         result = {
@@ -193,9 +244,14 @@ class BilateralExecutionPlan:
             "pose_design_sha256": self.pose_design_sha256,
             "robot_model": self.robot_model,
             "urdf_sha256": self.urdf_sha256,
-            "dex3_joint_positions_rad": {
-                side: list(self.dex3_joint_positions_rad[side]) for side in _SIDES
+            "joint_position_offsets_rad": self.joint_position_offsets_rad,
+            "commanded_dex3_joint_positions_rad": {
+                side: list(self.commanded_dex3_joint_positions_rad[side]) for side in _SIDES
             },
+            "modeled_dex3_joint_positions_rad": {
+                side: list(self.modeled_dex3_joint_positions_rad[side]) for side in _SIDES
+            },
+            "self_clearance_certificate": self.self_clearance_certificate,
             "transitions": [item.to_dict() for item in self.transitions],
             "planner_provenance": self.planner_provenance,
         }
@@ -210,21 +266,31 @@ class BilateralExecutionPlan:
             "pose_design_sha256",
             "robot_model",
             "urdf_sha256",
-            "dex3_joint_positions_rad",
+            "joint_position_offsets_rad",
+            "commanded_dex3_joint_positions_rad",
+            "modeled_dex3_joint_positions_rad",
+            "self_clearance_certificate",
             "transitions",
             "planner_provenance",
             "content_sha256",
         }
         if set(data) != expected:
-            raise ValueError("bilateral execution-plan fields differ from schema version 1")
+            raise ValueError("bilateral execution-plan fields differ from schema version 5")
         result = cls(
             schema_version=int(data["schema_version"]),
             pose_design_sha256=data["pose_design_sha256"],
             robot_model=data["robot_model"],
             urdf_sha256=data["urdf_sha256"],
-            dex3_joint_positions_rad={
-                side: tuple(values) for side, values in data["dex3_joint_positions_rad"].items()
+            joint_position_offsets_rad=dict(data["joint_position_offsets_rad"]),
+            commanded_dex3_joint_positions_rad={
+                side: tuple(values)
+                for side, values in data["commanded_dex3_joint_positions_rad"].items()
             },
+            modeled_dex3_joint_positions_rad={
+                side: tuple(values)
+                for side, values in data["modeled_dex3_joint_positions_rad"].items()
+            },
+            self_clearance_certificate=dict(data["self_clearance_certificate"]),
             transitions=tuple(
                 BilateralPlannedTransition.from_dict(item) for item in data["transitions"]
             ),
@@ -290,6 +356,7 @@ def pose_sets_from_bilateral_plan(
 
 class BilateralExecutor(Protocol):
     state: ExecutorState
+    fault_reason: str | None
     current_pose_id: str | None
     approved_validation_report_sha256: str
     pose_set: PoseSet
@@ -324,8 +391,12 @@ class BilateralBurstSource(Protocol):
 @dataclass(frozen=True, slots=True)
 class BilateralCollectionResult:
     accepted_count: int
+    rejected_count: int
     retry_count: int
     attempted_count: int
+    stopped_early: bool = False
+    return_anchor_occurrence_id: str | None = None
+    session_finalized: bool = True
 
 
 class BilateralCollectionOrchestrator:
@@ -341,7 +412,8 @@ class BilateralCollectionOrchestrator:
         store: BilateralCaptureStore,
         frame_source: BilateralBurstSource,
         wait_until_ready: Callable[[], None],
-        maximum_capture_attempts: int = 3,
+        graceful_stop_requested: Callable[[], bool] | None = None,
+        maximum_capture_attempts: int = 2,
         report_progress: Callable[[str, int, int], None] | None = None,
     ) -> None:
         plan.validate_design(design)
@@ -358,6 +430,7 @@ class BilateralCollectionOrchestrator:
         self.store = store
         self.frame_source = frame_source
         self.wait_until_ready = wait_until_ready
+        self.graceful_stop_requested = graceful_stop_requested or (lambda: False)
         self.maximum_capture_attempts = maximum_capture_attempts
         self.report_progress = report_progress or (lambda _message, _accepted, _retries: None)
 
@@ -368,41 +441,98 @@ class BilateralCollectionOrchestrator:
         ):
             raise RuntimeError("bilateral control is not ready at the handoff")
         accepted = 0
+        rejected = 0
         retries = 0
         attempts = 0
+        stopping = False
+        return_anchor_occurrence_id: str | None = None
         for waypoint_index, waypoint in enumerate(self.design.schedule):
-            captured, used_attempts = self._capture_waypoint(
-                waypoint_index=waypoint_index,
-            )
-            attempts += used_attempts
-            retries += used_attempts - 1
-            if not captured:
-                raise RuntimeError(
-                    f"bilateral capture exhausted retries at {waypoint.occurrence_id}"
+            stopping = stopping or self.graceful_stop_requested()
+            if stopping and waypoint.capture_role == "anchor":
+                return_anchor_occurrence_id = waypoint.occurrence_id
+                self.report_progress(
+                    f"graceful stop reached {waypoint.occurrence_id}",
+                    accepted,
+                    retries,
                 )
-            accepted += 1
-            self.report_progress(
-                f"accepted {waypoint.occurrence_id}",
-                accepted,
-                retries,
-            )
+                break
+            if waypoint.capturable and not stopping:
+                outcome, used_attempts = self._capture_waypoint(
+                    waypoint_index=waypoint_index,
+                )
+                attempts += used_attempts
+                retries += used_attempts - 1
+                if outcome == "stopped":
+                    stopping = True
+                    self.report_progress(
+                        f"graceful stop requested at {waypoint.occurrence_id}; "
+                        "returning at the next anchor",
+                        accepted,
+                        retries,
+                    )
+                elif outcome == "rejected":
+                    rejected += 1
+                    self.report_progress(
+                        f"rejected {waypoint.occurrence_id}; continuing frozen route",
+                        accepted,
+                        retries,
+                    )
+                else:
+                    accepted += 1
+                    self.report_progress(
+                        f"accepted {waypoint.occurrence_id}",
+                        accepted,
+                        retries,
+                    )
+                stopping = stopping or self.graceful_stop_requested()
+                if stopping and waypoint.capture_role == "anchor":
+                    return_anchor_occurrence_id = waypoint.occurrence_id
+                    self.report_progress(
+                        f"graceful stop reached {waypoint.occurrence_id}",
+                        accepted,
+                        retries,
+                    )
+                    break
             if waypoint_index == len(self.design.schedule) - 1:
                 break
             transition = self.plan.transitions[waypoint_index]
-            self._activate_arm(transition.arm)
-            self.executor.start_trajectory(
-                from_pose_id=transition.trajectory.from_pose_id,
-                to_pose_id=transition.trajectory.to_pose_id,
-                sample_time_s=transition.trajectory.sample_time_s,
-                command_q_rad=transition.trajectory.command_q_rad,
-                plan_sha256=self.plan.content_sha256,
-                operator_confirmed=True,
-            )
-            self.wait_until_ready()
-        if self.executor.current_pose_id != HANDOFF_POSE_ID:
-            raise RuntimeError("bilateral route did not terminate at the handoff")
-        self.store.finalize()
-        return BilateralCollectionResult(accepted, retries, attempts)
+            self._execute_transition(transition)
+        if return_anchor_occurrence_id is None:
+            if self.executor.current_pose_id != HANDOFF_POSE_ID:
+                raise RuntimeError("bilateral route did not terminate at the anchor handoff")
+        elif self.executor.current_pose_id != return_anchor_occurrence_id:
+            raise RuntimeError("bilateral graceful stop did not terminate at its repeated anchor")
+        session_finalized = accepted > 0
+        if session_finalized:
+            self.store.finalize()
+        return BilateralCollectionResult(
+            accepted,
+            rejected,
+            retries,
+            attempts,
+            stopped_early=return_anchor_occurrence_id is not None,
+            return_anchor_occurrence_id=return_anchor_occurrence_id,
+            session_finalized=session_finalized,
+        )
+
+    def _execute_transition(
+        self,
+        transition: BilateralPlannedTransition,
+        *,
+        from_pose_id: str | None = None,
+    ) -> None:
+        self._activate_arm(transition.arm)
+        self.executor.start_trajectory(
+            from_pose_id=(
+                transition.trajectory.from_pose_id if from_pose_id is None else from_pose_id
+            ),
+            to_pose_id=transition.trajectory.to_pose_id,
+            sample_time_s=transition.trajectory.sample_time_s,
+            command_q_rad=transition.trajectory.command_q_rad,
+            plan_sha256=self.plan.content_sha256,
+            operator_confirmed=True,
+        )
+        self.wait_until_ready()
 
     def _activate_arm(self, side: str) -> None:
         if self.executor.pose_set.calibration_arm == side:
@@ -418,7 +548,11 @@ class BilateralCollectionOrchestrator:
             boundary_pose_id=boundary,
         )
 
-    def _capture_waypoint(self, *, waypoint_index: int) -> tuple[bool, int]:
+    def _capture_waypoint(
+        self,
+        *,
+        waypoint_index: int,
+    ) -> tuple[Literal["accepted", "rejected", "stopped"], int]:
         waypoint = self.design.schedule[waypoint_index]
         for attempt_index in range(1, self.maximum_capture_attempts + 1):
             capture_id = f"capture_{waypoint_index:03d}_attempt_{attempt_index:02d}"
@@ -429,35 +563,41 @@ class BilateralCollectionOrchestrator:
                     capture_id=capture_id,
                     remember_signatures=True,
                 )
+            except BilateralGracefulStopRequested as error:
+                outcome, reason, frames = "aborted", str(error), ()
             except RecoverableCaptureError as error:
-                self.executor.finish_capture(outcome=f"retry: {error}")
-                final = attempt_index == self.maximum_capture_attempts
-                self.store.append_capture(
-                    capture_id=capture_id,
-                    pose_group_id=waypoint.candidate_id,
-                    capture_role=waypoint.capture_role,
-                    outcome="rejected" if final else "retry",
-                    reason=str(error),
-                    metadata={
-                        "occurrence_id": waypoint.occurrence_id,
-                        "attempt_index": attempt_index,
-                    },
+                outcome = "rejected" if attempt_index == self.maximum_capture_attempts else "retry"
+                reason, frames = str(error), ()
+            except Exception as error:
+                finish_capture_or_raise_fault(
+                    self.executor, outcome="bilateral burst failed", cause=error
                 )
-                if final:
-                    return False, attempt_index
+                raise
             else:
-                self.executor.finish_capture(outcome="accepted bilateral burst")
+                outcome, reason = "accepted", "both targets passed the stationary burst"
+            try:
+                # Keep the stationary capture interlock until the durable write
+                # finishes, as in the commissioned single-arm capture runner.
                 self.store.append_capture(
                     capture_id=capture_id,
                     pose_group_id=waypoint.candidate_id,
                     capture_role=waypoint.capture_role,
-                    outcome="accepted",
-                    reason="both targets passed the stationary burst",
+                    outcome=outcome,
+                    reason=reason,
                     frames=frames,
                     metadata={
                         "occurrence_id": waypoint.occurrence_id,
                         "attempt_index": attempt_index,
                     },
                 )
-                return True, attempt_index
+            except Exception as error:
+                finish_capture_or_raise_fault(
+                    self.executor, outcome="bilateral capture write failed", cause=error
+                )
+                raise
+            finish_capture_or_raise_fault(self.executor, outcome=outcome)
+            if outcome == "aborted":
+                return "stopped", attempt_index
+            if outcome in {"accepted", "rejected"}:
+                return outcome, attempt_index
         raise AssertionError("bilateral capture retry loop terminated unexpectedly")

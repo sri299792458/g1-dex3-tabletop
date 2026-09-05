@@ -140,25 +140,31 @@ to the repository default. It never rewrites the base URDF.
 
 ### Same-frame bilateral calibration pilot
 
-The replacement calibration route is planned completely offline from an exact
-stationary, shoulder-cleared snapshot with both Dex3 marker plates already at
-the commissioned middle-close posture:
+The expensive calibration core is planned once from a stationary reference
+snapshot. No manually prepared bilateral anchor or pre-closed hand posture is
+required:
 
 ```bash
 ./tools/g1_tabletop.sh plan-bilateral-calibration \
-  --snapshot /absolute/path/to/prepared_snapshot.json \
+  --snapshot /absolute/path/to/ready_snapshot.json \
   --output-directory /absolute/path/to/bilateral_plan
 ```
 
-This command does not create ROS nodes or publishers. It performs bilateral
-collision-aware IK, full-model information selection, handoff-connectivity
-reselection, and complete CuRobo edge certification. It emits mutually
-hash-bound `pose_design.json` and `execution_plan.json` plus all intermediate
-planning evidence. The execution plan includes the exact Dex3 joint posture
-used for collision checking.
+This command does not create ROS nodes or publishers. The reference snapshot
+is used to choose a compact closed-hand configuration where both hand markers are
+visible. Before statistical selection, it batch-checks a joint-space graph over
+the complete same-frame-visible candidate pool and retains only the component
+rooted at that fixed anchor. A complete selected-pose valid-edge graph supplies
+minimum-motion-cost anchor tours for the interleaved blocks and repeated
+anchors; there is no candidate-reselection loop or per-capture trajectory
+optimizer. The emitted route starts and ends at the identical visual anchor;
+it contains no Ready pose, shoulder preparation, or hand action. It
+emits mutually hash-bound `pose_design.json` and `execution_plan.json` plus all
+intermediate planning evidence. The execution plan binds the fixed full-close
+commands, commissioned empty-close geometry, joint offsets, and a passing
+closed-core self-clearance certificate.
 
-After inspecting those artifacts, the separate hardware collector consumes
-them without doing any online planning:
+After inspecting those artifacts, the separate hardware collector reuses them:
 
 ```bash
 ./tools/g1_tabletop_hardware.sh collect-bilateral-calibration \
@@ -168,7 +174,16 @@ them without doing any online planning:
   --confirm 'I CONFIRM THE G1 IS SECURED BY THE LOAD-BEARING HARNESS AND THE WORKSPACE IS CLEAR'
 ```
 
-Every accepted frame must contain both hand targets. This remains a pilot path;
+Before SPACE, an isolated CuRobo worker plans only a short reversible adapter
+from that run's measured Ready state through shoulder clearance to the fixed
+anchor. The collector then reaches shoulder clearance, closes and verifies both
+hands, follows the adapter to the anchor, and executes the reusable core. On
+return it reverses the adapter, commands the commissioned open posture at
+bilateral clearance, and reverses the run-specific shoulder paths to the same
+measured Ready state before releasing ownership. In the preview window, `q`
+latches a graceful stop: capture ends at the next repeated anchor and the same
+run-specific adapter performs the safe return.
+`Ctrl+C` remains the emergency Damp path. This remains a pilot path;
 the deployed bundle and the older single-arm command stay available until the
 new data passes the replay, observability, hardware, and later-day gates in
 [`docs/calibration-redesign.md`](docs/calibration-redesign.md).

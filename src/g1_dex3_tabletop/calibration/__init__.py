@@ -7,6 +7,7 @@ from g1_dex3_tabletop.calibration.anchors import (
 from g1_dex3_tabletop.calibration.bundle import write_bilateral_calibration_bundle
 from g1_dex3_tabletop.calibration.capture import (
     BilateralFrameEvidence,
+    BilateralGracefulStopRequested,
     BilateralLiveBurstSource,
     select_bilateral_medoid,
 )
@@ -24,6 +25,7 @@ from g1_dex3_tabletop.calibration.design import (
     BilateralDesignStep,
     BilateralPoseDesignArtifact,
     build_repeated_anchor_schedule,
+    build_valid_graph_route_schedule,
     linearize_design_candidate,
     select_bilateral_design,
 )
@@ -57,7 +59,6 @@ from g1_dex3_tabletop.calibration.planning import (
     BilateralRoutePlanningResult,
     BilateralVisibilityConfig,
     assemble_bilateral_planning_artifacts,
-    build_bilateral_route_request,
 )
 from g1_dex3_tabletop.calibration.projection import (
     BilateralCalibrationProjection,
@@ -121,6 +122,7 @@ __all__ = [
     "BilateralFergusonRecord",
     "BilateralFoldValidation",
     "BilateralFrameEvidence",
+    "BilateralGracefulStopRequested",
     "BilateralIKResult",
     "BilateralLiveBurstSource",
     "BilateralModelSpec",
@@ -145,8 +147,8 @@ __all__ = [
     "add_measured_color_frames",
     "assemble_bilateral_planning_artifacts",
     "build_bilateral_optimizer_config",
-    "build_bilateral_route_request",
     "build_repeated_anchor_schedule",
+    "build_valid_graph_route_schedule",
     "evaluate_bilateral_anchor_drift",
     "evaluate_bilateral_solution",
     "export_bilateral_solver_inputs",

@@ -88,6 +88,7 @@ from g1_dex3_tabletop.planning.contracts import (
     Dex3PreparationRequest,
     PlannedTrajectory,
     RobotSnapshot,
+    atomic_write_json,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -227,18 +228,27 @@ def _stage_executor(
         rate_hz=rate_hz,
         safety_heartbeat=heartbeat,
     )
-    if acquire:
-        driver.start()
-        synchronized.acquire(operator_confirmed=True)
-    else:
-        synchronized.adopt_owned_control(previous_command_q14=q14)
-        driver.start()
-    _wait_ready(
-        synchronized,
-        driver,
-        timeout_s=control_config.acquisition_ramp_s + 5.0,
-        label=f"{arm} ownership stage",
-    )
+    try:
+        if acquire:
+            driver.start()
+            synchronized.acquire(operator_confirmed=True)
+        else:
+            synchronized.adopt_owned_control(previous_command_q14=q14)
+            driver.start()
+        _wait_ready(
+            synchronized,
+            driver,
+            timeout_s=control_config.acquisition_ramp_s + 5.0,
+            label=f"{arm} ownership stage",
+        )
+    except BaseException as error:
+        # The caller has not received this driver yet. Stop it before the
+        # caller's existing watchdog/Damp cleanup handles the original failure.
+        try:
+            driver.close()
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
+        raise
     return synchronized, driver
 
 
@@ -263,6 +273,87 @@ def _execute_stage(
         driver,
         timeout_s=max(timeout_s, trajectory.sample_time_s[-1] + 5.0),
         label=trajectory.to_pose_id,
+    )
+
+
+def _command_validated_finger_posture(
+    *,
+    synchronized,
+    driver,
+    controller,
+    planner,
+    joint_position_offsets_rad,
+    left_target_q_rad,
+    right_target_q_rad,
+    left_acceptance_q_rad,
+    right_acceptance_q_rad,
+    body_tolerance_rad: float,
+    hand_tolerance_rad: float,
+    artifact_directory: Path,
+    phase: str,
+    label: str,
+):
+    """Recheck measured loaded geometry while the commissioned driver holds.
+
+    Uses the same finger validator as preflight through the existing persistent
+    worker/control-health polling client. Only a successful bound result may
+    reach the existing Dex3 posture controller.
+    """
+
+    driver.check()
+    snapshot = _snapshot(synchronized.observe_state(), _wait_for_hands(controller.observer))
+    request = Dex3PreparationRequest(
+        snapshot=snapshot,
+        joint_position_offsets_rad=joint_position_offsets_rad,
+        left_target_q_rad=tuple(left_target_q_rad),
+        right_target_q_rad=tuple(right_target_q_rad),
+    )
+    request.write_json(artifact_directory / f"{phase}_request.json")
+    event = planner.request_payload(
+        "validate-dex3-finger-sweep",
+        payload=request.to_dict(),
+        control_check=driver.check,
+        timeout_s=180.0,
+    )
+    result = event["payload"]
+    atomic_write_json(artifact_directory / f"{phase}_result.json", result)
+    if (
+        result.get("request_sha256") != request.content_sha256
+        or result.get("passed") is not True
+        or result.get("operation") != "validate_dex3_finger_sweep"
+        or not np.isfinite(float(result.get("minimum_clearance_m", float("nan"))))
+        or float(result["minimum_clearance_m"]) < 0.005 - 1e-6
+        or float(result.get("required_clearance_m", 0.0)) != 0.005
+    ):
+        raise RuntimeError("loaded Dex3 sweep lacks a passing request-bound 5mm check")
+    latest = _snapshot(synchronized.observe_state(), _wait_for_hands(controller.observer))
+    body_error = float(
+        np.max(np.abs(np.asarray(latest.measured_q29_rad) - np.asarray(snapshot.measured_q29_rad)))
+    )
+    hand_error = max(
+        float(
+            np.max(
+                np.abs(
+                    np.asarray(getattr(latest, f"{side}_dex3_q_rad"))
+                    - np.asarray(getattr(snapshot, f"{side}_dex3_q_rad"))
+                )
+            )
+        )
+        for side in ("left", "right")
+    )
+    if body_error > body_tolerance_rad or hand_error > hand_tolerance_rad:
+        raise RuntimeError(
+            "loaded state changed during finger validation; no finger motion commanded "
+            f"(body {body_error:.4f}rad, hand {hand_error:.4f}rad)"
+        )
+    driver.check()
+    return controller.command_posture(
+        left_target_q_rad=left_target_q_rad,
+        right_target_q_rad=right_target_q_rad,
+        left_acceptance_q_rad=left_acceptance_q_rad,
+        right_acceptance_q_rad=right_acceptance_q_rad,
+        label=label,
+        safety_heartbeat=driver.check,
     )
 
 
@@ -519,7 +610,6 @@ def run_collect_calibration(args) -> int:
                 initial_fsm_id=int(hardware["control"]["required_regular_fsm_id"]),
                 restore_seated=False,
             )
-            guard.start()
             transport = UnitreeArmSDKTransport(transport_cfg, observer=observer)
             observer = None
             dex_controller = UnitreeDex3PostureController(
@@ -527,6 +617,10 @@ def run_collect_calibration(args) -> int:
                 observer=dex_observer,
             )
             dex_observer = None
+            # Three SDK publisher Init calls take at least 0.6 s. As in the
+            # commissioned collector, arm the 0.5 s watchdog only after these
+            # non-commanding constructors have finished.
+            guard.start()
             held_hands = dex_controller.acquire_measured_hold(safety_heartbeat=guard.pulse)
             q29 = np.asarray(latest_activation.reference_state.position, dtype=np.float64)
             q14 = np.concatenate(

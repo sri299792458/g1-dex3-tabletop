@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import xml.etree.ElementTree as ET
 from dataclasses import replace
 from itertools import pairwise
@@ -27,11 +28,13 @@ from g1_aprilcube_calibration.pose_schema import HANDOFF_POSE_ID
 from g1_aprilcube_calibration.quality import QualityGrade, QualityReport
 from g1_aprilcube_calibration.readiness import RecordingGateConfig
 from g1_aprilcube_calibration.session_runner import RecoverableCaptureError
+from g1_aprilcube_calibration.session_store import IsolatedSessionStore
 from g1_aprilcube_calibration.timestamp_pairing import (
     ImageTiming,
     PairingConfig,
     pair_state_to_image,
 )
+from g1_dex3_tabletop import cli
 from g1_dex3_tabletop.calibration import (
     BilateralCalibrationDataset,
     BilateralCalibrationPlanningRequest,
@@ -43,6 +46,7 @@ from g1_dex3_tabletop.calibration import (
     BilateralExecutionPlan,
     BilateralFeasiblePose,
     BilateralFrameEvidence,
+    BilateralGracefulStopRequested,
     BilateralIKResult,
     BilateralModelSpec,
     BilateralPlannedTransition,
@@ -58,6 +62,7 @@ from g1_dex3_tabletop.calibration import (
     add_measured_color_frames,
     build_bilateral_optimizer_config,
     build_repeated_anchor_schedule,
+    build_valid_graph_route_schedule,
     evaluate_bilateral_anchor_drift,
     merge_bilateral_datasets,
     parse_ferguson_output,
@@ -71,13 +76,19 @@ from g1_dex3_tabletop.calibration import (
 )
 from g1_dex3_tabletop.cli import build_parser
 from g1_dex3_tabletop.hardware_bilateral_calibration import (
-    _handoff_error_rad,
     validate_frozen_bilateral_inputs,
 )
 from g1_dex3_tabletop.planning.contracts import (
     CalibrationCandidate,
+    Dex3PreparationPlan,
+    Dex3PreparationRequest,
     PlannedTrajectory,
     RobotSnapshot,
+)
+from g1_dex3_tabletop.planning.curobo_backend import (
+    _bilateral_core_reference_clearance,
+    _nearest_neighbor_edges,
+    _rooted_shortest_valid_edge_tree,
 )
 from g1_dex3_tabletop.planning.worker import build_parser as build_worker_parser
 
@@ -459,9 +470,108 @@ def test_full_model_design_is_arm_balanced_and_repeats_anchor() -> None:
         "excitation",
         "anchor",
     ]
+    assert not any(item.hand_action for item in schedule)
     assert {item.candidate_id for item in schedule if item.capture_role == "anchor"} == {
         "bilateral_anchor"
     }
+
+
+def test_valid_graph_route_uses_short_anchor_tours_and_captures_once() -> None:
+    candidates = (
+        design_candidate("left_near", "left", -0.8),
+        design_candidate("left_far", "left", 0.8),
+        design_candidate("right_near", "right", -0.8),
+        design_candidate("right_far", "right", 0.8),
+    )
+    selection = select_bilateral_design(
+        candidates,
+        parameter_names=("camera_x", "camera_y", "camera_z"),
+        config=BilateralDesignConfig(
+            left_excitation_count=2,
+            right_excitation_count=2,
+            anchor_interval=2,
+            require_full_joint_excitation=False,
+        ),
+    )
+    schedule = build_valid_graph_route_schedule(
+        selection,
+        anchor_candidate_id="bilateral_anchor",
+        anchor_interval=2,
+        valid_edges_by_arm={
+            "left": (
+                (1.0, "bilateral_anchor", "left_near"),
+                (1.0, "left_near", "left_far"),
+                (1.0, "bilateral_anchor", "left_far"),
+            ),
+            "right": (
+                (1.0, "bilateral_anchor", "right_near"),
+                (1.0, "right_near", "right_far"),
+                (1.0, "bilateral_anchor", "right_far"),
+            ),
+        },
+    )
+    captured = [item.candidate_id for item in schedule if item.capture_role == "excitation"]
+    assert sorted(captured) == sorted(item.candidate_id for item in selection.candidates)
+    assert len(captured) == len(set(captured))
+    assert not any(
+        item.capture_role == "preparation"
+        and item.candidate_id in {candidate.candidate_id for candidate in selection.candidates}
+        for item in schedule
+    )
+    anchor_indices = [
+        index for index, item in enumerate(schedule) if item.capture_role == "anchor"
+    ]
+    assert len(anchor_indices) == 3
+    assert all(
+        schedule[index + 1].active_arm != schedule[index - 1].active_arm
+        for index in anchor_indices[1:-1]
+    )
+
+
+def test_shortest_valid_edge_tree_uses_connected_near_edges() -> None:
+    q_by_id = {
+        "anchor": np.asarray((0.0, 0.0)),
+        "near": np.asarray((0.1, 0.0)),
+        "far": np.asarray((0.2, 0.0)),
+        "isolated": np.asarray((2.0, 0.0)),
+    }
+    edges = _nearest_neighbor_edges(q_by_id, neighbor_count=2)
+    passed = tuple(edge for edge in edges if "isolated" not in edge[1:])
+    parents = _rooted_shortest_valid_edge_tree(
+        root_id="anchor",
+        node_ids=tuple(q_by_id),
+        passed_edges=passed,
+    )
+    assert parents == {"near": "anchor", "far": "near"}
+
+
+def test_core_clearance_uses_the_stricter_reference_for_each_link_pair() -> None:
+    clearance_q = np.zeros(len(G1_29_JOINT_NAMES))
+    anchor_q = clearance_q.copy()
+    anchor_q[LEFT_ARM_INDICES[0]] = 0.3
+    anchor_q[RIGHT_ARM_INDICES[0]] = -0.2
+    names = (G1_29_JOINT_NAMES[RIGHT_ARM_INDICES[0]], G1_29_JOINT_NAMES[LEFT_ARM_INDICES[0]])
+    offsets = {names[0]: 0.01}
+    reference_gaps = np.asarray(((0.0006, 0.004, 0.006), (0.003, 0.001, 0.005)))
+    checked = []
+
+    def clearances(q, *, joint_names):
+        assert joint_names == names
+        checked.append(q)
+        return SimpleNamespace(amax=lambda dim: reference_gaps.max(axis=dim)), ()
+
+    result = _bilateral_core_reference_clearance(
+        checker=SimpleNamespace(self_collision_link_pair_clearances=clearances),
+        joint_names=names,
+        request=SimpleNamespace(
+            clearance_snapshot=SimpleNamespace(measured_q29_rad=tuple(clearance_q)),
+            joint_position_offsets_rad=offsets,
+        ),
+        pool=SimpleNamespace(anchor_q29_rad=tuple(anchor_q)),
+    )
+    # Each pair can be stricter at a different posture; neither may be discarded.
+    np.testing.assert_allclose(result, (0.003, 0.004, 0.006))
+    np.testing.assert_allclose(checked[0], ((0.01, 0.0), (-0.19, 0.3)))
 
 
 def test_design_rejects_a_rank_deficient_declared_model() -> None:
@@ -512,6 +622,10 @@ def bilateral_route_artifacts(
         "left_excitation": np.zeros(len(G1_29_JOINT_NAMES)),
         "right_excitation": np.zeros(len(G1_29_JOINT_NAMES)),
     }
+    poses["bilateral_anchor"][LEFT_ARM_INDICES[0]] = 0.1
+    poses["bilateral_anchor"][RIGHT_ARM_INDICES[0]] = -0.1
+    poses["left_excitation"][:] = poses["bilateral_anchor"]
+    poses["right_excitation"][:] = poses["bilateral_anchor"]
     poses["left_excitation"][LEFT_ARM_INDICES[0]] = 0.2
     poses["right_excitation"][RIGHT_ARM_INDICES[0]] = -0.2
     transitions = []
@@ -544,16 +658,44 @@ def bilateral_route_artifacts(
         },
         planner_provenance={"backend": "unit-test-curobo"},
     )
+    clearance_certificate = {
+        "policy": "strict_core_10mm",
+        "hard_clearance_m": 0.010,
+        "preexisting_clearance_maximum_degradation_m": 0.0,
+        "minimum_clearance_m": 0.011,
+        "minimum_margin_to_required_clearance_m": 0.001,
+        "passed": True,
+        "phases": [{"phase": "unit_test", "passed": True}],
+    }
+    anchor_indices = [
+        index for index, waypoint in enumerate(schedule) if waypoint.capture_role == "anchor"
+    ]
     plan = BilateralExecutionPlan(
         pose_design_sha256=design.content_sha256,
         robot_model="g1-test",
         urdf_sha256=urdf_sha256,
-        dex3_joint_positions_rad={
+        joint_position_offsets_rad={},
+        commanded_dex3_joint_positions_rad={
             "left": (0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5),
             "right": (0.0, -0.7, -0.7, 1.0, 1.5, 1.0, 1.5),
         },
+        modeled_dex3_joint_positions_rad={
+            "left": (0.0, 0.65, 0.65, -0.95, -1.45, -0.95, -1.45),
+            "right": (0.0, -0.65, -0.65, 0.95, 1.45, 0.95, 1.45),
+        },
+        self_clearance_certificate=clearance_certificate,
         transitions=tuple(transitions),
-        planner_provenance={"backend": "unit-test-curobo"},
+        planner_provenance={
+            "backend": "unit-test-curobo",
+            "self_clearance_certificate": clearance_certificate,
+            "graceful_return": {
+                "policy": "latch_at_any_capture_then_stop_at_next_identical_anchor",
+                "anchor_occurrence_ids": [
+                    schedule[index].occurrence_id for index in anchor_indices
+                ],
+                "terminal_boundary": HANDOFF_POSE_ID,
+            },
+        },
     )
     return design, plan
 
@@ -573,6 +715,98 @@ def test_bilateral_execution_plan_is_endpoint_and_hash_bound() -> None:
         for pose_set in pose_sets.values()
     )
 
+    failed_clearance = {
+        **plan.self_clearance_certificate,
+        "passed": False,
+        "minimum_margin_to_required_clearance_m": -0.001,
+    }
+    with pytest.raises(ValueError, match="self-clearance certificate"):
+        replace(plan, self_clearance_certificate=failed_clearance)
+
+
+def dex3_preparation_artifacts(
+    *,
+    snapshot: RobotSnapshot,
+    close_positions: dict[str, tuple[float, ...]],
+    settled_positions: dict[str, tuple[float, ...]],
+    return_positions: dict[str, tuple[float, ...]],
+    right_clearance_q29: tuple[float, ...],
+    dual_clearance_q29: tuple[float, ...],
+) -> tuple[Dex3PreparationRequest, Dex3PreparationPlan]:
+    request = Dex3PreparationRequest(
+        snapshot=snapshot,
+        joint_position_offsets_rad={},
+        left_target_q_rad=close_positions["left"],
+        right_target_q_rad=close_positions["right"],
+        left_settled_target_q_rad=settled_positions["left"],
+        right_settled_target_q_rad=settled_positions["right"],
+        left_return_target_q_rad=return_positions["left"],
+        right_return_target_q_rad=return_positions["right"],
+    )
+
+    def edge(
+        *,
+        side: str,
+        from_pose_id: str,
+        to_pose_id: str,
+        start_q29: tuple[float, ...],
+        end_q29: tuple[float, ...],
+    ) -> PlannedTrajectory:
+        indices = np.asarray(LEFT_ARM_INDICES if side == "left" else RIGHT_ARM_INDICES)
+        start = tuple(np.asarray(start_q29)[indices])
+        end = tuple(np.asarray(end_q29)[indices])
+        return PlannedTrajectory(
+            from_pose_id=from_pose_id,
+            to_pose_id=to_pose_id,
+            sample_time_s=(0.0, 1.0),
+            command_q_rad=(start, end),
+            model_q_rad=(start, end),
+            planning_time_s=0.1,
+        )
+
+    ready_q29 = snapshot.measured_q29_rad
+    right_outbound = edge(
+        side="right",
+        from_pose_id=HANDOFF_POSE_ID,
+        to_pose_id="right_shoulder_clearance",
+        start_q29=ready_q29,
+        end_q29=right_clearance_q29,
+    )
+    left_outbound = edge(
+        side="left",
+        from_pose_id="right_shoulder_clearance",
+        to_pose_id="dual_shoulder_clearance",
+        start_q29=right_clearance_q29,
+        end_q29=dual_clearance_q29,
+    )
+    left_return = edge(
+        side="left",
+        from_pose_id="dual_shoulder_clearance",
+        to_pose_id="right_shoulder_clearance",
+        start_q29=dual_clearance_q29,
+        end_q29=right_clearance_q29,
+    )
+    right_return = edge(
+        side="right",
+        from_pose_id="right_shoulder_clearance",
+        to_pose_id=HANDOFF_POSE_ID,
+        start_q29=right_clearance_q29,
+        end_q29=ready_q29,
+    )
+    dual = np.asarray(dual_clearance_q29)
+    return request, Dex3PreparationPlan(
+        request_sha256=request.content_sha256,
+        outward_offset_rad=0.1,
+        right_outbound=right_outbound,
+        left_outbound=left_outbound,
+        left_return=left_return,
+        right_return=right_return,
+        dual_clearance_q14_rad=tuple(dual[np.asarray((*LEFT_ARM_INDICES, *RIGHT_ARM_INDICES))]),
+        finger_sweep_sample_count=12,
+        return_sweep_sample_count=12,
+        planner_provenance={"backend": "unit-test-curobo"},
+    )
+
 
 def test_bilateral_offline_planning_contracts_are_hash_bound() -> None:
     left_full = np.zeros(len(G1_29_JOINT_NAMES))
@@ -580,14 +814,47 @@ def test_bilateral_offline_planning_contracts_are_hash_bound() -> None:
     right_full = np.zeros(len(G1_29_JOINT_NAMES))
     right_full[RIGHT_ARM_INDICES[0]] = -0.2
     identity = tuple(tuple(float(value) for value in row) for row in np.eye(4))
+    close_positions = {
+        "left": (0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5),
+        "right": (0.0, -0.7, -0.7, 1.0, 1.5, 1.0, 1.5),
+    }
+    model_positions = {
+        "left": (0.0, 0.65, 0.65, -0.95, -1.45, -0.95, -1.45),
+        "right": (0.0, -0.65, -0.65, 0.95, 1.45, 0.95, 1.45),
+    }
+    ready_positions = {
+        "left": (0.0,) * 7,
+        "right": (0.0,) * 7,
+    }
+    ready_snapshot = RobotSnapshot(
+        measured_q29_rad=(0.0,) * len(G1_29_JOINT_NAMES),
+        left_dex3_q_rad=ready_positions["left"],
+        right_dex3_q_rad=ready_positions["right"],
+    )
+    right_clearance = np.zeros(len(G1_29_JOINT_NAMES))
+    right_clearance[RIGHT_ARM_INDICES[0]] = -0.05
+    dual_clearance = right_clearance.copy()
+    dual_clearance[LEFT_ARM_INDICES[0]] = 0.05
+    preparation_request, preparation_plan = dex3_preparation_artifacts(
+        snapshot=ready_snapshot,
+        close_positions=close_positions,
+        settled_positions=model_positions,
+        return_positions=ready_positions,
+        right_clearance_q29=tuple(right_clearance),
+        dual_clearance_q29=tuple(dual_clearance),
+    )
+    clearance_snapshot = RobotSnapshot(
+        measured_q29_rad=tuple(dual_clearance),
+        left_dex3_q_rad=model_positions["left"],
+        right_dex3_q_rad=model_positions["right"],
+    )
     planning_request = BilateralCalibrationPlanningRequest(
         robot_model="g1-test",
         urdf_sha256="3" * 64,
-        snapshot=RobotSnapshot(
-            measured_q29_rad=(0.0,) * len(G1_29_JOINT_NAMES),
-            left_dex3_q_rad=(0.0, 0.7, 0.7, -1.0, -1.5, -1.0, -1.5),
-            right_dex3_q_rad=(0.0, -0.7, -0.7, 1.0, 1.5, 1.0, 1.5),
-        ),
+        snapshot=ready_snapshot,
+        clearance_snapshot=clearance_snapshot,
+        dex3_preparation_request=preparation_request,
+        dex3_preparation_plan=preparation_plan,
         camera_info=sample().camera_info,
         camera_frames=identity_camera_artifact(),
         design_model=model(),
@@ -601,6 +868,8 @@ def test_bilateral_offline_planning_contracts_are_hash_bound() -> None:
         nominal_torso_T_camera=identity,
         nominal_hand_T_targets={"left": identity, "right": identity},
         joint_position_offsets_rad={},
+        dex3_command_positions_rad=close_positions,
+        dex3_model_positions_rad=model_positions,
         candidates_by_arm={
             "left": (
                 CalibrationCandidate(
@@ -664,17 +933,45 @@ def test_bilateral_offline_planning_contracts_are_hash_bound() -> None:
 
 def test_bilateral_route_contract_binds_schedule_and_transition_arms() -> None:
     design, plan = bilateral_route_artifacts()
+    ready_q29 = np.zeros(len(G1_29_JOINT_NAMES))
+    right_clearance_q29 = ready_q29.copy()
+    right_clearance_q29[RIGHT_ARM_INDICES[0]] = -0.05
+    dual_clearance_q29 = right_clearance_q29.copy()
+    dual_clearance_q29[LEFT_ARM_INDICES[0]] = 0.05
+    ready_hands = {"left": (0.0,) * 7, "right": (0.0,) * 7}
+    ready_snapshot = RobotSnapshot(
+        measured_q29_rad=tuple(ready_q29),
+        left_dex3_q_rad=ready_hands["left"],
+        right_dex3_q_rad=ready_hands["right"],
+    )
+    preparation_request, preparation_plan = dex3_preparation_artifacts(
+        snapshot=ready_snapshot,
+        close_positions=plan.commanded_dex3_joint_positions_rad,
+        settled_positions=plan.modeled_dex3_joint_positions_rad,
+        return_positions=ready_hands,
+        right_clearance_q29=tuple(right_clearance_q29),
+        dual_clearance_q29=tuple(dual_clearance_q29),
+    )
     route_request = BilateralRoutePlanningRequest(
         planning_request_sha256="4" * 64,
         ik_result_sha256="5" * 64,
         robot_model=plan.robot_model,
         urdf_sha256=plan.urdf_sha256,
-        snapshot=RobotSnapshot(
-            measured_q29_rad=design.waypoint_joint_positions_rad["bilateral_anchor"],
-            left_dex3_q_rad=plan.dex3_joint_positions_rad["left"],
-            right_dex3_q_rad=plan.dex3_joint_positions_rad["right"],
+        snapshot=ready_snapshot,
+        clearance_snapshot=RobotSnapshot(
+            measured_q29_rad=tuple(dual_clearance_q29),
+            left_dex3_q_rad=plan.modeled_dex3_joint_positions_rad["left"],
+            right_dex3_q_rad=plan.modeled_dex3_joint_positions_rad["right"],
         ),
+        dex3_preparation_request=preparation_request,
+        dex3_preparation_plan=preparation_plan,
         joint_position_offsets_rad={},
+        dex3_command_positions_rad=plan.commanded_dex3_joint_positions_rad,
+        dex3_model_positions_rad=plan.modeled_dex3_joint_positions_rad,
+        anchor_candidate_ids_by_arm={
+            "left": "left_anchor_source",
+            "right": "right_anchor_source",
+        },
         parameter_names=design.parameter_names,
         selection=design.selection,
         schedule=design.schedule,
@@ -687,22 +984,25 @@ def test_bilateral_route_contract_binds_schedule_and_transition_arms() -> None:
         request_sha256=route_request.content_sha256,
         transitions=plan.transitions,
         disconnected_candidate_ids=(),
+        finger_sweep_sample_count=preparation_plan.finger_sweep_sample_count,
+        restoration_sweep_sample_count=preparation_plan.return_sweep_sample_count,
         planner_provenance={"backend": "unit-test-curobo"},
     )
     result.validate_request(route_request)
     assert BilateralRoutePlanningResult.from_dict(result.to_dict()) == result
+    assert result.transitions == plan.transitions
 
     wrong = replace(result, request_sha256="6" * 64)
     with pytest.raises(ValueError, match="different request"):
         wrong.validate_request(route_request)
 
-    moved_anchor = np.asarray(route_request.snapshot.measured_q29_rad).copy()
-    moved_anchor[0] = 0.01
-    with pytest.raises(ValueError, match="anchor differs"):
+    moved_ready = np.asarray(route_request.snapshot.measured_q29_rad).copy()
+    moved_ready[0] = 0.01
+    with pytest.raises(ValueError, match="preparation did not start from Ready"):
         replace(
             route_request,
             snapshot=RobotSnapshot(
-                measured_q29_rad=tuple(moved_anchor),
+                measured_q29_rad=tuple(moved_ready),
                 left_dex3_q_rad=route_request.snapshot.left_dex3_q_rad,
                 right_dex3_q_rad=route_request.snapshot.right_dex3_q_rad,
             ),
@@ -724,11 +1024,211 @@ def test_bilateral_planner_commands_are_offline_worker_phases() -> None:
     for command in (
         "solve-bilateral-calibration-ik",
         "plan-bilateral-calibration-route",
+        "plan-bilateral-calibration-adapter",
     ):
         worker = build_worker_parser().parse_args(
             [command, "--request", "request.json", "--output", "result.json"]
         )
         assert worker.command == command
+    design_plan = build_worker_parser().parse_args(
+        [
+            "plan-bilateral-calibration-design",
+            "--request",
+            "request.json",
+            "--ik-result",
+            "ik.json",
+            "--urdf",
+            "robot.urdf",
+            "--route-request-output",
+            "route_request.json",
+            "--output",
+            "route_result.json",
+        ]
+    )
+    assert design_plan.command == "plan-bilateral-calibration-design"
+    assert not hasattr(design_plan, "maximum_reselections")
+
+
+def test_bilateral_planner_cli_publishes_artifacts_and_current_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Exercise the real CLI and artifact bindings with command-free worker results."""
+    snapshot = RobotSnapshot(
+        measured_q29_rad=(0.0,) * len(G1_29_JOINT_NAMES),
+        left_dex3_q_rad=(0.0,) * 7,
+        right_dex3_q_rad=(0.0,) * 7,
+    )
+    snapshot_path = tmp_path / "snapshot.json"
+    snapshot_path.write_text(json.dumps(snapshot.to_dict()), encoding="utf-8")
+    output = tmp_path / "planned"
+    args = build_parser().parse_args(
+        [
+            "plan-bilateral-calibration",
+            "--snapshot",
+            str(snapshot_path),
+            "--output-directory",
+            str(output),
+            "--left-excitation-count",
+            "1",
+            "--right-excitation-count",
+            "1",
+            "--candidate-count",
+            "1",
+        ]
+    )
+    identity = tuple(tuple(float(v) for v in row) for row in np.eye(4))
+    monkeypatch.setattr(
+        cli,
+        "generate_calibration_candidates",
+        lambda **_: (CalibrationCandidate("candidate", identity, {"source": "unit test"}),),
+    )
+    phases = []
+
+    def fake_worker(command, request_path, output_path):
+        phases.append(command)
+        if command == "plan-dex3-preparation":
+            request = Dex3PreparationRequest.from_json(request_path)
+            right_q = np.asarray(request.snapshot.measured_q29_rad).copy()
+            right_q[RIGHT_ARM_INDICES[1]] -= 0.1
+            dual_q = right_q.copy()
+            dual_q[LEFT_ARM_INDICES[1]] += 0.1
+            _, preparation = dex3_preparation_artifacts(
+                snapshot=request.snapshot,
+                close_positions={
+                    "left": request.left_target_q_rad,
+                    "right": request.right_target_q_rad,
+                },
+                settled_positions={
+                    "left": request.left_settled_target_q_rad,
+                    "right": request.right_settled_target_q_rad,
+                },
+                return_positions={
+                    "left": request.left_return_target_q_rad,
+                    "right": request.right_return_target_q_rad,
+                },
+                right_clearance_q29=tuple(right_q),
+                dual_clearance_q29=tuple(dual_q),
+            )
+            replace(preparation, request_sha256=request.content_sha256).write_json(output_path)
+        else:
+            assert command == "solve-bilateral-calibration-ik"
+            request = BilateralCalibrationPlanningRequest.from_json(request_path)
+            q = request.clearance_snapshot.measured_q29_rad
+            poses = tuple(
+                BilateralFeasiblePose(
+                    candidate_id=request.candidates_by_arm[side][0].candidate_id,
+                    active_arm=side,
+                    active_model_q_rad=tuple(q[i] for i in indices),
+                    active_command_q_rad=tuple(q[i] for i in indices),
+                    full_command_q29_rad=q,
+                    ik_position_error_m=0.0,
+                    ik_rotation_error_rad=0.0,
+                    candidate_metadata={},
+                )
+                for side, indices in (("left", LEFT_ARM_INDICES), ("right", RIGHT_ARM_INDICES))
+            )
+            BilateralIKResult(request.content_sha256, poses, {}).write_json(output_path)
+
+    def fake_design_worker(
+        *, planning_request, ik_result, urdf, route_request_output, route_result_output
+    ):
+        phases.append("plan-bilateral-calibration-design")
+        request = BilateralCalibrationPlanningRequest.from_json(planning_request)
+        ik = BilateralIKResult.from_json(ik_result)
+        design, plan = bilateral_route_artifacts(urdf_sha256=request.urdf_sha256)
+        route = BilateralRoutePlanningRequest(
+            planning_request_sha256=request.content_sha256,
+            ik_result_sha256=ik.content_sha256,
+            robot_model=request.robot_model,
+            urdf_sha256=request.urdf_sha256,
+            snapshot=request.snapshot,
+            clearance_snapshot=request.clearance_snapshot,
+            dex3_preparation_request=request.dex3_preparation_request,
+            dex3_preparation_plan=request.dex3_preparation_plan,
+            joint_position_offsets_rad={},
+            dex3_command_positions_rad=request.dex3_command_positions_rad,
+            dex3_model_positions_rad=request.dex3_model_positions_rad,
+            anchor_candidate_ids_by_arm={
+                side: request.candidates_by_arm[side][0].candidate_id for side in ("left", "right")
+            },
+            parameter_names=design.parameter_names,
+            selection=design.selection,
+            schedule=design.schedule,
+            waypoint_joint_positions_rad=design.waypoint_joint_positions_rad,
+            design_provenance={"anchor_connected_candidate_count_by_arm": {"left": 2, "right": 3}},
+            random_seed=request.random_seed,
+        )
+        # Use the same deployed command-to-model correction as the real worker.
+        transitions = tuple(
+            replace(
+                t,
+                trajectory=replace(
+                    t.trajectory,
+                    model_q_rad=tuple(
+                        tuple(
+                            q + request.joint_position_offsets_rad.get(G1_29_JOINT_NAMES[i], 0.0)
+                            for q, i in zip(
+                                row,
+                                LEFT_ARM_INDICES if t.arm == "left" else RIGHT_ARM_INDICES,
+                                strict=True,
+                            )
+                        )
+                        for row in t.trajectory.command_q_rad
+                    ),
+                ),
+            )
+            for t in plan.transitions
+        )
+        result = BilateralRoutePlanningResult(
+            request_sha256=route.content_sha256,
+            transitions=transitions,
+            disconnected_candidate_ids=(),
+            finger_sweep_sample_count=12,
+            restoration_sweep_sample_count=12,
+            planner_provenance={"self_clearance_certificate": plan.self_clearance_certificate},
+        )
+        route.write_json(route_request_output)
+        result.write_json(route_result_output)
+
+    monkeypatch.setattr(cli, "_run_required_planner_worker", fake_worker)
+    monkeypatch.setattr(cli, "_run_required_bilateral_design_planner", fake_design_worker)
+    assert cli.run_plan_bilateral_calibration(args) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["commands_robot"] is False
+    assert summary["connected_candidate_count_by_arm"] == {"left": 2, "right": 3}
+    assert summary["selected_excitation_count"] == 2
+    assert "route_rejected_candidate_ids" not in summary
+    design = BilateralPoseDesignArtifact.from_json(output / "pose_design.json")
+    plan = BilateralExecutionPlan.from_json(output / "execution_plan.json")
+    plan.validate_design(design)
+    assert summary["execution_plan_sha256"] == plan.content_sha256
+    assert phases == [
+        "plan-dex3-preparation",
+        "solve-bilateral-calibration-ik",
+        "plan-bilateral-calibration-design",
+    ]
+    with pytest.raises(FileExistsError, match="already exists"):
+        cli.run_plan_bilateral_calibration(args)
+
+    def failed_design_worker(**kwargs):
+        Path(kwargs["route_result_output"]).write_text(
+            json.dumps({"connected": False, "failure": "test clearance rejection"}),
+            encoding="utf-8",
+        )
+        raise RuntimeError("test clearance rejection")
+
+    failed_output = tmp_path / "failed_plan"
+    args.output_directory = failed_output
+    monkeypatch.setattr(cli, "_run_required_bilateral_design_planner", failed_design_worker)
+    with pytest.raises(RuntimeError, match="test clearance rejection"):
+        cli.run_plan_bilateral_calibration(args)
+    assert not failed_output.exists()
+    retained = tuple(tmp_path.glob(".failed_plan.*"))
+    assert len(retained) == 1
+    assert (retained[0] / "ik_result.json").is_file()
+    assert (retained[0] / "route_result.json").is_file()
+    assert not (retained[0] / "execution_plan.json").exists()
+    assert str(retained[0]) in capsys.readouterr().err
 
 
 def test_bilateral_hardware_command_is_a_separate_frozen_route_command() -> None:
@@ -746,7 +1246,7 @@ def test_bilateral_hardware_command_is_a_separate_frozen_route_command() -> None
         ]
     )
     assert args.command == "collect-bilateral-calibration"
-    assert args.maximum_capture_attempts == 3
+    assert args.maximum_capture_attempts == 2
     assert args.hardware_config is None
 
 
@@ -770,8 +1270,23 @@ def test_bilateral_hardware_preflight_binds_route_model_and_camera() -> None:
         expected_camera=expected_camera,
     )
     assert set(pose_sets) == {"left", "right"}
-    anchor = design.waypoint_joint_positions_rad[design.schedule[0].candidate_id]
-    assert _handoff_error_rad(design, anchor) == 0.0
+    old_plan = replace(
+        plan,
+        self_clearance_certificate={
+            **plan.self_clearance_certificate,
+            "hard_clearance_m": 0.005,
+            "minimum_clearance_m": 0.0059,
+            "preexisting_clearance_maximum_degradation_m": 0.00025,
+        },
+    )
+    with pytest.raises(ValueError, match="requires strict 10mm"):
+        validate_frozen_bilateral_inputs(
+            design=design,
+            plan=old_plan,
+            model=model,
+            camera_frames=camera,
+            expected_camera=expected_camera,
+        )
     with pytest.raises(ValueError, match="RealSense serial"):
         validate_frozen_bilateral_inputs(
             design=design,
@@ -797,6 +1312,51 @@ def test_bilateral_execution_plan_rejects_an_inactive_arm_change() -> None:
         invalid_plan.validate_design(invalid_design)
 
 
+@pytest.mark.parametrize("fault_during", ["burst", "write"])
+def test_bilateral_capture_keeps_original_executor_fault(fault_during) -> None:
+    design, plan = bilateral_route_artifacts()
+    pose_sets = pose_sets_from_bilateral_plan(design, plan)
+    executor = SimpleNamespace(
+        state=ExecutorState.READY,
+        current_pose_id=HANDOFF_POSE_ID,
+        approved_validation_report_sha256=plan.content_sha256,
+        pose_set=pose_sets["right"],
+        fault_reason="control loop stalled",
+    )
+    executor.begin_capture = lambda: setattr(executor, "state", ExecutorState.CAPTURING)
+
+    def finish(**kwargs):
+        raise AssertionError("must report the original fault before finishing capture")
+
+    executor.finish_capture = finish
+
+    def burst(**kwargs):
+        if fault_during == "burst":
+            executor.state = ExecutorState.FAULT
+            raise RecoverableCaptureError("visual rejection raced with control fault")
+        return (object(),)
+
+    def write(**kwargs):
+        if fault_during == "write":
+            assert executor.state is ExecutorState.CAPTURING
+            executor.state = ExecutorState.FAULT
+            raise OSError("write failed after control fault")
+
+    orchestrator = BilateralCollectionOrchestrator(
+        executor=executor,
+        design=design,
+        plan=plan,
+        pose_sets=pose_sets,
+        store=SimpleNamespace(append_capture=write),
+        frame_source=SimpleNamespace(capture_burst=burst),
+        wait_until_ready=lambda: None,
+    )
+    with pytest.raises(
+        RuntimeError, match="executor faulted during capture: control loop stalled"
+    ):
+        orchestrator.run()
+
+
 def test_bilateral_orchestrator_retries_and_switches_arms() -> None:
     design, plan = bilateral_route_artifacts()
     pose_sets = pose_sets_from_bilateral_plan(design, plan)
@@ -806,7 +1366,7 @@ def test_bilateral_orchestrator_retries_and_switches_arms() -> None:
             self.state = ExecutorState.READY
             self.current_pose_id = HANDOFF_POSE_ID
             self.approved_validation_report_sha256 = plan.content_sha256
-            self.pose_set = pose_sets["left"]
+            self.pose_set = pose_sets["right"]
             self.started: list[dict] = []
             self.switches: list[str] = []
             self.capture_outcomes: list[str] = []
@@ -866,14 +1426,107 @@ def test_bilateral_orchestrator_retries_and_switches_arms() -> None:
         wait_until_ready=lambda: None,
     )
     result = orchestrator.run()
-    assert result.accepted_count == len(design.schedule)
+    capture_count = sum(item.capturable for item in design.schedule)
+    assert result.accepted_count == capture_count
+    assert result.rejected_count == 0
     assert result.retry_count == 1
-    assert result.attempted_count == len(design.schedule) + 1
-    assert executor.switches == ["right"]
+    assert result.attempted_count == capture_count + 1
+    assert executor.switches == ["left", "right"]
     assert len(executor.started) == len(plan.transitions)
     assert store.captures[0]["outcome"] == "retry"
     assert store.finalized
     assert all(request["remember_signatures"] for request in source.requests)
+
+    class RejectedFirstWaypointSource(FakeSource):
+        def capture_burst(self, **kwargs):
+            self.calls += 1
+            self.requests.append(kwargs)
+            if self.calls <= 2:
+                raise RecoverableCaptureError("target remains occluded")
+            return (object(),)
+
+    rejected_executor = FakeExecutor()
+    rejected_source = RejectedFirstWaypointSource()
+    rejected_store = FakeStore()
+    rejected_result = BilateralCollectionOrchestrator(
+        executor=rejected_executor,
+        design=design,
+        plan=plan,
+        pose_sets=pose_sets,
+        store=rejected_store,
+        frame_source=rejected_source,
+        wait_until_ready=lambda: None,
+    ).run()
+    assert rejected_result.accepted_count == capture_count - 1
+    assert rejected_result.rejected_count == 1
+    assert rejected_result.retry_count == 1
+    assert rejected_result.attempted_count == capture_count + 1
+    assert len(rejected_executor.started) == len(plan.transitions)
+    assert [item["outcome"] for item in rejected_store.captures[:2]] == [
+        "retry",
+        "rejected",
+    ]
+    assert rejected_store.finalized
+
+    class GracefulStopAtFirstExcitationSource(FakeSource):
+        def capture_burst(self, **kwargs):
+            self.calls += 1
+            self.requests.append(kwargs)
+            if self.calls == 2:
+                raise BilateralGracefulStopRequested("operator pressed Q")
+            return (object(),)
+
+    stopped_executor = FakeExecutor()
+    stopped_source = GracefulStopAtFirstExcitationSource()
+    stopped_store = FakeStore()
+    stopped_result = BilateralCollectionOrchestrator(
+        executor=stopped_executor,
+        design=design,
+        plan=plan,
+        pose_sets=pose_sets,
+        store=stopped_store,
+        frame_source=stopped_source,
+        wait_until_ready=lambda: None,
+        graceful_stop_requested=lambda: stopped_source.calls >= 2,
+    ).run()
+    assert stopped_result.accepted_count == 1
+    assert stopped_result.rejected_count == 0
+    assert stopped_result.stopped_early
+    assert stopped_result.return_anchor_occurrence_id == "anchor_000"
+    assert stopped_result.session_finalized
+    assert stopped_executor.current_pose_id == "anchor_000"
+    assert len(stopped_executor.started) < len(plan.transitions)
+    assert [item["outcome"] for item in stopped_store.captures] == [
+        "accepted",
+        "aborted",
+    ]
+    assert stopped_store.finalized
+
+    class GracefulStopAtInitialAnchorSource(FakeSource):
+        def capture_burst(self, **kwargs):
+            self.calls += 1
+            self.requests.append(kwargs)
+            raise BilateralGracefulStopRequested("operator pressed Q before data")
+
+    empty_executor = FakeExecutor()
+    empty_source = GracefulStopAtInitialAnchorSource()
+    empty_store = FakeStore()
+    empty_result = BilateralCollectionOrchestrator(
+        executor=empty_executor,
+        design=design,
+        plan=plan,
+        pose_sets=pose_sets,
+        store=empty_store,
+        frame_source=empty_source,
+        wait_until_ready=lambda: None,
+        graceful_stop_requested=lambda: empty_source.calls >= 1,
+    ).run()
+    assert empty_result.accepted_count == 0
+    assert empty_result.stopped_early
+    assert empty_result.return_anchor_occurrence_id == HANDOFF_POSE_ID
+    assert not empty_result.session_finalized
+    assert empty_executor.current_pose_id == HANDOFF_POSE_ID
+    assert not empty_store.finalized
 
 
 def frame_evidence(frame_id: str, corner_shift: float) -> BilateralFrameEvidence:
@@ -1233,8 +1886,10 @@ def test_bilateral_dataset_merge_preserves_each_source_manifest() -> None:
     }
 
 
+@pytest.mark.parametrize("isolated", [False, True])
 def test_bilateral_raw_session_replays_both_correspondence_hashes(
     tmp_path: Path,
+    isolated: bool,
 ) -> None:
     artifact = identity_camera_artifact()
     robot_bytes = b'<robot name="g1"/>\n'
@@ -1242,6 +1897,8 @@ def test_bilateral_raw_session_replays_both_correspondence_hashes(
     design, execution_plan = bilateral_route_artifacts(urdf_sha256=robot_sha256)
     camera_bytes = json.dumps(artifact.to_dict(), indent=2, sort_keys=True).encode() + b"\n"
     source_artifacts = {
+        "adapter_plan.json": b'{"source":"unit test"}\n',
+        "adapter_request.json": b'{"source":"unit test"}\n',
         "camera_frames.json": camera_bytes,
         "capture_quality.yaml": b"schema_version: 1\n",
         "execution_plan.json": (
@@ -1272,38 +1929,58 @@ def test_bilateral_raw_session_replays_both_correspondence_hashes(
             return getattr(frames_by_shift[shift], f"{self.side}_correspondences")
 
     store = BilateralSessionStore(tmp_path / "bilateral_session")
-    manifest = store.create(
-        session_id="bilateral_session",
-        created_at_utc="2026-08-24T00:00:00Z",
-        day_group_id="2026-08-24",
-        camera_info=selected.camera_info,
-        camera_frames=artifact,
-        pose_design_sha256=design.content_sha256,
-        execution_plan_sha256=execution_plan.content_sha256,
-        source_artifacts=source_artifacts,
-        pairing_config=PairingConfig(
+    create_arguments = {
+        "session_id": "bilateral_session",
+        "created_at_utc": "2026-08-24T00:00:00Z",
+        "day_group_id": "2026-08-24",
+        "camera_info": selected.camera_info,
+        "camera_frames": artifact,
+        "pose_design_sha256": design.content_sha256,
+        "execution_plan_sha256": execution_plan.content_sha256,
+        "source_artifacts": source_artifacts,
+        "pairing_config": PairingConfig(
             maximum_nearest_delta_s=0.2,
             maximum_bracket_span_s=0.3,
         ),
-        recording_gate_config=RecordingGateConfig(
+        "recording_gate_config": RecordingGateConfig(
             stationary_duration_s=0.1,
             maximum_state_gap_s=0.3,
             state_freshness_timeout_s=0.3,
             minimum_samples=2,
         ),
-        provenance={"command": "unit-test"},
+        "provenance": {"command": "unit-test"},
+    }
+    writer = (
+        IsolatedSessionStore(
+            store.directory, store_factory=BilateralSessionStore, poll_interval_s=0.001
+        )
+        if isolated
+        else store
     )
-    assert not manifest.finalized
-    store.append_capture(
-        capture_id="capture_001",
-        pose_group_id="bilateral_anchor",
-        capture_role="anchor",
-        outcome="accepted",
-        reason="both targets passed",
-        frames=(frames_by_shift[0], selected, frames_by_shift[20]),
-        recorded_at_utc="2026-08-24T00:00:01Z",
-    )
-    finalized = store.finalize()
+    health_checks = []
+    try:
+        if isolated:
+            writer.start()
+            assert writer.worker_pid != os.getpid()
+            writer.set_health_check(lambda: health_checks.append(True))
+        writer.create(**create_arguments)
+        assert not store.load().finalized
+        writer.append_capture(
+            capture_id="capture_001",
+            pose_group_id="bilateral_anchor",
+            capture_role="anchor",
+            outcome="accepted",
+            reason="both targets passed",
+            frames=(frames_by_shift[0], selected, frames_by_shift[20]),
+            recorded_at_utc="2026-08-24T00:00:01Z",
+        )
+        writer.finalize()
+    finally:
+        if isolated:
+            writer.close()
+    if isolated:
+        assert health_checks
+    finalized = store.load()
     assert finalized.finalized
     detectors = {
         "left": FixedDetector("left"),

@@ -255,6 +255,38 @@ def test_acquisition_faults_if_either_arm_moves_beyond_transition_limit() -> Non
     assert executor.maximum_acquisition_position_change_rad == pytest.approx(0.006)
 
 
+@pytest.mark.parametrize("joint_index", [15, 22])
+def test_acquisition_uses_fresh_seed_and_reports_takeover_drift(joint_index):
+    clock, transport, executor = subject()
+    executor.config = replace(
+        executor.config,
+        activation_position_tolerance_rad=0.02,
+        ownership_transition_position_tolerance_rad=0.05,
+        acquisition_ramp_s=1.0,
+    )
+    # Normal change since the earlier pose-set/SPACE reference must seed the
+    # first command, rather than count as movement during acquisition.
+    transport.position[joint_index] = 0.012
+    executor.acquire(operator_confirmed=True)
+    assert transport.commands[-1].q14[joint_index - 15] == pytest.approx(0.012)
+    assert transport.commands[-1].weight == 0.0
+    transport.position[joint_index] = 0.052
+    clock.advance(0.02)
+    assert executor.tick() is ExecutorState.ACQUIRING  # 0.040 from fresh seed.
+    assert executor.dual_arm_command_q[joint_index - 15] == pytest.approx(0.012)
+
+    transport.position[joint_index] = 0.0646
+    clock.advance(0.02)
+    assert executor.tick() is ExecutorState.FAULT  # 0.0526 from fresh seed.
+    side = "left" if joint_index == 15 else "right"
+    assert f"joint={side}_shoulder_pitch_joint" in executor.fault_reason
+    assert "0.0526rad" in executor.fault_reason
+    assert "0.012000rad" in executor.fault_reason
+    assert "measured=0.064600rad" in executor.fault_reason
+    assert "acquisition elapsed=0.0400s" in executor.fault_reason
+    assert "last blend weight=0.0200" in executor.fault_reason
+
+
 def test_acquisition_move_capture_handoff_and_clean_release() -> None:
     _, transport, executor = subject()
     assert transport.commands == []
@@ -359,9 +391,7 @@ def mpc_window(
 ) -> MPCCommandWindow:
     midpoint = (start_q + end_q) / 2.0
     predicted_start = (
-        start_q
-        if predicted_start_q is None
-        else np.asarray(predicted_start_q, dtype=np.float64)
+        start_q if predicted_start_q is None else np.asarray(predicted_start_q, dtype=np.float64)
     )
     tracking_offset = start_q - predicted_start
     predicted_midpoint = midpoint - tracking_offset

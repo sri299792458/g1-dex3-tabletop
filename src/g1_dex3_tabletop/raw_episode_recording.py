@@ -23,6 +23,7 @@ SPARK_REPOSITORY = "RPM-lab-UMN/spark-data-collection"
 SPARK_COMMIT = "be284c2f8138f383d260526f68613c7a28d364d4"
 SPARK_RECORDER_PATH = "data_pipeline/record_episode.py"
 PROFILE_NAME = "g1_seated_tabletop_raw_v2"
+STANDING_CALIBRATION_PROFILE_NAME = "g1_standing_calibration_raw_v1"
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,21 @@ TABLETOP_CAMERA_TOPICS = (
 
 TABLETOP_RAW_TOPICS = TABLETOP_STATE_COMMAND_TOPICS + TABLETOP_CAMERA_TOPICS
 
+# Reuse the official state/hand contracts, with standing arm-SDK commands.
+# Calibration already retains selected camera frames in its session store.
+STANDING_CALIBRATION_TOPICS = tuple(
+    topic
+    for topic in TABLETOP_STATE_COMMAND_TOPICS
+    if topic.name == "/lowstate" or topic.name.startswith("/dex3/")
+) + (
+    TopicSpec(
+        "/arm_sdk",
+        "unitree_hg/msg/LowCmd",
+        "standing arm commands including joint gains, feedforward torque, and slot-29 ownership weight",
+        "MCAP record time at laptop DDS receipt; not robot receipt acknowledgement",
+    ),
+)
+
 
 def tabletop_raw_topics(*, record_camera: bool = True) -> tuple[TopicSpec, ...]:
     """Select the stable tabletop profile; camera capture is enabled by default."""
@@ -210,16 +226,18 @@ def _git_provenance(repository: Path) -> dict[str, Any]:
     return {"git_commit": revision, "git_worktree_dirty": dirty}
 
 
-def _notes_text(episode_id: str, *, camera_recording_enabled: bool) -> str:
+def _notes_text(
+    episode_id: str, *, camera_recording_enabled: bool, profile_name: str = PROFILE_NAME
+) -> str:
     return (
         "# Raw episode notes\n\n"
         f"- Episode: `{episode_id}`\n"
-        f"- Profile: `{PROFILE_NAME}`\n"
+        f"- Profile: `{profile_name}`\n"
         f"- Camera recording enabled: `{str(camera_recording_enabled).lower()}`\n"
         "- Artifact role: source-of-truth asynchronous ROS capture\n"
         "- Storage: plain, untrimmed MCAP with no live compression\n\n"
         "## Operator notes\n\n"
-        "No inline operator note was supplied by the single-command tabletop workflow. "
+        "No inline operator note was supplied by the hardware workflow. "
         "Add observations here after the run without modifying the bag.\n"
     )
 
@@ -234,10 +252,12 @@ class RawEpisodeRecorder:
         repository: Path,
         topics: tuple[TopicSpec, ...] = TABLETOP_RAW_TOPICS,
         startup_timeout_s: float = 8.0,
+        profile_name: str = PROFILE_NAME,
     ) -> None:
         self.episode_directory = Path(episode_directory)
         self.repository = Path(repository)
         self.topics = topics
+        self.profile_name = profile_name
         self.startup_timeout_s = float(startup_timeout_s)
         self.bag_directory = self.episode_directory / "bag"
         self.manifest_path = self.episode_directory / "episode_manifest.json"
@@ -262,6 +282,15 @@ class RawEpisodeRecorder:
     def summary(self) -> dict[str, Any] | None:
         return self._summary
 
+    def check(self) -> None:
+        """Verify the recorder survived the operator wait before commanding."""
+
+        if self._process is None:
+            raise RuntimeError("raw episode recorder was not started")
+        return_code = self._process.poll()
+        if return_code is not None:
+            raise RuntimeError(f"raw MCAP recorder exited with {return_code}; see {self.log_path}")
+
     def _manifest(
         self,
         *,
@@ -281,7 +310,7 @@ class RawEpisodeRecorder:
                 "parent_run_directory": str(self.episode_directory.parent),
             },
             "profile": {
-                "name": PROFILE_NAME,
+                "name": self.profile_name,
                 "camera_recording_enabled": self.camera_recording_enabled,
             },
             "capture": {
@@ -322,6 +351,7 @@ class RawEpisodeRecorder:
             _notes_text(
                 self.episode_directory.parent.name,
                 camera_recording_enabled=self.camera_recording_enabled,
+                profile_name=self.profile_name,
             ),
             encoding="utf-8",
         )

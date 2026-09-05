@@ -674,19 +674,27 @@ class SessionStore:
             os.close(descriptor)
 
 
-def _session_writer_ready() -> int:
+def _session_writer_ready(store_factory) -> int:
     """Return the worker PID after the spawned writer has imported this module."""
 
+    # Passing the factory also imports its module in the spawned worker before
+    # control ownership. The bilateral store uses the same process lifecycle.
+    del store_factory
     return os.getpid()
 
 
-def _append_capture_isolated(directory: str, arguments: dict) -> str:
-    manifest = SessionStore(directory).append_capture(**arguments)
+def _append_capture_isolated(store_factory, directory: str, arguments: dict) -> str:
+    manifest = store_factory(directory).append_capture(**arguments)
     return manifest.content_sha256
 
 
-def _finalize_session_isolated(directory: str) -> str:
-    manifest = SessionStore(directory).finalize()
+def _create_session_isolated(store_factory, directory: str, arguments: dict) -> str:
+    manifest = store_factory(directory).create(**arguments)
+    return manifest.content_sha256
+
+
+def _finalize_session_isolated(store_factory, directory: str) -> str:
+    manifest = store_factory(directory).finalize()
     return manifest.content_sha256
 
 
@@ -703,10 +711,12 @@ class IsolatedSessionStore:
         directory: str | Path,
         *,
         poll_interval_s: float = 0.004,
+        store_factory=SessionStore,
     ) -> None:
         if poll_interval_s <= 0:
             raise ValueError("writer poll interval must be positive")
         self.directory = Path(directory)
+        self._store_factory = store_factory
         self.poll_interval_s = poll_interval_s
         self._health_check: Callable[[], None] | None = None
         self._pool = ProcessPoolExecutor(
@@ -726,7 +736,9 @@ class IsolatedSessionStore:
             raise RuntimeError("isolated session writer is closed")
         if self._started:
             return
-        self._worker_pid = int(self._wait(self._pool.submit(_session_writer_ready)))
+        self._worker_pid = int(
+            self._wait(self._pool.submit(_session_writer_ready, self._store_factory))
+        )
         if self._worker_pid == os.getpid():
             raise RuntimeError("session writer did not start in a separate process")
         self._started = True
@@ -736,34 +748,35 @@ class IsolatedSessionStore:
             raise TypeError("writer health check must be callable")
         self._health_check = health_check
 
-    def append_capture(
-        self,
-        *,
-        capture_id: str,
-        pose_id: str,
-        outcome: str,
-        reason: str,
-        frames: Sequence[CaptureFrameInput] = (),
-        supported_frames: Sequence[CaptureFrameInput] = (),
-        metadata: dict | None = None,
-        recorded_at_utc: str | None = None,
-    ) -> str:
+    def append_capture(self, **arguments) -> str:
+        """Delegate the selected store's capture schema to the isolated writer."""
+
         self._require_ready()
+        for name in ("frames", "supported_frames"):
+            if name in arguments:
+                arguments[name] = tuple(arguments[name])
         return str(
             self._wait(
                 self._pool.submit(
                     _append_capture_isolated,
+                    self._store_factory,
                     str(self.directory),
-                    {
-                        "capture_id": capture_id,
-                        "pose_id": pose_id,
-                        "outcome": outcome,
-                        "reason": reason,
-                        "frames": tuple(frames),
-                        "supported_frames": tuple(supported_frames),
-                        "metadata": metadata,
-                        "recorded_at_utc": recorded_at_utc,
-                    },
+                    arguments,
+                )
+            )
+        )
+
+    def create(self, **arguments) -> str:
+        """Freeze loaded-plan artifacts outside the active control process."""
+
+        self._require_ready()
+        return str(
+            self._wait(
+                self._pool.submit(
+                    _create_session_isolated,
+                    self._store_factory,
+                    str(self.directory),
+                    arguments,
                 )
             )
         )
@@ -774,6 +787,7 @@ class IsolatedSessionStore:
             self._wait(
                 self._pool.submit(
                     _finalize_session_isolated,
+                    self._store_factory,
                     str(self.directory),
                 )
             )

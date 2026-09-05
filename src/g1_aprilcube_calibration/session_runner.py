@@ -68,6 +68,20 @@ class ScheduledFrameSource:
         return self._frames[pose_id]
 
 
+def finish_capture_or_raise_fault(
+    executor,
+    *,
+    outcome: str,
+    cause: BaseException | None = None,
+) -> None:
+    """End a capture without masking the original control fault."""
+
+    if executor.state is ExecutorState.FAULT:
+        reason = executor.fault_reason or "unknown reason"
+        raise RuntimeError(f"executor faulted during capture: {reason}") from cause
+    executor.finish_capture(outcome=outcome)
+
+
 class CaptureSessionRunner:
     """Tie raw writes to the executor's stationary capture interlock."""
 
@@ -127,10 +141,7 @@ class CaptureSessionRunner:
         outcome: str,
         cause: BaseException | None = None,
     ) -> None:
-        if self.executor.state is ExecutorState.FAULT:
-            reason = self.executor.fault_reason or "unknown reason"
-            raise RuntimeError(f"executor faulted during capture: {reason}") from cause
-        self.executor.finish_capture(outcome=outcome)
+        finish_capture_or_raise_fault(self.executor, outcome=outcome, cause=cause)
 
 
 class ApprovedSessionOrchestrator:

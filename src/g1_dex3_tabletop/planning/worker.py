@@ -9,20 +9,31 @@ from pathlib import Path
 
 import numpy as np
 
+from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.calibration.planning import (
     BilateralCalibrationPlanningRequest,
+    BilateralIKResult,
     BilateralRoutePlanningRequest,
+    build_bilateral_design_pool,
+    build_connected_bilateral_route_request,
+    select_connected_bilateral_design,
 )
 from g1_dex3_tabletop.planning.contracts import (
+    BilateralCalibrationAdapterRequest,
     CalibrationPlanRequest,
     Dex3PreparationRequest,
 )
 from g1_dex3_tabletop.planning.curobo_backend import (
+    clearance_certified_bilateral_anchor_candidates,
+    connect_bilateral_design_pool,
+    connect_selected_bilateral_design,
     inspect_model,
+    plan_bilateral_calibration_adapter,
     plan_bilateral_calibration_route,
     plan_calibration,
     plan_dex3_preparation,
     solve_bilateral_calibration_ik,
+    validate_dex3_finger_sweep,
 )
 from g1_dex3_tabletop.planning.tabletop_planner import (
     PickPlaceRetentionRouteValidator,
@@ -71,12 +82,27 @@ def build_parser() -> argparse.ArgumentParser:
         bilateral = subparsers.add_parser(command, help=help_text)
         bilateral.add_argument("--request", type=Path, required=True)
         bilateral.add_argument("--output", type=Path, required=True)
+    route_search = subparsers.add_parser(
+        "plan-bilateral-calibration-design",
+        help=("connect the full candidate pool, select the design, and certify its route"),
+    )
+    route_search.add_argument("--request", type=Path, required=True)
+    route_search.add_argument("--ik-result", type=Path, required=True)
+    route_search.add_argument("--urdf", type=Path, required=True)
+    route_search.add_argument("--route-request-output", type=Path, required=True)
+    route_search.add_argument("--output", type=Path, required=True)
     preparation_parser = subparsers.add_parser(
         "plan-dex3-preparation",
         help="plan shoulder clearance and validate the complete Dex3 finger sweep",
     )
     preparation_parser.add_argument("--request", type=Path, required=True)
     preparation_parser.add_argument("--output", type=Path, required=True)
+    adapter_parser = subparsers.add_parser(
+        "plan-bilateral-calibration-adapter",
+        help="plan the live reversible Ready-to-fixed-anchor boundary adapter",
+    )
+    adapter_parser.add_argument("--request", type=Path, required=True)
+    adapter_parser.add_argument("--output", type=Path, required=True)
     for command, help_text in (
         (
             "plan-supported-escape",
@@ -177,7 +203,16 @@ def _serve_tabletop() -> int:
                 def progress(text: str, *, event_id: int = request_id) -> None:
                     _emit({"type": "progress", "id": event_id, "message": text})
 
-                if command == "prepare-moving-grasp-mpc":
+                if command == "validate-dex3-finger-sweep":
+                    request = Dex3PreparationRequest.from_dict(message["payload"])
+                    event = {
+                        "type": "result",
+                        "id": request_id,
+                        "ok": True,
+                        "operation": command,
+                        "payload": validate_dex3_finger_sweep(request),
+                    }
+                elif command == "prepare-moving-grasp-mpc":
                     request_payload = message["payload"]
                     payload = session.prepare_moving_grasp_mpc(
                         reference_T_camera0=np.asarray(
@@ -253,7 +288,10 @@ def _serve_tabletop() -> int:
                     output_path = Path(message["output"])
                     if output_path.exists():
                         raise FileExistsError(f"planner output already exists: {output_path}")
-                    if command == "plan-tabletop-lifecycle":
+                    if command == "plan-bilateral-calibration-adapter":
+                        request = BilateralCalibrationAdapterRequest.from_json(request_path)
+                        result = plan_bilateral_calibration_adapter(request, progress=progress)
+                    elif command == "plan-tabletop-lifecycle":
                         request = TabletopTaskRequest.from_json(request_path)
                         result = session.plan_lifecycle(request, progress=progress)
                     elif command == "plan-supported-escape":
@@ -346,6 +384,99 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "inspect-model":
             request = CalibrationPlanRequest.from_json(args.request)
             print(json.dumps(inspect_model(request), indent=2, sort_keys=True))
+            return 0
+        if args.command == "plan-bilateral-calibration-design":
+            if args.output.exists():
+                raise FileExistsError(f"planner output already exists: {args.output}")
+            if args.route_request_output.exists():
+                raise FileExistsError(
+                    f"route-request output already exists: {args.route_request_output}"
+                )
+            planning_request = BilateralCalibrationPlanningRequest.from_json(args.request)
+            ik_result = BilateralIKResult.from_json(args.ik_result)
+            ik_result.validate_request(planning_request)
+            urdf_model = URDFModel(args.urdf)
+
+            def progress(message: str) -> None:
+                print(message, file=sys.stderr, flush=True)
+
+            anchor_candidates, anchor_clearance = clearance_certified_bilateral_anchor_candidates(
+                planning_request,
+                ik_result,
+            )
+            progress(
+                "clearance-certified bilateral anchor sources: "
+                + ", ".join(f"{side}={len(values)}" for side, values in anchor_candidates.items())
+            )
+            pool = build_bilateral_design_pool(
+                planning_request,
+                ik_result,
+                urdf_model,
+                anchor_candidate_ids_by_arm=anchor_candidates,
+            )
+            connectivity = connect_bilateral_design_pool(
+                planning_request,
+                pool,
+                progress=progress,
+            )
+            selection = select_connected_bilateral_design(
+                planning_request,
+                pool,
+                connected_candidate_ids_by_arm=(connectivity.connected_candidate_ids_by_arm),
+            )
+            selected_edges, selected_connectivity = connect_selected_bilateral_design(
+                planning_request,
+                pool,
+                selection,
+                progress=progress,
+            )
+            route_request = build_connected_bilateral_route_request(
+                planning_request,
+                ik_result,
+                pool,
+                connected_candidate_ids_by_arm=(connectivity.connected_candidate_ids_by_arm),
+                valid_edges_by_arm=selected_edges,
+                connectivity_provenance={
+                    **connectivity.provenance,
+                    "anchor_source_clearance": anchor_clearance,
+                    "selected_graph": selected_connectivity,
+                },
+                selection=selection,
+            )
+            route_result = plan_bilateral_calibration_route(
+                route_request,
+                progress=progress,
+            )
+            route_result.validate_request(route_request)
+            route_request.write_json(args.route_request_output)
+            route_result.write_json(args.output)
+            if not route_result.connected:
+                raise RuntimeError(
+                    "the independently replayed valid graph differs from its "
+                    f"candidate-pool certification: {route_result.disconnected_candidate_ids}"
+                )
+            print(
+                json.dumps(
+                    {
+                        "commands_robot": False,
+                        "connected": True,
+                        "connected_candidate_count_by_arm": {
+                            side: len(values)
+                            for side, values in (
+                                connectivity.connected_candidate_ids_by_arm.items()
+                            )
+                        },
+                        "operation": args.command,
+                        "output": str(args.output.resolve()),
+                        "result_sha256": route_result.content_sha256,
+                        "route_request_output": str(args.route_request_output.resolve()),
+                        "route_request_sha256": route_request.content_sha256,
+                        "trajectory_count": len(route_result.transitions),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
             return 0
         if args.output.exists():
             raise FileExistsError(f"planner output already exists: {args.output}")
@@ -450,6 +581,20 @@ def main(argv: list[str] | None = None) -> int:
                 "plan_sha256": result.content_sha256,
                 "outward_offset_rad": result.outward_offset_rad,
                 "finger_sweep_sample_count": result.finger_sweep_sample_count,
+                "return_sweep_sample_count": result.return_sweep_sample_count,
+            }
+        elif args.command == "plan-bilateral-calibration-adapter":
+            request = BilateralCalibrationAdapterRequest.from_json(args.request)
+            result = plan_bilateral_calibration_adapter(
+                request,
+                progress=lambda message: print(message, file=sys.stderr, flush=True),
+            )
+            summary = {
+                "commands_robot": False,
+                "output": str(args.output.resolve()),
+                "plan_sha256": result.content_sha256,
+                "locked_joint_error_rad": (result.maximum_locked_joint_error_rad_observed),
+                "operation": args.command,
             }
         elif args.command == "solve-bilateral-calibration-ik":
             request = BilateralCalibrationPlanningRequest.from_json(args.request)

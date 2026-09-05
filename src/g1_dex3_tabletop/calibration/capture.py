@@ -37,6 +37,10 @@ from g1_aprilcube_calibration.timestamp_pairing import (
 _SIDES = ("left", "right")
 
 
+class BilateralGracefulStopRequested(RuntimeError):
+    """The operator requested a certified return instead of an emergency stop."""
+
+
 @dataclass(frozen=True, slots=True)
 class BilateralFrameEvidence:
     """One raw image with two detections and exactly one paired state window."""
@@ -156,7 +160,9 @@ class BilateralLiveBurstSource:
         pose_local_rejection_seen = False
         while len(accepted) < self.config.frame_count:
             if self.cancelled():
-                raise RuntimeError("operator cancelled bilateral live burst")
+                raise BilateralGracefulStopRequested(
+                    "operator requested a graceful bilateral return"
+                )
             if self.clock.monotonic() >= deadline:
                 error_type = RecoverableCaptureError if pose_local_rejection_seen else RuntimeError
                 raise error_type(

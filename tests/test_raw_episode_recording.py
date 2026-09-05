@@ -182,8 +182,11 @@ def test_read_bag_metadata_preserves_topic_types_and_counts(tmp_path: Path) -> N
     assert result["size_bytes"] > 4
 
 
+@pytest.mark.parametrize(
+    "profile_name", [recording.PROFILE_NAME, recording.STANDING_CALIBRATION_PROFILE_NAME]
+)
 def test_recorder_writes_spark_artifacts_and_audits_completion(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, profile_name
 ) -> None:
     popen_call: dict = {}
 
@@ -227,6 +230,7 @@ def test_recorder_writes_spark_artifacts_and_audits_completion(
         episode,
         repository=Path(__file__).resolve().parents[1],
         topics=(topic,),
+        profile_name=profile_name,
     )
 
     recorder.start()
@@ -269,8 +273,23 @@ def test_recorder_writes_spark_artifacts_and_audits_completion(
     assert manifest["capture"]["complete"] is True
     assert manifest["episode"]["episode_id"] == "run_001"
     assert manifest["profile"]["camera_recording_enabled"] is False
+    assert manifest["profile"]["name"] == profile_name
+    assert f"Profile: `{profile_name}`" in recorder.notes_path.read_text()
     assert manifest["provenance"]["design_source"]["commit"] == recording.SPARK_COMMIT
     assert recorder.notes_path.is_file()
+
+
+def test_recorder_health_check_detects_exit_during_operator_wait(tmp_path):
+    from types import SimpleNamespace
+
+    recorder = recording.RawEpisodeRecorder(tmp_path / "raw_episode", repository=tmp_path)
+    with pytest.raises(RuntimeError, match="was not started"):
+        recorder.check()
+    recorder._process = SimpleNamespace(poll=lambda: None)
+    recorder.check()
+    recorder._process = SimpleNamespace(poll=lambda: 1)
+    with pytest.raises(RuntimeError, match="exited with 1"):
+        recorder.check()
 
 
 def test_recorder_refuses_start_without_every_requested_subscription(

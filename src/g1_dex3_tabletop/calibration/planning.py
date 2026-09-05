@@ -18,6 +18,7 @@ from g1_aprilcube_calibration.joint_map import (
     arm_joint_names,
     validate_full_joint_vector,
 )
+from g1_aprilcube_calibration.pose_schema import HANDOFF_POSE_ID
 from g1_aprilcube_calibration.transforms import validate_transform
 from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.calibration.design import (
@@ -26,7 +27,7 @@ from g1_dex3_tabletop.calibration.design import (
     BilateralDesignConfig,
     BilateralDesignSelection,
     BilateralPoseDesignArtifact,
-    build_repeated_anchor_schedule,
+    build_valid_graph_route_schedule,
     linearize_design_candidate,
     select_bilateral_design,
 )
@@ -43,6 +44,8 @@ from g1_dex3_tabletop.calibration.models import (
 from g1_dex3_tabletop.calibration.projection import BilateralCalibrationProjection
 from g1_dex3_tabletop.planning.contracts import (
     CalibrationCandidate,
+    Dex3PreparationPlan,
+    Dex3PreparationRequest,
     RobotSnapshot,
     atomic_write_json,
 )
@@ -84,6 +87,17 @@ def _side_mapping(value: dict[str, Any], *, name: str) -> dict[str, Any]:
     if set(value) != set(_SIDES):
         raise ValueError(f"{name} must contain left and right")
     return dict(value)
+
+
+def _dex3_mapping(value: dict[str, Any], *, name: str) -> dict[str, tuple[float, ...]]:
+    values = _side_mapping(value, name=name)
+    result: dict[str, tuple[float, ...]] = {}
+    for side in _SIDES:
+        posture = np.asarray(values[side], dtype=np.float64).reshape(-1)
+        if posture.shape != (7,) or not np.all(np.isfinite(posture)):
+            raise ValueError(f"{name} {side} posture must contain seven finite values")
+        result[side] = tuple(float(item) for item in posture)
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +146,9 @@ class BilateralCalibrationPlanningRequest:
     robot_model: str
     urdf_sha256: str
     snapshot: RobotSnapshot
+    clearance_snapshot: RobotSnapshot
+    dex3_preparation_request: Dex3PreparationRequest
+    dex3_preparation_plan: Dex3PreparationPlan
     camera_info: dict[str, Any]
     camera_frames: CameraFrameArtifact
     design_model: BilateralModelSpec
@@ -140,6 +157,8 @@ class BilateralCalibrationPlanningRequest:
     nominal_torso_T_camera: tuple[tuple[float, ...], ...]
     nominal_hand_T_targets: dict[str, tuple[tuple[float, ...], ...]]
     joint_position_offsets_rad: dict[str, float]
+    dex3_command_positions_rad: dict[str, tuple[float, ...]]
+    dex3_model_positions_rad: dict[str, tuple[float, ...]]
     candidates_by_arm: dict[str, tuple[CalibrationCandidate, ...]]
     target_artifact_sha256_by_arm: dict[str, str]
     target_corner_tag_ids_by_arm: dict[str, tuple[int, ...]]
@@ -147,10 +166,10 @@ class BilateralCalibrationPlanningRequest:
     ik_batch_size: int
     random_seed: int
     source_provenance: dict[str, Any]
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError("unsupported bilateral planning-request schema version")
         if not self.robot_model.strip():
             raise ValueError("bilateral planning robot model must be non-empty")
@@ -161,6 +180,25 @@ class BilateralCalibrationPlanningRequest:
             if isinstance(self.snapshot, RobotSnapshot)
             else RobotSnapshot.from_dict(self.snapshot)
         )
+        clearance_snapshot = (
+            self.clearance_snapshot
+            if isinstance(self.clearance_snapshot, RobotSnapshot)
+            else RobotSnapshot.from_dict(self.clearance_snapshot)
+        )
+        preparation_request = (
+            self.dex3_preparation_request
+            if isinstance(self.dex3_preparation_request, Dex3PreparationRequest)
+            else Dex3PreparationRequest.from_dict(self.dex3_preparation_request)
+        )
+        preparation_plan = (
+            self.dex3_preparation_plan
+            if isinstance(self.dex3_preparation_plan, Dex3PreparationPlan)
+            else Dex3PreparationPlan.from_dict(self.dex3_preparation_plan)
+        )
+        if preparation_request.snapshot != snapshot:
+            raise ValueError("Dex3 preparation did not start from the bilateral Ready snapshot")
+        if preparation_plan.request_sha256 != preparation_request.content_sha256:
+            raise ValueError("Dex3 preparation plan belongs to a different request")
         camera_info = RectifiedCameraInfo.from_dict(dict(self.camera_info))
         camera_frames = (
             self.camera_frames
@@ -251,7 +289,46 @@ class BilateralCalibrationPlanningRequest:
             raise ValueError("bilateral IK batch size must be positive")
         if isinstance(self.random_seed, bool) or not isinstance(self.random_seed, int):
             raise TypeError("bilateral planning random seed must be an integer")
+        command_positions = _dex3_mapping(
+            self.dex3_command_positions_rad,
+            name="Dex3 command",
+        )
+        model_positions = _dex3_mapping(
+            self.dex3_model_positions_rad,
+            name="Dex3 model",
+        )
+        if preparation_request.left_target_q_rad != command_positions["left"] or (
+            preparation_request.right_target_q_rad != command_positions["right"]
+        ):
+            raise ValueError("Dex3 preparation targets differ from the commissioned close")
+        if (
+            preparation_request.left_settled_target_q_rad != model_positions["left"]
+            or preparation_request.right_settled_target_q_rad != model_positions["right"]
+            or preparation_request.left_return_target_q_rad is None
+            or preparation_request.right_return_target_q_rad is None
+            or preparation_plan.return_sweep_sample_count < 2
+        ):
+            raise ValueError(
+                "Dex3 preparation did not certify empty-close to its declared open posture"
+            )
+        clearance_q = np.asarray(clearance_snapshot.measured_q29_rad, dtype=np.float64)
+        clearance_q14 = clearance_q[
+            np.asarray((*arm_indices("left"), *arm_indices("right")), dtype=np.int64)
+        ]
+        if (
+            np.max(np.abs(clearance_q14 - np.asarray(preparation_plan.dual_clearance_q14_rad)))
+            > _POSE_EPSILON_RAD
+        ):
+            raise ValueError("bilateral clearance snapshot differs from its preparation plan")
+        if (
+            clearance_snapshot.left_dex3_q_rad != model_positions["left"]
+            or clearance_snapshot.right_dex3_q_rad != model_positions["right"]
+        ):
+            raise ValueError("bilateral clearance snapshot must use the closed-hand model")
         object.__setattr__(self, "snapshot", snapshot)
+        object.__setattr__(self, "clearance_snapshot", clearance_snapshot)
+        object.__setattr__(self, "dex3_preparation_request", preparation_request)
+        object.__setattr__(self, "dex3_preparation_plan", preparation_plan)
         object.__setattr__(self, "camera_info", camera_info.to_dict())
         object.__setattr__(self, "camera_frames", camera_frames)
         object.__setattr__(self, "design_model", model)
@@ -264,6 +341,16 @@ class BilateralCalibrationPlanningRequest:
         )
         object.__setattr__(self, "nominal_hand_T_targets", nominal_targets)
         object.__setattr__(self, "joint_position_offsets_rad", dict(sorted(offsets.items())))
+        object.__setattr__(
+            self,
+            "dex3_command_positions_rad",
+            command_positions,
+        )
+        object.__setattr__(
+            self,
+            "dex3_model_positions_rad",
+            model_positions,
+        )
         object.__setattr__(self, "candidates_by_arm", candidates)
         object.__setattr__(self, "target_artifact_sha256_by_arm", hashes)
         object.__setattr__(self, "target_corner_tag_ids_by_arm", tag_ids)
@@ -284,6 +371,9 @@ class BilateralCalibrationPlanningRequest:
             "robot_model": self.robot_model,
             "urdf_sha256": self.urdf_sha256,
             "snapshot": self.snapshot.to_dict(),
+            "clearance_snapshot": self.clearance_snapshot.to_dict(),
+            "dex3_preparation_request": self.dex3_preparation_request.to_dict(),
+            "dex3_preparation_plan": self.dex3_preparation_plan.to_dict(),
             "camera_info": self.camera_info,
             "camera_frames": self.camera_frames.to_dict(),
             "design_model": self.design_model.to_dict(),
@@ -294,6 +384,12 @@ class BilateralCalibrationPlanningRequest:
                 side: [list(row) for row in self.nominal_hand_T_targets[side]] for side in _SIDES
             },
             "joint_position_offsets_rad": self.joint_position_offsets_rad,
+            "dex3_command_positions_rad": {
+                side: list(self.dex3_command_positions_rad[side]) for side in _SIDES
+            },
+            "dex3_model_positions_rad": {
+                side: list(self.dex3_model_positions_rad[side]) for side in _SIDES
+            },
             "candidates_by_arm": {
                 side: [item.to_dict() for item in self.candidates_by_arm[side]] for side in _SIDES
             },
@@ -320,6 +416,9 @@ class BilateralCalibrationPlanningRequest:
             "robot_model",
             "urdf_sha256",
             "snapshot",
+            "clearance_snapshot",
+            "dex3_preparation_request",
+            "dex3_preparation_plan",
             "camera_info",
             "camera_frames",
             "design_model",
@@ -328,6 +427,8 @@ class BilateralCalibrationPlanningRequest:
             "nominal_torso_T_camera",
             "nominal_hand_T_targets",
             "joint_position_offsets_rad",
+            "dex3_command_positions_rad",
+            "dex3_model_positions_rad",
             "candidates_by_arm",
             "target_artifact_sha256_by_arm",
             "target_corner_tag_ids_by_arm",
@@ -502,17 +603,23 @@ class BilateralRoutePlanningRequest:
     robot_model: str
     urdf_sha256: str
     snapshot: RobotSnapshot
+    clearance_snapshot: RobotSnapshot
+    dex3_preparation_request: Dex3PreparationRequest
+    dex3_preparation_plan: Dex3PreparationPlan
     joint_position_offsets_rad: dict[str, float]
+    dex3_command_positions_rad: dict[str, tuple[float, ...]]
+    dex3_model_positions_rad: dict[str, tuple[float, ...]]
+    anchor_candidate_ids_by_arm: dict[str, str]
     parameter_names: tuple[str, ...]
     selection: BilateralDesignSelection
     schedule: tuple[BilateralCaptureWaypoint, ...]
     waypoint_joint_positions_rad: dict[str, tuple[float, ...]]
     design_provenance: dict[str, Any]
     random_seed: int
-    schema_version: int = 1
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 3:
             raise ValueError("unsupported bilateral route-request schema version")
         for name in ("planning_request_sha256", "ik_result_sha256", "urdf_sha256"):
             if not _SHA256_PATTERN.fullmatch(getattr(self, name)):
@@ -526,6 +633,25 @@ class BilateralRoutePlanningRequest:
             if isinstance(self.snapshot, RobotSnapshot)
             else RobotSnapshot.from_dict(self.snapshot)
         )
+        clearance_snapshot = (
+            self.clearance_snapshot
+            if isinstance(self.clearance_snapshot, RobotSnapshot)
+            else RobotSnapshot.from_dict(self.clearance_snapshot)
+        )
+        preparation_request = (
+            self.dex3_preparation_request
+            if isinstance(self.dex3_preparation_request, Dex3PreparationRequest)
+            else Dex3PreparationRequest.from_dict(self.dex3_preparation_request)
+        )
+        preparation_plan = (
+            self.dex3_preparation_plan
+            if isinstance(self.dex3_preparation_plan, Dex3PreparationPlan)
+            else Dex3PreparationPlan.from_dict(self.dex3_preparation_plan)
+        )
+        if preparation_request.snapshot != snapshot:
+            raise ValueError("route Dex3 preparation did not start from Ready")
+        if preparation_plan.request_sha256 != preparation_request.content_sha256:
+            raise ValueError("route Dex3 preparation plan belongs to a different request")
         selection = (
             self.selection
             if isinstance(self.selection, BilateralDesignSelection)
@@ -548,15 +674,31 @@ class BilateralRoutePlanningRequest:
         }
         if set(poses) != {item.candidate_id for item in schedule}:
             raise ValueError("bilateral route request does not define every waypoint")
-        anchor_candidate_ids = {
-            item.candidate_id for item in schedule if item.capture_role == "anchor"
-        }
-        if len(anchor_candidate_ids) != 1:
+        anchor_pose_ids = {item.candidate_id for item in schedule if item.capture_role == "anchor"}
+        if len(anchor_pose_ids) != 1:
             raise ValueError("bilateral route request must use one repeated anchor pose")
-        anchor_q = np.asarray(poses[next(iter(anchor_candidate_ids))], dtype=np.float64)
-        snapshot_q = np.asarray(snapshot.measured_q29_rad, dtype=np.float64)
-        if np.max(np.abs(anchor_q - snapshot_q)) > _POSE_EPSILON_RAD:
-            raise ValueError("bilateral route anchor differs from the planning snapshot")
+        if (
+            schedule[0].occurrence_id != HANDOFF_POSE_ID
+            or schedule[-1].occurrence_id != HANDOFF_POSE_ID
+            or schedule[0].capture_role != "anchor"
+            or schedule[-1].capture_role != "anchor"
+            or schedule[0].candidate_id != schedule[-1].candidate_id
+            or any(item.hand_action is not None for item in schedule)
+        ):
+            raise ValueError(
+                "bilateral route request must be a hand-action-free anchor-to-anchor core"
+            )
+        anchors = {
+            str(side): str(candidate_id)
+            for side, candidate_id in _side_mapping(
+                self.anchor_candidate_ids_by_arm,
+                name="anchor source candidates",
+            ).items()
+        }
+        if any(not value.strip() for value in anchors.values()):
+            raise ValueError("bilateral anchor source candidate IDs must be non-empty")
+        if len(set(anchors.values())) != 2:
+            raise ValueError("bilateral anchor must use distinct left and right candidates")
         for index in range(len(schedule) - 1):
             self._transition_arm_from(schedule, poses, index)
         offsets = {
@@ -567,12 +709,51 @@ class BilateralRoutePlanningRequest:
             for name, value in offsets.items()
         ):
             raise ValueError("bilateral route joint offsets are invalid")
+        command_positions = _dex3_mapping(
+            self.dex3_command_positions_rad,
+            name="Dex3 command",
+        )
+        model_positions = _dex3_mapping(
+            self.dex3_model_positions_rad,
+            name="Dex3 model",
+        )
+        if preparation_request.left_target_q_rad != command_positions["left"] or (
+            preparation_request.right_target_q_rad != command_positions["right"]
+        ):
+            raise ValueError("route Dex3 preparation targets differ from fixed-close")
+        if (
+            preparation_request.left_settled_target_q_rad != model_positions["left"]
+            or preparation_request.right_settled_target_q_rad != model_positions["right"]
+            or preparation_request.left_return_target_q_rad is None
+            or preparation_request.right_return_target_q_rad is None
+            or preparation_plan.return_sweep_sample_count < 2
+        ):
+            raise ValueError("route Dex3 preparation lacks the declared open-hand sweep")
+        if (
+            clearance_snapshot.left_dex3_q_rad != model_positions["left"]
+            or clearance_snapshot.right_dex3_q_rad != model_positions["right"]
+        ):
+            raise ValueError("route clearance snapshot must use the closed-hand model")
         object.__setattr__(self, "snapshot", snapshot)
+        object.__setattr__(self, "clearance_snapshot", clearance_snapshot)
+        object.__setattr__(self, "dex3_preparation_request", preparation_request)
+        object.__setattr__(self, "dex3_preparation_plan", preparation_plan)
         object.__setattr__(self, "selection", selection)
         object.__setattr__(self, "schedule", schedule)
         object.__setattr__(self, "parameter_names", names)
         object.__setattr__(self, "waypoint_joint_positions_rad", poses)
         object.__setattr__(self, "joint_position_offsets_rad", dict(sorted(offsets.items())))
+        object.__setattr__(
+            self,
+            "dex3_command_positions_rad",
+            command_positions,
+        )
+        object.__setattr__(
+            self,
+            "dex3_model_positions_rad",
+            model_positions,
+        )
+        object.__setattr__(self, "anchor_candidate_ids_by_arm", anchors)
         object.__setattr__(
             self,
             "design_provenance",
@@ -618,6 +799,20 @@ class BilateralRoutePlanningRequest:
         )
 
     @property
+    def anchor_candidate_id(self) -> str:
+        return next(item.candidate_id for item in self.schedule if item.capture_role == "anchor")
+
+    @property
+    def calibration_snapshot(self) -> RobotSnapshot:
+        """Full selected anchor with the commissioned empty-close collision model."""
+
+        return RobotSnapshot(
+            measured_q29_rad=self.waypoint_joint_positions_rad[self.anchor_candidate_id],
+            left_dex3_q_rad=self.dex3_model_positions_rad["left"],
+            right_dex3_q_rad=self.dex3_model_positions_rad["right"],
+        )
+
+    @property
     def content_sha256(self) -> str:
         return _content_sha256(self.to_dict(include_hash=False))
 
@@ -629,7 +824,17 @@ class BilateralRoutePlanningRequest:
             "robot_model": self.robot_model,
             "urdf_sha256": self.urdf_sha256,
             "snapshot": self.snapshot.to_dict(),
+            "clearance_snapshot": self.clearance_snapshot.to_dict(),
+            "dex3_preparation_request": self.dex3_preparation_request.to_dict(),
+            "dex3_preparation_plan": self.dex3_preparation_plan.to_dict(),
             "joint_position_offsets_rad": self.joint_position_offsets_rad,
+            "dex3_command_positions_rad": {
+                side: list(self.dex3_command_positions_rad[side]) for side in _SIDES
+            },
+            "dex3_model_positions_rad": {
+                side: list(self.dex3_model_positions_rad[side]) for side in _SIDES
+            },
+            "anchor_candidate_ids_by_arm": self.anchor_candidate_ids_by_arm,
             "parameter_names": list(self.parameter_names),
             "selection": self.selection.to_dict(),
             "schedule": [item.to_dict() for item in self.schedule],
@@ -653,7 +858,13 @@ class BilateralRoutePlanningRequest:
             "robot_model",
             "urdf_sha256",
             "snapshot",
+            "clearance_snapshot",
+            "dex3_preparation_request",
+            "dex3_preparation_plan",
             "joint_position_offsets_rad",
+            "dex3_command_positions_rad",
+            "dex3_model_positions_rad",
+            "anchor_candidate_ids_by_arm",
             "parameter_names",
             "selection",
             "schedule",
@@ -682,11 +893,13 @@ class BilateralRoutePlanningResult:
     request_sha256: str
     transitions: tuple[BilateralPlannedTransition, ...]
     disconnected_candidate_ids: tuple[str, ...]
+    finger_sweep_sample_count: int
+    restoration_sweep_sample_count: int
     planner_provenance: dict[str, Any]
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError("unsupported bilateral route-result schema version")
         if not _SHA256_PATTERN.fullmatch(self.request_sha256):
             raise ValueError("bilateral route request hash must be lowercase SHA-256")
@@ -703,6 +916,16 @@ class BilateralRoutePlanningResult:
             raise ValueError(
                 "bilateral route result must contain either transitions or disconnections"
             )
+        if transitions and self.finger_sweep_sample_count < 2:
+            raise ValueError("connected bilateral route requires a certified closing sweep")
+        if transitions and self.restoration_sweep_sample_count < 2:
+            raise ValueError(
+                "connected bilateral route requires a certified Ready-hand restoration sweep"
+            )
+        if disconnected and (
+            self.finger_sweep_sample_count != 0 or self.restoration_sweep_sample_count != 0
+        ):
+            raise ValueError("disconnected bilateral route cannot certify finger sweeps")
         object.__setattr__(self, "transitions", transitions)
         object.__setattr__(self, "disconnected_candidate_ids", disconnected)
         object.__setattr__(
@@ -722,8 +945,16 @@ class BilateralRoutePlanningResult:
     def validate_request(self, request: BilateralRoutePlanningRequest) -> None:
         if self.request_sha256 != request.content_sha256:
             raise ValueError("bilateral route result belongs to a different request")
-        selected_ids = {item.candidate_id for item in request.selection.candidates}
-        if not set(self.disconnected_candidate_ids).issubset(selected_ids):
+        rejectable_ids = {
+            *(item.candidate_id for item in request.selection.candidates),
+            *request.anchor_candidate_ids_by_arm.values(),
+            *(
+                item.candidate_id
+                for item in request.schedule
+                if item.capture_role == "preparation"
+            ),
+        }
+        if not set(self.disconnected_candidate_ids).issubset(rejectable_ids):
             raise ValueError("bilateral route result rejected an unknown candidate")
         if self.connected:
             expected = tuple(
@@ -745,6 +976,8 @@ class BilateralRoutePlanningResult:
             "request_sha256": self.request_sha256,
             "transitions": [item.to_dict() for item in self.transitions],
             "disconnected_candidate_ids": list(self.disconnected_candidate_ids),
+            "finger_sweep_sample_count": self.finger_sweep_sample_count,
+            "restoration_sweep_sample_count": self.restoration_sweep_sample_count,
             "planner_provenance": self.planner_provenance,
         }
         if include_hash:
@@ -758,6 +991,8 @@ class BilateralRoutePlanningResult:
             "request_sha256",
             "transitions",
             "disconnected_candidate_ids",
+            "finger_sweep_sample_count",
+            "restoration_sweep_sample_count",
             "planner_provenance",
             "content_sha256",
         }
@@ -776,25 +1011,200 @@ class BilateralRoutePlanningResult:
         atomic_write_json(path, self.to_dict())
 
 
-def build_bilateral_route_request(
+def _select_bilateral_anchor(
+    request: BilateralCalibrationPlanningRequest,
+    ik_result: BilateralIKResult,
+    projection: BilateralCalibrationProjection,
+    parameters: dict[str, float],
+    *,
+    excluded_candidate_ids: set[str],
+) -> tuple[dict[str, str], np.ndarray, dict[str, Any]]:
+    """Choose one both-visible anchor without reprojecting every arm pair.
+
+    With the camera and body fixed, each marker projection depends only on its
+    own arm.  Project every feasible arm pose once, then combine the retained
+    centroids algebraically.  The previous Cartesian pair loop repeated full
+    FK/projection tens of thousands of times for no additional information.
+    """
+
+    clearance_q = np.asarray(request.clearance_snapshot.measured_q29_rad, dtype=np.float64)
+    by_side: dict[str, list[tuple[float, BilateralFeasiblePose, np.ndarray]]] = {
+        "left": [],
+        "right": [],
+    }
+    visibility_rejections: list[dict[str, str]] = []
+    for pose in ik_result.poses:
+        if pose.candidate_id in excluded_candidate_ids:
+            continue
+        indices = np.asarray(arm_indices(pose.active_arm), dtype=np.int64)
+        distance = float(
+            np.linalg.norm(np.asarray(pose.active_command_q_rad) - clearance_q[indices])
+        )
+        full_q = clearance_q.copy()
+        full_q[indices] = np.asarray(pose.active_command_q_rad, dtype=np.float64)
+        try:
+            _sample, projected = _predicted_sample(
+                request,
+                projection,
+                parameters,
+                candidate_id=pose.candidate_id,
+                full_q=full_q,
+                capture_role="anchor",
+            )
+            centroid = _single_target_visibility_centroid(
+                request,
+                side=pose.active_arm,
+                projected=projected[pose.active_arm],
+            )
+        except ValueError as error:
+            visibility_rejections.append({"candidate_id": pose.candidate_id, "reason": str(error)})
+            continue
+        by_side[pose.active_arm].append((distance, pose, centroid))
+    for side in _SIDES:
+        by_side[side].sort(key=lambda item: (item[0], item[1].candidate_id))
+        if not by_side[side]:
+            raise ValueError(f"no {side} CuRobo-feasible candidate remains for the anchor")
+
+    candidates: list[tuple[float, float, str, str, np.ndarray]] = []
+    separation_rejections = 0
+    for left_distance, left_pose, left_centroid in by_side["left"]:
+        for right_distance, right_pose, right_centroid in by_side["right"]:
+            target_separation_px = float(np.linalg.norm(left_centroid - right_centroid))
+            if target_separation_px < request.visibility_config.minimum_target_separation_px:
+                separation_rejections += 1
+                continue
+            full_q = clearance_q.copy()
+            full_q[np.asarray(arm_indices("left"), dtype=np.int64)] = np.asarray(
+                left_pose.active_command_q_rad, dtype=np.float64
+            )
+            full_q[np.asarray(arm_indices("right"), dtype=np.int64)] = np.asarray(
+                right_pose.active_command_q_rad, dtype=np.float64
+            )
+            clearance_motion = max(left_distance, right_distance) + 0.1 * (
+                left_distance + right_distance
+            )
+            candidates.append(
+                (
+                    clearance_motion,
+                    -target_separation_px,
+                    left_pose.candidate_id,
+                    right_pose.candidate_id,
+                    full_q.copy(),
+                )
+            )
+    if not candidates:
+        raise ValueError("no CuRobo-feasible left/right candidate pair keeps both targets visible")
+    clearance_motion, negative_separation, left_id, right_id, anchor_q = min(
+        candidates,
+        key=lambda item: (item[0], item[1], item[2], item[3]),
+    )
+    pair_id = f"{left_id}+{right_id}"
+    _sample, projected = _predicted_sample(
+        request,
+        projection,
+        parameters,
+        candidate_id=pair_id,
+        full_q=anchor_q,
+        capture_role="anchor",
+    )
+    _visibility_bins(request, projected)
+    return (
+        {"left": left_id, "right": right_id},
+        anchor_q,
+        {
+            "policy": (
+                "single_projection_per_arm_then_minimum_clearance_motion_among_"
+                "same_frame_visible_pairs_with_separation_as_tiebreaker"
+            ),
+            "candidate_pool_size_by_arm": {side: len(by_side[side]) for side in _SIDES},
+            "evaluated_pair_count": len(by_side["left"]) * len(by_side["right"]),
+            "visible_pair_count": len(candidates),
+            "selected_target_separation_px": -negative_separation,
+            "selected_clearance_motion_score": clearance_motion,
+            "visibility_rejections": visibility_rejections,
+            "separation_rejection_count": separation_rejections,
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class BilateralDesignPool:
+    """Same-frame-visible design candidates around one immutable anchor."""
+
+    parameter_names: tuple[str, ...]
+    nominal_parameter_values: dict[str, float]
+    anchor_candidate_ids_by_arm: dict[str, str]
+    anchor_q29_rad: tuple[float, ...]
+    candidates: tuple[BilateralDesignCandidate, ...]
+    full_q29_rad_by_candidate_id: dict[str, tuple[float, ...]]
+    visibility_rejections: tuple[dict[str, str], ...]
+    anchor_search: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        names = tuple(str(value) for value in self.parameter_names)
+        if not names or len(names) != len(set(names)):
+            raise ValueError("bilateral design-pool parameters must be unique and non-empty")
+        anchors = {
+            str(side): str(candidate_id)
+            for side, candidate_id in self.anchor_candidate_ids_by_arm.items()
+        }
+        if set(anchors) != set(_SIDES) or len(set(anchors.values())) != 2:
+            raise ValueError("bilateral design pool must bind distinct arm anchor candidates")
+        candidates = tuple(self.candidates)
+        candidate_ids = {item.candidate_id for item in candidates}
+        if len(candidate_ids) != len(candidates):
+            raise ValueError("bilateral design-pool candidate IDs must be unique")
+        poses = {
+            str(candidate_id): tuple(validate_full_joint_vector(q))
+            for candidate_id, q in self.full_q29_rad_by_candidate_id.items()
+        }
+        required = {
+            "ready",
+            "right_shoulder_clearance",
+            "dual_shoulder_clearance",
+            "right_anchor_preparation",
+            "bilateral_anchor",
+            *candidate_ids,
+        }
+        if set(poses) != required:
+            raise ValueError("bilateral design pool does not define every candidate pose")
+        anchor = tuple(validate_full_joint_vector(self.anchor_q29_rad))
+        if poses["bilateral_anchor"] != anchor:
+            raise ValueError("bilateral design-pool anchor pose is inconsistent")
+        object.__setattr__(self, "parameter_names", names)
+        object.__setattr__(self, "anchor_candidate_ids_by_arm", anchors)
+        object.__setattr__(self, "anchor_q29_rad", anchor)
+        object.__setattr__(self, "candidates", candidates)
+        object.__setattr__(self, "full_q29_rad_by_candidate_id", poses)
+        object.__setattr__(
+            self,
+            "nominal_parameter_values",
+            {str(name): float(value) for name, value in self.nominal_parameter_values.items()},
+        )
+        object.__setattr__(
+            self,
+            "visibility_rejections",
+            tuple(dict(value) for value in self.visibility_rejections),
+        )
+        object.__setattr__(
+            self,
+            "anchor_search",
+            _canonical_mapping(self.anchor_search, name="bilateral anchor search"),
+        )
+
+
+def build_bilateral_design_pool(
     request: BilateralCalibrationPlanningRequest,
     ik_result: BilateralIKResult,
     urdf_model: URDFModel,
     *,
-    excluded_candidate_ids: tuple[str, ...] = (),
-) -> BilateralRoutePlanningRequest:
-    """Filter same-frame visibility, score the full model, and schedule the route."""
+    anchor_candidate_ids_by_arm: dict[str, tuple[str, ...]] | None = None,
+) -> BilateralDesignPool:
+    """Linearize every same-frame-visible pose around one fixed anchor."""
 
     ik_result.validate_request(request)
     if urdf_model.name != request.robot_model or urdf_model.sha256 != request.urdf_sha256:
         raise ValueError("bilateral planning request belongs to a different projection URDF")
-    excluded = tuple(str(value) for value in excluded_candidate_ids)
-    if len(excluded) != len(set(excluded)):
-        raise ValueError("excluded bilateral candidate IDs must be unique")
-    feasible_ids = {item.candidate_id for item in ik_result.poses}
-    if not set(excluded).issubset(feasible_ids):
-        raise ValueError("cannot exclude a candidate absent from the IK result")
-
     projection = BilateralCalibrationProjection(
         urdf_model,
         camera_frames=request.camera_frames,
@@ -812,33 +1222,63 @@ def build_bilateral_route_request(
         },
         joint_position_offsets_rad=request.joint_position_offsets_rad,
     )
-    anchor_sample, anchor_projection = _predicted_sample(
+    excluded_anchor_ids: set[str] = set()
+    if anchor_candidate_ids_by_arm is not None:
+        if set(anchor_candidate_ids_by_arm) != set(_SIDES):
+            raise ValueError("clearance-certified anchor candidates must define both arms")
+        allowed = {
+            side: {str(value) for value in anchor_candidate_ids_by_arm[side]} for side in _SIDES
+        }
+        if any(not allowed[side] for side in _SIDES):
+            raise ValueError("no clearance-certified anchor candidate remains for one arm")
+        excluded_anchor_ids = {
+            pose.candidate_id
+            for pose in ik_result.poses
+            if pose.candidate_id not in allowed[pose.active_arm]
+        }
+    anchor_sources, anchor_q, anchor_search = _select_bilateral_anchor(
         request,
+        ik_result,
         projection,
         parameters,
-        candidate_id="bilateral_anchor",
-        full_q=request.snapshot.measured_q29_rad,
-        capture_role="anchor",
+        excluded_candidate_ids=excluded_anchor_ids,
     )
-    _visibility_bins(request, anchor_projection)
-    del anchor_sample
-
     limits_by_arm = {side: urdf_model.joint_limits(arm_joint_names(side)) for side in _SIDES}
-    design_candidates: list[BilateralDesignCandidate] = []
+    ready_q = np.asarray(request.snapshot.measured_q29_rad, dtype=np.float64)
+    right_clearance_q = ready_q.copy()
+    right_clearance_q[np.asarray(arm_indices("right"), dtype=np.int64)] = np.asarray(
+        request.dex3_preparation_plan.right_outbound.command_q_rad[-1],
+        dtype=np.float64,
+    )
+    dual_clearance_q = np.asarray(request.clearance_snapshot.measured_q29_rad, dtype=np.float64)
+    right_anchor_q = dual_clearance_q.copy()
+    right_anchor_q[np.asarray(arm_indices("right"), dtype=np.int64)] = anchor_q[
+        np.asarray(arm_indices("right"), dtype=np.int64)
+    ]
     full_q_by_id: dict[str, tuple[float, ...]] = {
-        "bilateral_anchor": tuple(request.snapshot.measured_q29_rad)
+        "ready": tuple(ready_q),
+        "right_shoulder_clearance": tuple(right_clearance_q),
+        "dual_shoulder_clearance": tuple(dual_clearance_q),
+        "right_anchor_preparation": tuple(right_anchor_q),
+        "bilateral_anchor": tuple(anchor_q),
     }
+    design_candidates: list[BilateralDesignCandidate] = []
     visibility_rejections: list[dict[str, str]] = []
     for pose in ik_result.poses:
-        if pose.candidate_id in excluded:
+        if pose.candidate_id in anchor_sources.values():
             continue
+        paired_q = np.asarray(anchor_q, dtype=np.float64).copy()
+        paired_q[np.asarray(arm_indices(pose.active_arm), dtype=np.int64)] = np.asarray(
+            pose.active_command_q_rad,
+            dtype=np.float64,
+        )
         try:
             predicted, projected = _predicted_sample(
                 request,
                 projection,
                 parameters,
                 candidate_id=pose.candidate_id,
-                full_q=pose.full_command_q29_rad,
+                full_q=paired_q,
                 capture_role="excitation",
             )
             coverage = _visibility_bins(request, projected)
@@ -868,33 +1308,92 @@ def build_bilateral_route_request(
                 image_coverage_bins=coverage,
             )
         )
-        full_q_by_id[pose.candidate_id] = pose.full_command_q29_rad
-
-    selection = select_bilateral_design(
-        tuple(design_candidates),
+        full_q_by_id[pose.candidate_id] = tuple(paired_q)
+    return BilateralDesignPool(
         parameter_names=projection.parameter_names,
-        config=request.design_config,
+        nominal_parameter_values=dict(sorted(parameters.items())),
+        anchor_candidate_ids_by_arm=anchor_sources,
+        anchor_q29_rad=tuple(anchor_q),
+        candidates=tuple(design_candidates),
+        full_q29_rad_by_candidate_id=full_q_by_id,
+        visibility_rejections=tuple(visibility_rejections),
+        anchor_search=anchor_search,
     )
-    route_order = {
-        side: _anchor_chunked_nearest_order(
-            tuple(item.candidate_id for item in selection.candidates if item.active_arm == side),
-            full_q_by_id=full_q_by_id,
-            arm=side,
-            anchor_interval=request.design_config.anchor_interval,
-        )
+
+
+def select_connected_bilateral_design(
+    request: BilateralCalibrationPlanningRequest,
+    pool: BilateralDesignPool,
+    *,
+    connected_candidate_ids_by_arm: dict[str, tuple[str, ...]],
+) -> BilateralDesignSelection:
+    """Select the statistical design from the rooted feasible component."""
+
+    if set(connected_candidate_ids_by_arm) != set(_SIDES):
+        raise ValueError("bilateral connectivity must define both arms")
+    candidate_by_id = {item.candidate_id: item for item in pool.candidates}
+    connected = {
+        side: tuple(str(value) for value in connected_candidate_ids_by_arm[side])
         for side in _SIDES
     }
-    schedule = build_repeated_anchor_schedule(
-        selection,
+    for side in _SIDES:
+        if len(connected[side]) != len(set(connected[side])):
+            raise ValueError(f"bilateral {side} connected candidates must be unique")
+        if any(
+            candidate_id not in candidate_by_id or candidate_by_id[candidate_id].active_arm != side
+            for candidate_id in connected[side]
+        ):
+            raise ValueError(f"bilateral {side} connectivity contains an invalid candidate")
+    eligible_ids = {candidate_id for values in connected.values() for candidate_id in values}
+    return select_bilateral_design(
+        tuple(
+            candidate for candidate in pool.candidates if candidate.candidate_id in eligible_ids
+        ),
+        parameter_names=pool.parameter_names,
+        config=request.design_config,
+    )
+
+
+def build_connected_bilateral_route_request(
+    request: BilateralCalibrationPlanningRequest,
+    ik_result: BilateralIKResult,
+    pool: BilateralDesignPool,
+    *,
+    connected_candidate_ids_by_arm: dict[str, tuple[str, ...]],
+    valid_edges_by_arm: dict[str, tuple[tuple[float, str, str], ...]],
+    connectivity_provenance: dict[str, Any],
+    selection: BilateralDesignSelection | None = None,
+) -> BilateralRoutePlanningRequest:
+    """Select anchor-connected poses and freeze short valid-graph tours."""
+
+    ik_result.validate_request(request)
+    if set(connected_candidate_ids_by_arm) != set(_SIDES) or set(valid_edges_by_arm) != set(
+        _SIDES
+    ):
+        raise ValueError("bilateral connectivity must define both arms")
+    connected = {
+        side: tuple(str(value) for value in connected_candidate_ids_by_arm[side])
+        for side in _SIDES
+    }
+    for side in _SIDES:
+        if len(connected[side]) != len(set(connected[side])):
+            raise ValueError(f"bilateral {side} connected candidates must be unique")
+    selected = selection or select_connected_bilateral_design(
+        request,
+        pool,
+        connected_candidate_ids_by_arm=connected,
+    )
+    schedule = build_valid_graph_route_schedule(
+        selected,
         anchor_candidate_id="bilateral_anchor",
         anchor_interval=request.design_config.anchor_interval,
-        candidate_order_by_arm=route_order,
+        valid_edges_by_arm=valid_edges_by_arm,
     )
-    selected_ids = {item.candidate_id for item in selection.candidates}
+    scheduled_ids = {item.candidate_id for item in schedule}
     positions = {
-        candidate_id: position
-        for candidate_id, position in full_q_by_id.items()
-        if candidate_id == "bilateral_anchor" or candidate_id in selected_ids
+        candidate_id: q
+        for candidate_id, q in pool.full_q29_rad_by_candidate_id.items()
+        if candidate_id in scheduled_ids
     }
     return BilateralRoutePlanningRequest(
         planning_request_sha256=request.content_sha256,
@@ -902,18 +1401,32 @@ def build_bilateral_route_request(
         robot_model=request.robot_model,
         urdf_sha256=request.urdf_sha256,
         snapshot=request.snapshot,
+        clearance_snapshot=request.clearance_snapshot,
+        dex3_preparation_request=request.dex3_preparation_request,
+        dex3_preparation_plan=request.dex3_preparation_plan,
         joint_position_offsets_rad=request.joint_position_offsets_rad,
-        parameter_names=projection.parameter_names,
-        selection=selection,
+        dex3_command_positions_rad=request.dex3_command_positions_rad,
+        dex3_model_positions_rad=request.dex3_model_positions_rad,
+        anchor_candidate_ids_by_arm=pool.anchor_candidate_ids_by_arm,
+        parameter_names=pool.parameter_names,
+        selection=selected,
         schedule=schedule,
         waypoint_joint_positions_rad=positions,
         design_provenance={
             "ik_feasible_count": len(ik_result.poses),
-            "same_frame_visible_candidate_count": len(design_candidates),
-            "same_frame_visibility_rejections": visibility_rejections,
-            "route_disconnected_candidate_ids_excluded": list(excluded),
-            "nominal_parameter_values": dict(sorted(parameters.items())),
-            "route_order_policy": "anchor_chunked_nearest_neighbor",
+            "same_frame_visible_candidate_count": len(pool.candidates),
+            "same_frame_visibility_rejections": list(pool.visibility_rejections),
+            "bilateral_anchor_search": pool.anchor_search,
+            "bilateral_anchor_candidate_ids_by_arm": pool.anchor_candidate_ids_by_arm,
+            "anchor_connected_candidate_count_by_arm": {
+                side: len(connected[side]) for side in _SIDES
+            },
+            "selected_valid_edges_by_arm": valid_edges_by_arm,
+            "nominal_parameter_values": pool.nominal_parameter_values,
+            "route_order_policy": (
+                "minimum_motion_cost_anchor_tours_over_selected_valid_edge_graphs"
+            ),
+            "connectivity": connectivity_provenance,
         },
         random_seed=request.random_seed,
     )
@@ -935,6 +1448,11 @@ def assemble_bilateral_planning_artifacts(
     route_result.validate_request(route_request)
     if not route_result.connected:
         raise ValueError("cannot assemble a disconnected bilateral route")
+    anchor_indices = [
+        index
+        for index, waypoint in enumerate(route_request.schedule)
+        if waypoint.capture_role == "anchor"
+    ]
     provenance = {
         **request.source_provenance,
         "planning_request_sha256": request.content_sha256,
@@ -944,6 +1462,13 @@ def assemble_bilateral_planning_artifacts(
         "ik": ik_result.planner_provenance,
         "route": route_result.planner_provenance,
         "design": route_request.design_provenance,
+        "graceful_return": {
+            "policy": "latch_at_any_capture_then_stop_at_next_identical_anchor",
+            "anchor_occurrence_ids": [
+                route_request.schedule[index].occurrence_id for index in anchor_indices
+            ],
+            "terminal_boundary": HANDOFF_POSE_ID,
+        },
     }
     design = BilateralPoseDesignArtifact(
         model_sha256=request.design_model.content_sha256,
@@ -960,10 +1485,12 @@ def assemble_bilateral_planning_artifacts(
         pose_design_sha256=design.content_sha256,
         robot_model=request.robot_model,
         urdf_sha256=request.urdf_sha256,
-        dex3_joint_positions_rad={
-            "left": request.snapshot.left_dex3_q_rad,
-            "right": request.snapshot.right_dex3_q_rad,
-        },
+        joint_position_offsets_rad=request.joint_position_offsets_rad,
+        commanded_dex3_joint_positions_rad=request.dex3_command_positions_rad,
+        modeled_dex3_joint_positions_rad=request.dex3_model_positions_rad,
+        self_clearance_certificate=dict(
+            route_result.planner_provenance["self_clearance_certificate"]
+        ),
         transitions=route_result.transitions,
         planner_provenance=provenance,
     )
@@ -1104,33 +1631,32 @@ def _visibility_bins(
     return tuple(bins)
 
 
-def _anchor_chunked_nearest_order(
-    candidate_ids: tuple[str, ...],
+def _single_target_visibility_centroid(
+    request: BilateralCalibrationPlanningRequest,
     *,
-    full_q_by_id: dict[str, tuple[float, ...]],
-    arm: str,
-    anchor_interval: int,
-) -> tuple[str, ...]:
-    indices = np.asarray(arm_indices(arm), dtype=np.int64)
-    anchor = np.asarray(full_q_by_id["bilateral_anchor"], dtype=np.float64)[indices]
-    remaining = list(candidate_ids)
-    ordered: list[str] = []
-    while remaining:
-        current = anchor
-        for _ in range(min(anchor_interval, len(remaining))):
-            chosen = min(
-                remaining,
-                key=lambda candidate_id: (
-                    float(
-                        np.linalg.norm(
-                            np.asarray(full_q_by_id[candidate_id], dtype=np.float64)[indices]
-                            - current
-                        )
-                    ),
-                    candidate_id,
-                ),
-            )
-            ordered.append(chosen)
-            remaining.remove(chosen)
-            current = np.asarray(full_q_by_id[chosen], dtype=np.float64)[indices]
-    return tuple(ordered)
+    side: str,
+    projected: tuple[np.ndarray, np.ndarray],
+) -> np.ndarray:
+    """Validate one target and return its image centroid."""
+
+    if side not in _SIDES:
+        raise ValueError("bilateral target side is invalid")
+    camera = RectifiedCameraInfo.from_dict(request.camera_info)
+    config = request.visibility_config
+    pixels = np.asarray(projected[0], dtype=np.float64)
+    depths = np.asarray(projected[1], dtype=np.float64)
+    if np.any(depths < config.minimum_depth_m) or np.any(depths > config.maximum_depth_m):
+        raise ValueError(f"{side} target depth is outside the bilateral visibility range")
+    if (
+        np.min(pixels[:, 0]) < config.image_margin_px
+        or np.max(pixels[:, 0]) > camera.width - config.image_margin_px
+        or np.min(pixels[:, 1]) < config.image_margin_px
+        or np.max(pixels[:, 1]) > camera.height - config.image_margin_px
+    ):
+        raise ValueError(f"{side} target leaves the bilateral image margin")
+    for lower in range(0, len(pixels), 4):
+        corners = pixels[lower : lower + 4]
+        spans = np.linalg.norm(corners - np.roll(corners, -1, axis=0), axis=1)
+        if float(np.min(spans)) < config.minimum_target_span_px:
+            raise ValueError(f"{side} target span is below the bilateral visibility limit")
+    return np.mean(pixels, axis=0)

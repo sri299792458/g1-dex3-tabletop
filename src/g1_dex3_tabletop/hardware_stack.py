@@ -192,6 +192,26 @@ def _clearance_perception_rejection(driver, error: Exception) -> TabletopTaskRej
     )
 
 
+class StackPerceptionBlocked(TabletopTaskRejected):
+    """A supported-start scene rejection that is safe to present to the operator."""
+
+    message = (
+        "PERCEPTION BLOCKED — both arms remain supported. Remove any occlusion, "
+        "reposition the cubes, and press SPACE to try again."
+    )
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(self.message)
+        self.detail = str(detail)
+
+
+def _supported_perception_rejection(driver, error: Exception) -> StackPerceptionBlocked:
+    """Reject the episode at its supported start only if control is still healthy."""
+
+    driver.check()
+    return StackPerceptionBlocked(str(error))
+
+
 def _ordered_arm_choices(
     *,
     reference_request: TabletopTaskRequest,
@@ -1020,20 +1040,23 @@ def run_stack(args) -> int:
                     synchronized.observe_dual_arm_control_input()
                 )
                 loaded_hands = dex_controller.observer.observe()
-                loaded_upper, loaded_bottom = _observe_pair(
-                    frame_sets["loaded"],
-                    expected_camera=expected_camera,
-                    upper_detector=upper_detector,
-                    bottom_detector=bottom_detector,
-                    snapshot=_command_bound_snapshot(
-                        loaded_state,
-                        loaded_hands,
-                        loaded_command_q14,
-                    ),
-                    quality=quality,
-                    model=model,
-                    bundle=bundle,
-                )
+                try:
+                    loaded_upper, loaded_bottom = _observe_pair(
+                        frame_sets["loaded"],
+                        expected_camera=expected_camera,
+                        upper_detector=upper_detector,
+                        bottom_detector=bottom_detector,
+                        snapshot=_command_bound_snapshot(
+                            loaded_state,
+                            loaded_hands,
+                            loaded_command_q14,
+                        ),
+                        quality=quality,
+                        model=model,
+                        bundle=bundle,
+                    )
+                except ValueError as error:
+                    raise _supported_perception_rejection(driver, error) from error
                 reference_request = build_request("left", loaded_upper, upper_profile)
                 arm_choices = _ordered_arm_choices(
                     reference_request=reference_request,
@@ -1569,11 +1592,15 @@ def run_stack(args) -> int:
                     ),
                     "controller_retained_at_supported_start": True,
                 }
-                print(
-                    "STACK TASK REJECTED — selected arm returned through its frozen "
-                    f"supported route; lowcmd remains active. Reason: {rejection}",
-                    flush=True,
-                )
+                if isinstance(rejection, StackPerceptionBlocked):
+                    status["perception_error"] = rejection.detail
+                    print(str(rejection), flush=True)
+                else:
+                    print(
+                        "STACK TASK REJECTED — selected arm returned through its frozen "
+                        f"supported route; lowcmd remains active. Reason: {rejection}",
+                        flush=True,
+                    )
             except BaseException as error:
                 episode_error = error
                 status = {

@@ -47,6 +47,8 @@ from g1_dex3_tabletop.calibration.models import (
 BILATERAL_SESSION_SCHEMA_VERSION = 1
 BILATERAL_SOURCE_ARTIFACTS = frozenset(
     {
+        "adapter_plan.json",
+        "adapter_request.json",
         "camera_frames.json",
         "capture_quality.yaml",
         "execution_plan.json",

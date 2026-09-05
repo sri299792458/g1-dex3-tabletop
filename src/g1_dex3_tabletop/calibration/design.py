@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import re
@@ -278,20 +279,31 @@ class BilateralDesignSelection:
 class BilateralCaptureWaypoint:
     occurrence_id: str
     candidate_id: str
-    capture_role: Literal["anchor", "excitation"]
+    capture_role: Literal["ready", "preparation", "anchor", "excitation"]
     active_arm: Literal["left", "right"] | None
+    hand_action: Literal["close", "restore_ready"] | None = None
 
     def __post_init__(self) -> None:
         if not self.occurrence_id.strip() or not self.candidate_id.strip():
             raise ValueError("bilateral capture waypoint IDs must be non-empty")
-        if self.capture_role == "anchor":
+        if self.capture_role in {"ready", "anchor"}:
             if self.active_arm is not None:
-                raise ValueError("bilateral anchor waypoint cannot name an active arm")
-        elif self.capture_role == "excitation":
+                raise ValueError(
+                    f"bilateral {self.capture_role} waypoint cannot name an active arm"
+                )
+        elif self.capture_role in {"preparation", "excitation"}:
             if self.active_arm not in _SIDES:
-                raise ValueError("bilateral excitation waypoint must name an active arm")
+                raise ValueError(f"bilateral {self.capture_role} waypoint must name an active arm")
         else:
             raise ValueError("bilateral capture waypoint role is invalid")
+        if self.hand_action not in {None, "close", "restore_ready"}:
+            raise ValueError("bilateral waypoint hand action is invalid")
+        if self.hand_action is not None and self.capture_role != "preparation":
+            raise ValueError("bilateral hand actions are only legal at preparation waypoints")
+
+    @property
+    def capturable(self) -> bool:
+        return self.capture_role in {"anchor", "excitation"}
 
     def to_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
@@ -305,7 +317,7 @@ class BilateralCaptureWaypoint:
 
 @dataclass(frozen=True, slots=True)
 class BilateralPoseDesignArtifact:
-    """Frozen statistical design plus exact CuRobo-certified route inputs."""
+    """Frozen statistical design for one closed-hand anchor-to-anchor core."""
 
     model_sha256: str
     parameter_names: tuple[str, ...]
@@ -314,10 +326,10 @@ class BilateralPoseDesignArtifact:
     waypoint_joint_positions_rad: dict[str, tuple[float, ...]]
     route_validation_sha256_by_transition: dict[str, str]
     planner_provenance: dict[str, Any]
-    schema_version: int = 1
+    schema_version: int = 3
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 3:
             raise ValueError("unsupported bilateral pose-design schema version")
         if not _SHA256_PATTERN.fullmatch(self.model_sha256):
             raise ValueError("bilateral pose-design model hash must be lowercase SHA-256")
@@ -332,7 +344,16 @@ class BilateralPoseDesignArtifact:
             or schedule[0].capture_role != "anchor"
             or schedule[-1].capture_role != "anchor"
         ):
-            raise ValueError("bilateral pose-design schedule must start and finish at an anchor")
+            raise ValueError(
+                "bilateral pose-design schedule must start and finish at the visual anchor"
+            )
+        anchor_candidate_ids = {
+            item.candidate_id for item in schedule if item.capture_role == "anchor"
+        }
+        if len(anchor_candidate_ids) != 1:
+            raise ValueError("bilateral pose-design schedule must repeat one identical anchor")
+        if any(item.hand_action is not None for item in schedule):
+            raise ValueError("bilateral pose-design core cannot contain hand actions")
         occurrence_ids = [item.occurrence_id for item in schedule]
         if (
             occurrence_ids[0] != HANDOFF_POSE_ID
@@ -342,7 +363,7 @@ class BilateralPoseDesignArtifact:
         ):
             raise ValueError(
                 "bilateral pose-design must have unique interior occurrences and "
-                "the executor handoff at both ends"
+                "the visual-anchor executor handoff at both ends"
             )
         selected = {item.candidate_id: item.active_arm for item in self.selection.candidates}
         for item in schedule:
@@ -640,10 +661,10 @@ def build_repeated_anchor_schedule(
     anchor_interval: int,
     candidate_order_by_arm: dict[str, tuple[str, ...]] | None = None,
 ) -> tuple[BilateralCaptureWaypoint, ...]:
-    """Group active-arm motion and interleave the same bilateral anchor."""
+    """Build one interleaved closed-hand route rooted at a repeated anchor."""
 
     if not anchor_candidate_id.strip():
-        raise ValueError("anchor candidate ID must be non-empty")
+        raise ValueError("bilateral route anchor candidate ID must be non-empty")
     if anchor_interval < 1:
         raise ValueError("anchor interval must be positive")
     selected_by_arm = {
@@ -666,41 +687,231 @@ def build_repeated_anchor_schedule(
                     f"bilateral {side} route order differs from the statistical selection"
                 )
     selected = {item.candidate_id: item for item in selection.candidates}
-    waypoints: list[BilateralCaptureWaypoint] = []
+    waypoints: list[BilateralCaptureWaypoint] = [
+        BilateralCaptureWaypoint(
+            occurrence_id=HANDOFF_POSE_ID,
+            candidate_id=anchor_candidate_id,
+            capture_role="anchor",
+            active_arm=None,
+        )
+    ]
     anchor_index = 0
     excitation_index = 0
 
-    def append_anchor(*, handoff: bool = False) -> None:
+    def append_anchor() -> None:
         nonlocal anchor_index
         waypoints.append(
             BilateralCaptureWaypoint(
-                occurrence_id=(HANDOFF_POSE_ID if handoff else f"anchor_{anchor_index:03d}"),
+                occurrence_id=f"anchor_{anchor_index:03d}",
                 candidate_id=anchor_candidate_id,
                 capture_role="anchor",
                 active_arm=None,
             )
         )
-        if not handoff:
-            anchor_index += 1
+        anchor_index += 1
 
-    append_anchor(handoff=True)
-    for side_index, side in enumerate(_SIDES):
-        side_candidates = [selected[candidate_id] for candidate_id in ordered_by_arm[side]]
-        for index, candidate in enumerate(side_candidates, start=1):
+    queues = {side: list(ordered_by_arm[side]) for side in _SIDES}
+    while any(queues.values()):
+        for side in _SIDES:
+            block = queues[side][:anchor_interval]
+            del queues[side][: len(block)]
+            if not block:
+                continue
+            for candidate_id in block:
+                candidate = selected[candidate_id]
+                waypoints.append(
+                    BilateralCaptureWaypoint(
+                        occurrence_id=f"excitation_{excitation_index:03d}",
+                        candidate_id=candidate.candidate_id,
+                        capture_role="excitation",
+                        active_arm=side,
+                    )
+                )
+                excitation_index += 1
+            append_anchor()
+    if waypoints[-1].capture_role != "anchor":
+        raise RuntimeError("bilateral route did not return to its anchor")
+    waypoints[-1] = BilateralCaptureWaypoint(
+        occurrence_id=HANDOFF_POSE_ID,
+        candidate_id=anchor_candidate_id,
+        capture_role="anchor",
+        active_arm=None,
+    )
+    return tuple(waypoints)
+
+
+def build_valid_graph_route_schedule(
+    selection: BilateralDesignSelection,
+    *,
+    anchor_candidate_id: str,
+    anchor_interval: int,
+    valid_edges_by_arm: dict[str, tuple[tuple[float, str, str], ...]],
+) -> tuple[BilateralCaptureWaypoint, ...]:
+    """Build minimum-cost anchor tours over collision-certified edge graphs.
+
+    Every short arm block starts and ends at the shared bilateral anchor so
+    the opposite arm remains at its anchor command.  A state-space Dijkstra
+    search minimizes the certified-edge motion cost while tracking which
+    block poses have been visited.  Selected poses used only as intermediate
+    graph nodes are explicit, non-capturing preparation waypoints; every
+    excitation is captured exactly once in its assigned block.
+    """
+
+    if anchor_interval < 1:
+        raise ValueError("bilateral graph-route anchor interval must be positive")
+    if set(valid_edges_by_arm) != set(_SIDES):
+        raise ValueError("bilateral graph route must define both arm edge graphs")
+    if not anchor_candidate_id.strip():
+        raise ValueError("bilateral graph-route anchor ID must be non-empty")
+
+    selected_by_arm = {
+        side: tuple(item.candidate_id for item in selection.candidates if item.active_arm == side)
+        for side in _SIDES
+    }
+    selected_ids = {candidate_id for values in selected_by_arm.values() for candidate_id in values}
+    allowed_nodes = selected_ids | {anchor_candidate_id}
+    adjacency: dict[str, dict[str, tuple[tuple[float, str], ...]]] = {}
+    for side in _SIDES:
+        nodes = set(selected_by_arm[side]) | {anchor_candidate_id}
+        neighbors: dict[str, dict[str, float]] = {node: {} for node in nodes}
+        seen_pairs: set[tuple[str, str]] = set()
+        for raw_cost, raw_first, raw_second in valid_edges_by_arm[side]:
+            cost = float(raw_cost)
+            first = str(raw_first)
+            second = str(raw_second)
+            pair = tuple(sorted((first, second)))
+            if (
+                not np.isfinite(cost)
+                or cost <= 0.0
+                or first == second
+                or first not in nodes
+                or second not in nodes
+                or first not in allowed_nodes
+                or second not in allowed_nodes
+            ):
+                raise ValueError(f"bilateral {side} graph contains an invalid edge")
+            if pair in seen_pairs:
+                raise ValueError(f"bilateral {side} graph contains a duplicate edge")
+            seen_pairs.add(pair)
+            neighbors[first][second] = cost
+            neighbors[second][first] = cost
+        adjacency[side] = {
+            node: tuple(
+                sorted(
+                    ((cost, neighbor) for neighbor, cost in values.items()),
+                    key=lambda item: (item[0], item[1]),
+                )
+            )
+            for node, values in neighbors.items()
+        }
+
+    def shortest_closed_walk(side: str, captures: tuple[str, ...]) -> tuple[str, ...]:
+        """Return graph nodes after the anchor, including the final anchor."""
+
+        if not captures or len(captures) != len(set(captures)):
+            raise ValueError(f"bilateral {side} graph block captures must be unique")
+        capture_bit = {candidate_id: 1 << index for index, candidate_id in enumerate(captures)}
+        graph = adjacency[side]
+        if any(candidate_id not in graph for candidate_id in captures):
+            raise ValueError(f"bilateral {side} graph block contains an unknown capture")
+        full_mask = (1 << len(captures)) - 1
+        start = (anchor_candidate_id, 0)
+        best: dict[tuple[str, int], tuple[float, int]] = {start: (0.0, 0)}
+        previous: dict[tuple[str, int], tuple[str, int]] = {}
+        heap: list[tuple[float, int, str, int]] = [(0.0, 0, anchor_candidate_id, 0)]
+        goal: tuple[str, int] | None = None
+        while heap:
+            cost, hops, node, mask = heapq.heappop(heap)
+            state = (node, mask)
+            if best.get(state) != (cost, hops):
+                continue
+            if node == anchor_candidate_id and mask == full_mask:
+                goal = state
+                break
+            for edge_cost, neighbor in graph[node]:
+                next_mask = mask | capture_bit.get(neighbor, 0)
+                next_state = (neighbor, next_mask)
+                next_value = (cost + edge_cost, hops + 1)
+                if next_value < best.get(next_state, (float("inf"), 2**31 - 1)):
+                    best[next_state] = next_value
+                    previous[next_state] = state
+                    heapq.heappush(
+                        heap,
+                        (next_value[0], next_value[1], neighbor, next_mask),
+                    )
+        if goal is None:
+            raise ValueError(
+                f"bilateral {side} graph cannot return its capture block to the anchor"
+            )
+        reversed_nodes: list[str] = []
+        state = goal
+        while state != start:
+            reversed_nodes.append(state[0])
+            state = previous[state]
+        return tuple(reversed(reversed_nodes))
+
+    waypoints: list[BilateralCaptureWaypoint] = [
+        BilateralCaptureWaypoint(
+            occurrence_id=HANDOFF_POSE_ID,
+            candidate_id=anchor_candidate_id,
+            capture_role="anchor",
+            active_arm=None,
+        ),
+    ]
+    occurrence_index = 0
+    anchor_index = 1
+    queues = {side: list(selected_by_arm[side]) for side in _SIDES}
+
+    def append_block(side: str, captures: tuple[str, ...]) -> None:
+        nonlocal occurrence_index, anchor_index
+        traversal = shortest_closed_walk(side, captures)
+        capture_ids = set(captures)
+        captured: set[str] = set()
+        for traversal_index, candidate_id in enumerate(traversal, start=1):
+            is_final_anchor = candidate_id == anchor_candidate_id and traversal_index == len(
+                traversal
+            )
+            if is_final_anchor:
+                waypoints.append(
+                    BilateralCaptureWaypoint(
+                        occurrence_id=f"anchor_{anchor_index:03d}",
+                        candidate_id=anchor_candidate_id,
+                        capture_role="anchor",
+                        active_arm=None,
+                    )
+                )
+                anchor_index += 1
+                continue
+            capture = candidate_id in capture_ids and candidate_id not in captured
+            if capture:
+                captured.add(candidate_id)
             waypoints.append(
                 BilateralCaptureWaypoint(
-                    occurrence_id=f"excitation_{excitation_index:03d}",
-                    candidate_id=candidate.candidate_id,
-                    capture_role="excitation",
+                    occurrence_id=f"graph_{occurrence_index:03d}",
+                    candidate_id=candidate_id,
+                    capture_role="excitation" if capture else "preparation",
                     active_arm=side,
                 )
             )
-            excitation_index += 1
-            if index % anchor_interval == 0 and index < len(side_candidates):
-                append_anchor()
-        if side_index < len(_SIDES) - 1:
-            append_anchor()
-    append_anchor(handoff=True)
+            occurrence_index += 1
+        if captured != set(captures):
+            raise RuntimeError(f"bilateral {side} graph block did not visit every capture")
+
+    while any(queues.values()):
+        for side in _SIDES:
+            block = tuple(queues[side][:anchor_interval])
+            del queues[side][: len(block)]
+            if block:
+                append_block(side, block)
+
+    if waypoints[-1].capture_role != "anchor":
+        raise RuntimeError("bilateral graph route did not return to its anchor")
+    waypoints[-1] = BilateralCaptureWaypoint(
+        occurrence_id=HANDOFF_POSE_ID,
+        candidate_id=anchor_candidate_id,
+        capture_role="anchor",
+        active_arm=None,
+    )
     return tuple(waypoints)
 
 

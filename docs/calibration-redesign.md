@@ -158,13 +158,20 @@ CuRobo remains the geometry authority, but it does not choose statistically
 informative samples. Candidate selection operates on feasible paired arm
 configurations and the declared calibration model.
 
-The default route alternates active-arm blocks:
+The lifecycle has a reusable frozen core and a short live adapter:
 
-1. Hold the right arm in a visible anchor pose and excite the left arm.
-2. Return to a repeated bilateral anchor.
-3. Hold the left arm in a different visible anchor pose and excite the right
-   arm.
-4. Interleave the same anchor throughout the route and finish at it.
+1. Read the current stationary normal Ready posture and plan only a reversible
+   right-then-left shoulder-clearance adapter for that run.
+2. At bilateral shoulder clearance, command both hands to the descriptor-defined
+   fixed full close, require the commissioned empty-close measurements, and
+   certify the complete closing sweep.
+3. Follow the run-specific adapter to the fixed collision-free visual anchor.
+4. Execute the offline anchor-to-anchor core: alternate short left- and
+   right-arm excitation blocks, returning to the
+   same bilateral anchor between blocks.
+5. Reverse the adapter to bilateral clearance, command and verify the
+   commissioned open posture, then execute the exact reverse run-specific
+   shoulder trajectories to the measured Ready state before releasing ownership.
 
 Every capture sees both targets. Each arm must receive independent variation in
 all intended-to-be-estimated joint directions. Candidate scoring combines:
@@ -262,23 +269,37 @@ entry point is:
 
 ```bash
 ./tools/g1_tabletop.sh plan-bilateral-calibration \
-  --snapshot /absolute/path/to/prepared_snapshot.json \
+  --snapshot /absolute/path/to/ready_snapshot.json \
   --output-directory /absolute/path/to/bilateral_plan
 ```
 
-The snapshot must be the exact stationary, shoulder-cleared handoff with both
-Dex3 hands already at the commissioned middle-close marker posture. The command
-creates no ROS node or robot publisher. It runs collision-aware batched IK for
-both arms in the isolated CuRobo environment, scores the surviving poses using
-the complete declared bilateral model, then certifies every scheduled edge. A
-selected pose without handoff connectivity is excluded and the statistical
-selection is recomputed, up to the configured reselection limit.
+The snapshot is a stationary reference used only to generate the reusable core;
+hardware runs are not required to reproduce its arm commands. The command
+creates no ROS node or robot publisher. It runs collision-aware batched IK with the
+commissioned empty-close hand model. It chooses a both-visible bilateral anchor,
+filters all remaining same-frame-visible poses through one batched CuRobo
+joint-space graph, and scores only the anchor-rooted component using the
+complete declared bilateral model. It then certifies the complete selected-pose
+edge graph, freezes minimum-motion-cost anchor tours for interleaved blocks,
+and certifies every edge of a closed-hand anchor-to-anchor core.
+There is no select-fail-reselect loop and no motion-optimizer construction for
+each capture edge.
 
-The output directory retains the hash-bound planning request, IK result, every
-route-selection attempt, the final route request/result, `pose_design.json`,
-and `execution_plan.json`. The last artifact also binds the exact left/right
-Dex3 posture used by CuRobo. Hardware collection accepts only the mutually
-bound pose design and execution plan; it never invokes CuRobo online.
+The output directory retains the hash-bound planning request, IK result, the
+connected route request/result, `pose_design.json`,
+and `execution_plan.json`. The last artifact binds the fixed full-close command,
+commissioned empty-close collision model, joint offsets, and core clearance
+certificate. Hardware collection accepts only the mutually bound pose design
+and execution plan, then asks the isolated CuRobo worker for a small live
+Ready-to-anchor adapter before creating any command publisher.
+
+During hardware collection, `q` requests a graceful early finish. It never
+interrupts an active arm trajectory: the request is latched at the stationary
+capture boundary, remaining captures are skipped until the next repeated
+anchor. The run-specific adapter then returns to bilateral shoulder clearance,
+opens both hands, returns both arms to the same measured Ready state, and
+releases ownership cleanly. `Ctrl+C`, watchdog trips, tracking
+faults, and failed return motion still invoke Damp.
 
 ## Required verification gates
 

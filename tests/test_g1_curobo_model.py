@@ -1,13 +1,18 @@
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import yaml
 
 from g1_aprilcube_calibration.calibration_bundle import CalibrationBundle
+from g1_aprilcube_calibration.joint_map import arm_joint_names
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 from g1_dex3_tabletop.planning.g1_model import (
     _mounted_plate_collision_spheres,
+    build_locked_robot_config,
     build_robot_config_for_active_joints,
     build_tabletop_robot_config,
     command_from_model_q,
@@ -20,6 +25,73 @@ from g1_dex3_tabletop.planning.g1_model import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.mark.parametrize("active_fingers", [False, True])
+def test_calibration_hand_policy_keeps_external_pairs_and_geometry(monkeypatch, active_fingers):
+    def load_yaml(path):
+        return yaml.safe_load(Path(path).read_text())
+
+    monkeypatch.setitem(sys.modules, "curobo.config_io", SimpleNamespace(load_yaml=load_yaml))
+    snapshot = RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7)
+    active = ("right_hand_thumb_1_joint",) if active_fingers else ("right_shoulder_roll_joint",)
+    strict, _ = build_robot_config_for_active_joints(
+        active_joint_names=active, snapshot=snapshot, joint_position_offsets_rad={}
+    )
+    configured, _ = build_robot_config_for_active_joints(
+        active_joint_names=active,
+        snapshot=snapshot,
+        joint_position_offsets_rad={},
+        ignore_internal_hand_collisions=True,
+    )
+    original = strict["kinematics"]
+    actual = configured["kinematics"]
+    # Only the same-hand pair policy changes. Every sphere, body pair, and
+    # cross-hand pair retains exactly its original configuration.
+    for key in set(original) - {"self_collision_ignore"}:
+        assert actual[key] == original[key]
+    links = actual["collision_link_names"]
+    for first in links:
+        for second in links:
+            if first == second:
+                continue
+            before = second in original["self_collision_ignore"].get(first, [])
+            after = second in actual["self_collision_ignore"].get(first, [])
+            same_hand = any(
+                first.startswith(f"{side}_hand_") and second.startswith(f"{side}_hand_")
+                for side in ("left", "right")
+            )
+            assert after == (True if same_hand else before)
+    if not active_fingers:
+        arm_robot, _ = build_locked_robot_config(
+            arm="right", snapshot=snapshot, joint_position_offsets_rad={}
+        )
+        arm_ignore = arm_robot["kinematics"]["self_collision_ignore"]
+        additions = {
+            (first, second)
+            for first, others in arm_ignore.items()
+            for second in others
+            if second not in actual["self_collision_ignore"].get(first, [])
+        }
+        adjacent = {
+            ("torso_link", "left_shoulder_roll_link"),
+            ("left_shoulder_roll_link", "torso_link"),
+            ("torso_link", "right_shoulder_roll_link"),
+            ("right_shoulder_roll_link", "torso_link"),
+        }
+        assert adjacent <= additions
+        assert ("pelvis", "left_hip_roll_link") in additions
+        moving = {
+            name.removesuffix("_joint") + "_link"
+            for side in ("left", "right")
+            for name in arm_joint_names(side)
+        }
+        moving.update(name for name in links if "_hand_" in name)
+        assert all(
+            first not in moving and second not in moving for first, second in additions - adjacent
+        )
+        assert "right_shoulder_yaw_link" not in arm_ignore["torso_link"]
+        assert "left_shoulder_yaw_link" not in arm_ignore["torso_link"]
+
+
 def test_both_cad_mounts_create_the_same_segmented_sphere_count() -> None:
     left = _mounted_plate_collision_spheres("left")
     right = _mounted_plate_collision_spheres("right")
@@ -27,6 +99,49 @@ def test_both_cad_mounts_create_the_same_segmented_sphere_count() -> None:
     assert len(left) == len(right) == 30
     assert all(item["radius"] > 0 for item in left + right)
     assert model_source_hashes()["curobo_commit"] == ("8e734f3ced1df898990bcd92de40abce475907db")
+
+
+def test_calibration_static_pair_exclusion_rejects_active_waist(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "curobo.config_io",
+        SimpleNamespace(load_yaml=lambda path: yaml.safe_load(Path(path).read_text())),
+    )
+    with pytest.raises(ValueError, match="locked"):
+        build_robot_config_for_active_joints(
+            active_joint_names=("waist_yaw_joint", "right_shoulder_roll_joint"),
+            snapshot=RobotSnapshot((0.0,) * 29, (0.0,) * 7, (0.0,) * 7),
+            joint_position_offsets_rad={},
+            ignore_static_body_collisions=True,
+        )
+
+
+@pytest.mark.parametrize("gap, passed", [(0.009, False), (0.0101, True)])
+def test_core_clearance_does_not_inherit_a_close_reference_exception(gap, passed):
+    torch = pytest.importorskip("torch")
+    from g1_dex3_tabletop.planning.curobo_backend import (
+        _combine_self_clearance_certificates,
+        _self_clearance_certificate,
+    )
+
+    class FixedGapChecker:
+        def self_collision_link_pair_clearances(self, samples, *, joint_names):
+            return torch.full((len(samples), 1), gap), (("torso", "hand"),)
+
+    certificate = _self_clearance_certificate(
+        checker=FixedGapChecker(),
+        joint_names=("shoulder",),
+        reference_q=np.zeros(1),
+        segments=(("core_edge", np.zeros((2, 1))),),
+        phase="closed_hand_core",
+    )
+    assert certificate["passed"] is passed
+    assert certificate["hard_clearance_m"] == 0.010
+    assert certificate["preexisting_clearance_maximum_degradation_m"] == 0.0
+    combined = _combine_self_clearance_certificates([certificate])
+    assert combined["passed"] is passed
+    assert combined["policy"] == "strict_core_10mm"
+    assert combined["preexisting_clearance_maximum_degradation_m"] == 0.0
 
 
 def test_model_offsets_are_added_for_fk_and_removed_for_commands() -> None:
