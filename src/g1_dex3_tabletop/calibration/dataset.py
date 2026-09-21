@@ -18,13 +18,15 @@ from g1_dex3_tabletop.calibration.models import (
 
 
 def target_observation_from_correspondences(
-    result: CorrespondenceResult,
+    result: CorrespondenceResult | None,
     *,
     side: Literal["left", "right"],
     target_artifact_sha256: str,
-) -> TargetObservation:
+) -> TargetObservation | None:
     """Flatten one re-detected target while preserving canonical corner order."""
 
+    if result is None:
+        return None
     if not result.valid:
         raise ValueError(f"{side} target correspondences are not valid")
     image_points: list[tuple[float, float]] = []
@@ -89,6 +91,7 @@ def sample_from_frame_evidence(
             side="right",
             target_artifact_sha256=right_target_artifact_sha256,
         ),
+        active_arm=frame.active_arm,
     )
 
 

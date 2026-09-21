@@ -204,13 +204,17 @@ class URDFModel:
         link_name: str,
         *,
         visual_fallback: bool = False,
+        prefer_visual: bool = False,
     ) -> tuple[LinkGeometry, ...]:
         element = self._link_elements.get(link_name)
         if element is None:
             raise ValueError(f"unknown URDF link: {link_name}")
         geometries = element.findall("collision")
         source = "collision"
-        if not geometries and visual_fallback:
+        if prefer_visual and element.findall("visual"):
+            geometries = element.findall("visual")
+            source = "visual"
+        elif not geometries and visual_fallback:
             geometries = element.findall("visual")
             source = "visual_fallback"
         return tuple(

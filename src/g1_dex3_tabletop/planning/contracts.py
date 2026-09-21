@@ -83,6 +83,9 @@ class RobotSnapshot:
         return cls(**data)
 
 
+MAXIMUM_SHOULDER_CLEARANCE_OFFSET_RAD = 0.14
+
+
 @dataclass(frozen=True, slots=True)
 class Dex3PreparationRequest:
     """Live Ready snapshot for CuRobo shoulder clearance and finger sweep."""
@@ -91,17 +94,79 @@ class Dex3PreparationRequest:
     joint_position_offsets_rad: dict[str, float]
     left_target_q_rad: tuple[float, ...]
     right_target_q_rad: tuple[float, ...]
+    left_settled_target_q_rad: tuple[float, ...] | None = None
+    right_settled_target_q_rad: tuple[float, ...] | None = None
+    left_return_target_q_rad: tuple[float, ...] | None = None
+    right_return_target_q_rad: tuple[float, ...] | None = None
     initial_outward_offset_rad: float = 0.08
     outward_search_step_rad: float = 0.02
-    maximum_outward_offset_rad: float = 0.50
+    maximum_outward_offset_rad: float = MAXIMUM_SHOULDER_CLEARANCE_OFFSET_RAD
     random_seed: int = 17
     schema_version: int = PLANNER_SCHEMA_VERSION
     operation: str = "plan_dex3_preparation"
 
+    @classmethod
+    def for_measured_hold(cls, *, snapshot, joint_position_offsets_rad, random_seed=17):
+        """Move only shoulders while retaining the observed finger positions."""
+
+        return cls(
+            snapshot=snapshot,
+            joint_position_offsets_rad=joint_position_offsets_rad,
+            left_target_q_rad=snapshot.left_dex3_q_rad,
+            right_target_q_rad=snapshot.right_dex3_q_rad,
+            left_settled_target_q_rad=snapshot.left_dex3_q_rad,
+            right_settled_target_q_rad=snapshot.right_dex3_q_rad,
+            left_return_target_q_rad=snapshot.left_dex3_q_rad,
+            right_return_target_q_rad=snapshot.right_dex3_q_rad,
+            random_seed=random_seed,
+            operation="plan_dex3_measured_hold",
+        )
+
+    @property
+    def holds_measured_fingers(self) -> bool:
+        return self.operation == "plan_dex3_measured_hold"
+
+    @classmethod
+    def for_measured_restoration(
+        cls,
+        *,
+        snapshot: RobotSnapshot,
+        recorded_start: RobotSnapshot,
+        joint_position_offsets_rad: dict[str, float],
+        left_target_q_rad,
+        right_target_q_rad,
+        random_seed: int = 17,
+    ) -> Dex3PreparationRequest:
+        """Validate exact restoration as the reverse of an inward recovery.
+
+        Collision geometry is independent of traversal direction. Reversing
+        the endpoints reuses the existing measured-start limit policy without
+        allowing a new out-of-limit target or changing any model limits. The
+        current body is retained; only the finger endpoints are exchanged.
+        """
+
+        for side, target in (("left", left_target_q_rad), ("right", right_target_q_rad)):
+            target = _finite_vector(target, 7, f"{side}_restoration_target")
+            if target != getattr(recorded_start, f"{side}_dex3_q_rad"):
+                raise ValueError(
+                    f"{side} restoration target differs from the recorded starting posture"
+                )
+        return cls(
+            snapshot=RobotSnapshot(
+                snapshot.measured_q29_rad,
+                recorded_start.left_dex3_q_rad,
+                recorded_start.right_dex3_q_rad,
+            ),
+            joint_position_offsets_rad=joint_position_offsets_rad,
+            left_target_q_rad=snapshot.left_dex3_q_rad,
+            right_target_q_rad=snapshot.right_dex3_q_rad,
+            random_seed=random_seed,
+        )
+
     def __post_init__(self) -> None:
         if self.schema_version != PLANNER_SCHEMA_VERSION:
             raise ValueError("unsupported planner request schema version")
-        if self.operation != "plan_dex3_preparation":
+        if self.operation not in {"plan_dex3_preparation", "plan_dex3_measured_hold"}:
             raise ValueError("unsupported planner request operation")
         object.__setattr__(
             self,
@@ -120,6 +185,28 @@ class Dex3PreparationRequest:
             "right_target_q_rad",
             _finite_vector(self.right_target_q_rad, 7, "right_target_q_rad"),
         )
+        optional_names = (
+            "left_settled_target_q_rad",
+            "right_settled_target_q_rad",
+            "left_return_target_q_rad",
+            "right_return_target_q_rad",
+        )
+        provided = [getattr(self, name) is not None for name in optional_names]
+        if any(provided) and not all(provided):
+            raise ValueError(
+                "Dex3 return sweep requires settled-close and return targets for both hands"
+            )
+        if all(provided):
+            for name in optional_names:
+                object.__setattr__(self, name, _finite_vector(getattr(self, name), 7, name))
+        if self.holds_measured_fingers:
+            for side in ("left", "right"):
+                measured = getattr(self.snapshot, f"{side}_dex3_q_rad")
+                if any(
+                    getattr(self, f"{side}_{suffix}_q_rad") != measured
+                    for suffix in ("target", "settled_target", "return_target")
+                ):
+                    raise ValueError("measured-hold preparation cannot change finger positions")
         offsets: dict[str, float] = {}
         for name, value in self.joint_position_offsets_rad.items():
             numeric = float(value)
@@ -127,8 +214,19 @@ class Dex3PreparationRequest:
                 raise ValueError("joint offsets must have names and finite values")
             offsets[str(name)] = numeric
         object.__setattr__(self, "joint_position_offsets_rad", offsets)
+        if not all(
+            np.isfinite(value)
+            for value in (
+                self.initial_outward_offset_rad,
+                self.maximum_outward_offset_rad,
+                self.outward_search_step_rad,
+            )
+        ):
+            raise ValueError("shoulder-clearance search bounds must be finite")
         if not (0 < self.initial_outward_offset_rad <= self.maximum_outward_offset_rad):
             raise ValueError("initial outward offset is outside the search range")
+        if self.maximum_outward_offset_rad > MAXIMUM_SHOULDER_CLEARANCE_OFFSET_RAD:
+            raise ValueError("shoulder-clearance search cannot exceed 0.14 rad")
         if self.outward_search_step_rad <= 0:
             raise ValueError("outward search step must be positive")
 
@@ -151,6 +249,26 @@ class Dex3PreparationRequest:
             "joint_position_offsets_rad": self.joint_position_offsets_rad,
             "left_target_q_rad": list(self.left_target_q_rad),
             "right_target_q_rad": list(self.right_target_q_rad),
+            "left_settled_target_q_rad": (
+                None
+                if self.left_settled_target_q_rad is None
+                else list(self.left_settled_target_q_rad)
+            ),
+            "right_settled_target_q_rad": (
+                None
+                if self.right_settled_target_q_rad is None
+                else list(self.right_settled_target_q_rad)
+            ),
+            "left_return_target_q_rad": (
+                None
+                if self.left_return_target_q_rad is None
+                else list(self.left_return_target_q_rad)
+            ),
+            "right_return_target_q_rad": (
+                None
+                if self.right_return_target_q_rad is None
+                else list(self.right_return_target_q_rad)
+            ),
             "initial_outward_offset_rad": self.initial_outward_offset_rad,
             "outward_search_step_rad": self.outward_search_step_rad,
             "maximum_outward_offset_rad": self.maximum_outward_offset_rad,
@@ -169,6 +287,10 @@ class Dex3PreparationRequest:
             "joint_position_offsets_rad",
             "left_target_q_rad",
             "right_target_q_rad",
+            "left_settled_target_q_rad",
+            "right_settled_target_q_rad",
+            "left_return_target_q_rad",
+            "right_return_target_q_rad",
             "initial_outward_offset_rad",
             "outward_search_step_rad",
             "maximum_outward_offset_rad",
@@ -185,6 +307,117 @@ class Dex3PreparationRequest:
 
     @classmethod
     def from_json(cls, path: str | Path) -> Dex3PreparationRequest:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class BilateralCalibrationAdapterRequest:
+    """Ready preflight or loaded clearance joined to the reusable closed anchor.
+
+    The loaded worker retains the hash-bound preflight shoulder plan; snapshot
+    arms then describe its completed clearance command. Finger readings describe
+    the live operator-prepared posture held throughout the route.
+    """
+
+    execution_plan_sha256: str
+    robot_model: str
+    urdf_sha256: str
+    snapshot: RobotSnapshot
+    anchor_q29_rad: tuple[float, ...]
+    core_transitions: tuple[dict[str, Any], ...]
+    joint_position_offsets_rad: dict[str, float]
+    random_seed: int = 17
+    schema_version: int = 3
+    operation: str = "plan_bilateral_calibration_adapter"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 3:
+            raise ValueError("unsupported bilateral adapter request schema")
+        if self.operation != "plan_bilateral_calibration_adapter":
+            raise ValueError("unsupported bilateral adapter request operation")
+        if len(self.execution_plan_sha256) != 64 or len(self.urdf_sha256) != 64:
+            raise ValueError("bilateral adapter hashes must contain 64 characters")
+        if not self.robot_model.strip():
+            raise ValueError("bilateral adapter robot model must be non-empty")
+        object.__setattr__(
+            self,
+            "snapshot",
+            self.snapshot
+            if isinstance(self.snapshot, RobotSnapshot)
+            else RobotSnapshot.from_dict(self.snapshot),
+        )
+        object.__setattr__(
+            self,
+            "anchor_q29_rad",
+            _finite_vector(self.anchor_q29_rad, 29, "anchor_q29_rad"),
+        )
+        core_transitions: list[dict[str, Any]] = []
+        for raw in self.core_transitions:
+            if set(raw) != {"arm", "trajectory"} or raw["arm"] not in {"left", "right"}:
+                raise ValueError("bilateral adapter core transition is invalid")
+            trajectory = (
+                raw["trajectory"]
+                if isinstance(raw["trajectory"], PlannedTrajectory)
+                else PlannedTrajectory.from_dict(raw["trajectory"])
+            )
+            core_transitions.append({"arm": raw["arm"], "trajectory": trajectory.to_dict()})
+        if not core_transitions:
+            raise ValueError("bilateral adapter requires the reusable core transitions")
+        object.__setattr__(self, "core_transitions", tuple(core_transitions))
+        offsets: dict[str, float] = {}
+        for name, value in self.joint_position_offsets_rad.items():
+            numeric = float(value)
+            if not name or not np.isfinite(numeric):
+                raise ValueError("bilateral adapter joint offsets are invalid")
+            offsets[str(name)] = numeric
+        object.__setattr__(self, "joint_position_offsets_rad", dict(sorted(offsets.items())))
+        if isinstance(self.random_seed, bool) or not isinstance(self.random_seed, int):
+            raise TypeError("bilateral adapter random seed must be an integer")
+
+    @property
+    def content_sha256(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                self.to_dict(include_hash=False),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        document = {
+            "schema_version": self.schema_version,
+            "operation": self.operation,
+            "execution_plan_sha256": self.execution_plan_sha256,
+            "robot_model": self.robot_model,
+            "urdf_sha256": self.urdf_sha256,
+            "snapshot": self.snapshot.to_dict(),
+            "anchor_q29_rad": list(self.anchor_q29_rad),
+            "core_transitions": list(self.core_transitions),
+            "joint_position_offsets_rad": self.joint_position_offsets_rad,
+            "random_seed": self.random_seed,
+        }
+        if include_hash:
+            document["content_sha256"] = self.content_sha256
+        return document
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BilateralCalibrationAdapterRequest:
+        expected_hash = data.get("content_sha256")
+        expected = set(cls.__dataclass_fields__) | {"content_sha256"}
+        if set(data) != expected:
+            raise ValueError("bilateral adapter request fields do not match schema")
+        result = cls(**{key: value for key, value in data.items() if key != "content_sha256"})
+        if result.content_sha256 != expected_hash:
+            raise ValueError("bilateral adapter request content SHA-256 mismatch")
+        return result
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> BilateralCalibrationAdapterRequest:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     def write_json(self, path: str | Path) -> None:
@@ -488,6 +721,7 @@ class Dex3PreparationPlan:
     right_return: PlannedTrajectory
     dual_clearance_q14_rad: tuple[float, ...]
     finger_sweep_sample_count: int
+    return_sweep_sample_count: int
     planner_provenance: dict[str, Any]
     schema_version: int = PLANNER_SCHEMA_VERSION
     backend: str = PLANNER_BACKEND
@@ -525,8 +759,19 @@ class Dex3PreparationPlan:
             "dual_clearance_q14_rad",
             _finite_vector(self.dual_clearance_q14_rad, 14, "dual_clearance_q14_rad"),
         )
-        if self.finger_sweep_sample_count < 2:
-            raise ValueError("finger sweep requires at least two samples")
+        if (
+            self.planner_provenance.get("finger_motion_policy")
+            == "operator_preclosed_measured_hold"
+        ):
+            if self.finger_sweep_sample_count != 0 or self.return_sweep_sample_count != 0:
+                raise ValueError("measured-hold preparation cannot contain finger sweeps")
+        else:
+            if self.finger_sweep_sample_count < 2:
+                raise ValueError("finger sweep requires at least two samples")
+            if self.return_sweep_sample_count != 0 and self.return_sweep_sample_count < 2:
+                raise ValueError(
+                    "return finger sweep must be absent or contain at least two samples"
+                )
         provenance = json.loads(
             json.dumps(self.planner_provenance, sort_keys=True, allow_nan=False)
         )
@@ -557,6 +802,7 @@ class Dex3PreparationPlan:
             "right_return": self.right_return.to_dict(),
             "dual_clearance_q14_rad": list(self.dual_clearance_q14_rad),
             "finger_sweep_sample_count": self.finger_sweep_sample_count,
+            "return_sweep_sample_count": self.return_sweep_sample_count,
             "planner_provenance": self.planner_provenance,
         }
         if include_hash:
@@ -577,6 +823,7 @@ class Dex3PreparationPlan:
             "right_return",
             "dual_clearance_q14_rad",
             "finger_sweep_sample_count",
+            "return_sweep_sample_count",
             "planner_provenance",
             "content_sha256",
         }
@@ -589,6 +836,144 @@ class Dex3PreparationPlan:
 
     @classmethod
     def from_json(cls, path: str | Path) -> Dex3PreparationPlan:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+    def write_json(self, path: str | Path) -> None:
+        atomic_write_json(path, self.to_dict())
+
+
+@dataclass(frozen=True, slots=True)
+class BilateralCalibrationAdapterPlan:
+    """Run-specific reversible Ready/clearance/anchor adapter."""
+
+    request_sha256: str
+    preparation: Dex3PreparationPlan
+    right_anchor_outbound: PlannedTrajectory
+    left_anchor_outbound: PlannedTrajectory
+    left_anchor_return: PlannedTrajectory
+    right_anchor_return: PlannedTrajectory
+    anchor_q14_rad: tuple[float, ...]
+    maximum_locked_joint_error_rad_observed: float
+    live_core_self_clearance_certificate: dict[str, Any]
+    planner_provenance: dict[str, Any]
+    schema_version: int = PLANNER_SCHEMA_VERSION
+    backend: str = PLANNER_BACKEND
+
+    def __post_init__(self) -> None:
+        if len(self.request_sha256) != 64:
+            raise ValueError("bilateral adapter request hash must contain 64 characters")
+        if self.schema_version != PLANNER_SCHEMA_VERSION or self.backend != PLANNER_BACKEND:
+            raise ValueError("unsupported bilateral adapter backend or schema")
+        if not isinstance(self.preparation, Dex3PreparationPlan):
+            object.__setattr__(
+                self,
+                "preparation",
+                Dex3PreparationPlan.from_dict(self.preparation),
+            )
+        for name in (
+            "right_anchor_outbound",
+            "left_anchor_outbound",
+            "left_anchor_return",
+            "right_anchor_return",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, PlannedTrajectory):
+                object.__setattr__(self, name, PlannedTrajectory.from_dict(value))
+        expected_edges = (
+            ("dual_shoulder_clearance", "right_anchor_preparation"),
+            ("right_anchor_preparation", HANDOFF_POSE_ID),
+            (HANDOFF_POSE_ID, "right_anchor_preparation"),
+            ("right_anchor_preparation", "dual_shoulder_clearance"),
+        )
+        actual_edges = tuple(
+            (value.from_pose_id, value.to_pose_id)
+            for value in (
+                self.right_anchor_outbound,
+                self.left_anchor_outbound,
+                self.left_anchor_return,
+                self.right_anchor_return,
+            )
+        )
+        if actual_edges != expected_edges:
+            raise ValueError("bilateral adapter anchor trajectories have invalid endpoints")
+        object.__setattr__(
+            self,
+            "anchor_q14_rad",
+            _finite_vector(self.anchor_q14_rad, 14, "anchor_q14_rad"),
+        )
+        observed = float(self.maximum_locked_joint_error_rad_observed)
+        if not np.isfinite(observed) or observed < 0.0:
+            raise ValueError("bilateral adapter locked-joint error is invalid")
+        object.__setattr__(self, "maximum_locked_joint_error_rad_observed", observed)
+        clearance = json.loads(
+            json.dumps(
+                self.live_core_self_clearance_certificate,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        )
+        if (
+            not isinstance(clearance, dict)
+            or clearance.get("passed") is not True
+            or not clearance.get("phases")
+            or float(clearance.get("hard_clearance_m", 0.0)) <= 0.0
+            or float(clearance.get("minimum_clearance_m", -1.0)) < -1e-6
+            or float(clearance.get("minimum_margin_to_required_clearance_m", -1.0)) < -1e-6
+        ):
+            raise ValueError("bilateral adapter lacks a passing live-core clearance certificate")
+        object.__setattr__(self, "live_core_self_clearance_certificate", clearance)
+        provenance = json.loads(
+            json.dumps(self.planner_provenance, sort_keys=True, allow_nan=False)
+        )
+        if not provenance:
+            raise ValueError("bilateral adapter planner provenance must be non-empty")
+        object.__setattr__(self, "planner_provenance", provenance)
+
+    @property
+    def content_sha256(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                self.to_dict(include_hash=False),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+
+    def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
+        document = {
+            "schema_version": self.schema_version,
+            "backend": self.backend,
+            "request_sha256": self.request_sha256,
+            "preparation": self.preparation.to_dict(),
+            "right_anchor_outbound": self.right_anchor_outbound.to_dict(),
+            "left_anchor_outbound": self.left_anchor_outbound.to_dict(),
+            "left_anchor_return": self.left_anchor_return.to_dict(),
+            "right_anchor_return": self.right_anchor_return.to_dict(),
+            "anchor_q14_rad": list(self.anchor_q14_rad),
+            "maximum_locked_joint_error_rad_observed": (
+                self.maximum_locked_joint_error_rad_observed
+            ),
+            "live_core_self_clearance_certificate": (self.live_core_self_clearance_certificate),
+            "planner_provenance": self.planner_provenance,
+        }
+        if include_hash:
+            document["content_sha256"] = self.content_sha256
+        return document
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BilateralCalibrationAdapterPlan:
+        expected_hash = data.get("content_sha256")
+        expected = set(cls.__dataclass_fields__) | {"content_sha256"}
+        if set(data) != expected:
+            raise ValueError("bilateral adapter plan fields do not match schema")
+        result = cls(**{key: value for key, value in data.items() if key != "content_sha256"})
+        if result.content_sha256 != expected_hash:
+            raise ValueError("bilateral adapter plan content SHA-256 mismatch")
+        return result
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> BilateralCalibrationAdapterPlan:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
     def write_json(self, path: str | Path) -> None:

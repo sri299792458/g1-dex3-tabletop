@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -25,6 +27,7 @@ from g1_aprilcube_calibration.transports.unitree_debug_lowcmd import (
     UnitreeMotionModeManager,
     UnitreeMotionSwitcherBindings,
 )
+from g1_dex3_tabletop.hardware_config import transport_config
 
 
 @dataclass
@@ -218,7 +221,7 @@ def test_lowstate_without_tau_est_is_rejected(sdk):
     observer.close()
 
 
-def test_transport_maps_only_arms_and_weight_and_requires_zero_close(sdk):
+def test_transport_maps_arms_held_waist_and_weight_and_requires_zero_close(sdk):
     bindings, _ = sdk
     clock = ManualClock(5.0)
     transport = UnitreeArmSDKTransport(
@@ -258,7 +261,9 @@ def test_transport_maps_only_arms_and_weight_and_requires_zero_close(sdk):
         base = (40.0, 1.5) if index in {19, 20, 21, 26, 27, 28} else (80, 3)
         expected = (base[0] * kp_scale[offset], base[1] * kd_scale[offset])
         assert (motor.kp, motor.kd) == expected
-    for index in list(range(15)) + list(range(30, 35)):
+    for index in range(12, 15):
+        assert sent.motor_cmd[index] == Motor(mode=1, q=index / 10, kp=300.0, kd=3.0)
+    for index in list(range(12)) + list(range(30, 35)):
         assert sent.motor_cmd[index] == Motor()
 
     with pytest.raises(RuntimeError, match="terminal weight-zero"):
@@ -267,6 +272,62 @@ def test_transport_maps_only_arms_and_weight_and_requires_zero_close(sdk):
     transport.close()
     assert Publisher.instances[0].closed
     assert Subscriber.instances[0].closed
+
+
+@pytest.mark.parametrize(
+    "profile", ["hardware_dex3_aruco.yaml", "hardware_dex3_left_aruco_id5.yaml"]
+)
+def test_standing_profile_holds_waist_through_recorded_takeover_and_release(sdk, profile):
+    """The old packet leaves the waist unsupported on these exact recorded inputs."""
+    bindings, _ = sdk
+    root = Path(__file__).resolve().parents[1]
+    fixture = json.loads((root / "tests/fixtures/standing_waist_225655.json").read_text())
+    cfg = transport_config(root / "config" / profile, interface="test", domain_id=0)
+    clock = ManualClock(0.0)
+    observer = UnitreeLowStateObserver(cfg, bindings=bindings, clock=clock)
+    Subscriber.instances[0].emit(state())
+    transport = UnitreeArmSDKTransport(cfg, observer=observer)
+    assert Publisher.instances[0].messages == []
+    target = fixture["samples"][0]["measured_q29_rad"][12:15]
+    samples = fixture["samples"]
+    # One transport spans acquisition, shoulder moves, full-weight controller
+    # handoffs, and terminal release. Later feedback must never rebase the waist.
+    for sample in samples + [{**samples[-1], "weight": 0.5}, {**samples[-1], "weight": 0.0}]:
+        clock.advance(0.004)
+        measured = state()
+        for motor, q in zip(measured.motor_state[:29], sample["measured_q29_rad"], strict=True):
+            motor.q = q
+        Subscriber.instances[0].emit(measured)
+        command = ArmCommand.create(
+            sample["command_q14_rad"],
+            weight=sample["weight"],
+            tau_ff14=sample["command_tau14_nm"],
+            issued_monotonic_s=clock.monotonic(),
+        )
+        transport.send_command(command)
+        sent = Publisher.instances[0].messages[-1]
+        for index, q in zip(range(12, 15), target, strict=True):
+            assert sent.motor_cmd[index] == Motor(mode=1, q=q, kp=300.0, kd=3.0)
+        for index in list(range(12)) + list(range(30, 35)):
+            assert sent.motor_cmd[index] == Motor()
+        assert sent.motor_cmd[ARM_WEIGHT_SLOT].q == sample["weight"]
+        for offset, motor in enumerate(sent.motor_cmd[15:29]):
+            assert motor.q == command.q14[offset]
+            assert motor.tau == command.tau_ff14[offset]
+            assert (motor.mode, motor.dq) == (1, 0.0)
+            assert (motor.kp, motor.kd) == (
+                (40.0, 1.5) if offset in {4, 5, 6, 11, 12, 13} else (80.0, 3.0)
+            )
+    transport.close()
+    assert Publisher.instances[0].closed
+    assert Subscriber.instances[0].closed
+
+
+@pytest.mark.parametrize("name", ["waist_kp", "waist_kd"])
+@pytest.mark.parametrize("value", [0.0, -1.0, float("nan"), float("inf")])
+def test_standing_waist_hold_requires_finite_positive_gains(name, value):
+    with pytest.raises(ValueError, match="gains"):
+        UnitreeTransportConfig(network_interface="test", **{name: value})
 
 
 def test_transport_attaches_publisher_to_existing_read_only_observer(sdk):

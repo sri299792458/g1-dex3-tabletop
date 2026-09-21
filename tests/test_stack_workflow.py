@@ -7,10 +7,12 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from g1_aprilcube_calibration.joint_map import arm_indices
-from g1_dex3_tabletop import hardware_stack, tabletop_perception
+from g1_dex3_tabletop import control_boundary, hardware_stack, tabletop_perception
+from g1_dex3_tabletop.control_boundary import (
+    dual_arm_command_snapshot as _dual_arm_command_snapshot,
+)
 from g1_dex3_tabletop.hardware_stack import (
     _command_bound_snapshot,
-    _dual_arm_command_snapshot,
     _install_plan_at_current_boundary,
     _ordered_arm_choices,
 )
@@ -145,7 +147,7 @@ def test_command_bound_snapshot_reproduces_latest_right_elbow_regression() -> No
 def test_new_episode_installs_same_arm_plan_at_retained_handoff(monkeypatch) -> None:
     replacement = object()
     monkeypatch.setattr(
-        hardware_stack,
+        control_boundary,
         "pose_set_from_trajectories",
         lambda **_kwargs: replacement,
     )
@@ -190,7 +192,7 @@ def test_new_episode_installs_same_arm_plan_at_retained_handoff(monkeypatch) -> 
 
 def test_new_episode_can_switch_selected_arm_at_retained_handoff(monkeypatch) -> None:
     monkeypatch.setattr(
-        hardware_stack,
+        control_boundary,
         "pose_set_from_trajectories",
         lambda **_kwargs: object(),
     )
@@ -284,6 +286,40 @@ def test_clearance_perception_failure_is_recoverable_only_with_healthy_control()
 
     with pytest.raises(RuntimeError, match="controller fault"):
         hardware_stack._clearance_perception_rejection(
+            FaultedDriver(),
+            ValueError("camera failed"),
+        )
+
+
+def test_supported_perception_failure_rejects_episode_only_with_healthy_control() -> None:
+    checks = []
+
+    class HealthyDriver:
+        @staticmethod
+        def check() -> None:
+            checks.append("healthy")
+
+    rejection = hardware_stack._supported_perception_rejection(
+        HealthyDriver(),
+        ValueError("secondary cube passed only 2/5 frames"),
+    )
+
+    assert isinstance(rejection, hardware_stack.StackPerceptionBlocked)
+    assert isinstance(rejection, hardware_stack.TabletopTaskRejected)
+    assert checks == ["healthy"]
+    assert str(rejection) == (
+        "PERCEPTION BLOCKED — both arms remain supported. Remove any occlusion, "
+        "reposition the cubes, and press SPACE to try again."
+    )
+    assert rejection.detail == "secondary cube passed only 2/5 frames"
+
+    class FaultedDriver:
+        @staticmethod
+        def check() -> None:
+            raise RuntimeError("controller fault")
+
+    with pytest.raises(RuntimeError, match="controller fault"):
+        hardware_stack._supported_perception_rejection(
             FaultedDriver(),
             ValueError("camera failed"),
         )

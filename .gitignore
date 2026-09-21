@@ -20,3 +20,12 @@ running_notes.md
 /published/
 /docs/calibration-redesign.md
 /docs/state-estimation-research.md
+
+# Private investigation records.
+/docs/calibration-investigation-ledger.md
+/docs/bilateral-standing-design-assessment-*.md
+/docs/calibration-lifecycle-audit-*.md
+/docs/calibration-pipeline-code-review-*.md
+/docs/calibration-review-*.md
+/docs/full-bilateral-collection-*.md
+/docs/calibration-diagnostic-*.md

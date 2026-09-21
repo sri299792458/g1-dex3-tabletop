@@ -351,7 +351,7 @@ def _wait_for_space_with_preview(
         termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
 
 
-def _wait_ready(executor, driver, *, timeout_s: float, label: str) -> None:
+def _wait_ready(executor, driver, *, timeout_s: float, label: str, wait_once=None) -> None:
     deadline = time.monotonic() + timeout_s
     next_report = time.monotonic() + 1.0
     while time.monotonic() < deadline:
@@ -363,7 +363,10 @@ def _wait_ready(executor, driver, *, timeout_s: float, label: str) -> None:
         if time.monotonic() >= next_report:
             print(executor.motion_diagnostic(prefix=f"motion status for {label}"), flush=True)
             next_report += 1.0
-        time.sleep(0.01)
+        if wait_once is None:
+            time.sleep(0.01)
+        else:
+            wait_once(0.01)
     raise RuntimeError(f"timed out waiting for {label}")
 
 
@@ -1528,9 +1531,7 @@ def run_tabletop(args) -> int:
                         "input": camera_state_anchor.to_dict(),
                         "visual_reference": {
                             "kind": "frozen_clearance_cube_frame",
-                            "observation_sha256": (
-                                clearance_request.observation.content_sha256
-                            ),
+                            "observation_sha256": (clearance_request.observation.content_sha256),
                             "contract": (
                                 "cube stationary through clearance observation; "
                                 "later cube observations may move"

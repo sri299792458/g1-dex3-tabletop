@@ -244,13 +244,18 @@ class BilateralFergusonRecord:
         if positions.shape != (len(G1_29_JOINT_NAMES),) or not np.all(np.isfinite(positions)):
             raise ValueError("bilateral Ferguson record has invalid joint positions")
         observations = tuple(self.observations)
-        expected = ("left_arm", "left_camera", "right_arm", "right_camera")
-        if tuple(item.sensor_name for item in observations) != expected:
-            raise ValueError("bilateral Ferguson record must contain four ordered sensors")
-        if len(observations[0].points) != len(observations[1].points):
-            raise ValueError("left Ferguson feature counts differ")
-        if len(observations[2].points) != len(observations[3].points):
-            raise ValueError("right Ferguson feature counts differ")
+        valid_sensors = {
+            ("left_arm", "left_camera"),
+            ("right_arm", "right_camera"),
+            ("left_arm", "left_camera", "right_arm", "right_camera"),
+        }
+        if tuple(item.sensor_name for item in observations) not in valid_sensors:
+            raise ValueError(
+                "bilateral Ferguson record requires complete ordered arm/camera pairs"
+            )
+        for arm, camera in zip(observations[::2], observations[1::2], strict=True):
+            if len(arm.points) != len(camera.points):
+                raise ValueError(f"{arm.sensor_name} Ferguson feature counts differ")
         if self.stamp_ns is not None and self.stamp_ns < 0:
             raise ValueError("bilateral Ferguson timestamp must be non-negative")
         object.__setattr__(self, "joint_positions", tuple(float(value) for value in positions))
@@ -292,7 +297,7 @@ def sample_to_ferguson_record(
     model: BilateralModelSpec,
     initial_hand_T_targets: dict[str, np.ndarray],
 ) -> BilateralFergusonRecord:
-    """Map one simultaneous frame to four unambiguous sensor observations."""
+    """Map each observed hand to its stock Ferguson arm/camera sensor pair."""
 
     if set(initial_hand_T_targets) != set(_SIDES):
         raise ValueError("initial hand-target transforms must contain left and right")

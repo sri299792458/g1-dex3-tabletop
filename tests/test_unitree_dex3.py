@@ -294,6 +294,151 @@ def test_posture_command_can_publish_descriptor_target_against_measured_acceptan
     controller.timeout_and_close()
 
 
+@pytest.mark.parametrize("bypass_tabletop_helper", [False, True])
+def test_calibration_finger_move_has_one_writer_and_resumes_hold_checks(
+    dex3_sdk, monkeypatch, tmp_path, bypass_tabletop_helper
+):
+    """Replay the failed close feedback through the real ramp and heartbeat."""
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from g1_aprilcube_calibration.executor_driver import ExecutorControlDriver
+    from g1_dex3_tabletop.calibration import fingers
+    from g1_dex3_tabletop.hardware_tabletop import _finger_heartbeat
+    from g1_dex3_tabletop.planning.contracts import Dex3PreparationRequest, RobotSnapshot
+
+    trace = json.loads((Path(__file__).parent / "fixtures/dex3_close_220845.json").read_text())
+    bindings, _ = dex3_sdk
+    clock = ManualClock(0.0)
+    cfg = config(posture_ramp_s=2.0, posture_settle_dwell_s=0.1)
+    observer = UnitreeDex3StateObserver(cfg, bindings=bindings, clock=clock)
+    initial = RobotSnapshot(
+        (0.0,) * 29, tuple(trace["initial_left_q_rad"]), tuple(trace["initial_right_q_rad"])
+    )
+    emit_pair(initial.left_dex3_q_rad, initial.right_dex3_q_rad)
+    pulses = []
+    watchdog = SimpleNamespace(pulse=lambda: pulses.append(clock.monotonic()))
+    driver = ExecutorControlDriver(SimpleNamespace(), safety_heartbeat=watchdog.pulse)
+    replay_recording = True
+    movement_started = clock.monotonic()
+    tick_count = 0
+
+    def advance_and_track(duration):
+        nonlocal tick_count
+        # Interleave a driver heartbeat before the next ramp publication.
+        clock.advance(duration + 0.001)
+        elapsed = clock.monotonic() - movement_started
+        by_topic = {item.topic: item for item in Publisher.instances}
+        if replay_recording and elapsed <= trace["time_s"][-1]:
+            index = np.searchsorted(trace["time_s"], elapsed)
+            positions = {side: trace[side + "_q_rad"][index] for side in ("left", "right")}
+        else:
+            positions = {
+                side: [motor.q for motor in by_topic[f"rt/dex3/{side}/cmd"].messages[-1].motor_cmd]
+                for side in ("left", "right")
+            }
+        emit_pair(positions["left"], positions["right"])
+        driver.safety_heartbeat()
+        tick_count += 1
+
+    controller = UnitreeDex3PostureController(
+        cfg, observer=observer, clock=clock, sleep=advance_and_track
+    )
+    controller.acquire_measured_hold()
+    driver.safety_heartbeat = _finger_heartbeat(watchdog, controller)
+
+    def validate(operation, *, payload, control_check, timeout_s):
+        request = Dex3PreparationRequest.from_dict(payload)
+        control_check()
+        driver.safety_heartbeat()
+        return {
+            "payload": {
+                "operation": "validate_dex3_finger_sweep",
+                "passed": True,
+                "request_sha256": request.content_sha256,
+                "minimum_clearance_m": 0.01,
+                "required_clearance_m": 0.005,
+            }
+        }
+
+    if bypass_tabletop_helper:
+        # Negative control reproduces the calibration's former direct call.
+        def direct(controller, driver, watchdog, **kwargs):
+            return controller.command_posture(
+                left_target_q_rad=kwargs["left"],
+                right_target_q_rad=kwargs["right"],
+                left_acceptance_q_rad=kwargs["left_acceptance"],
+                right_acceptance_q_rad=kwargs["right_acceptance"],
+                label=kwargs["label"],
+                safety_heartbeat=driver.check,
+            )
+
+        monkeypatch.setattr(fingers, "_command_fingers", direct)
+
+    def move(left, right, *, restore=False):
+        return fingers.command_validated_finger_posture(
+            synchronized=SimpleNamespace(
+                observe_state=lambda: SimpleNamespace(position=np.zeros(29))
+            ),
+            driver=driver,
+            controller=controller,
+            watchdog=watchdog,
+            planner=SimpleNamespace(request_payload=validate),
+            joint_position_offsets_rad={},
+            left_target_q_rad=left,
+            right_target_q_rad=right,
+            left_acceptance_q_rad=left,
+            right_acceptance_q_rad=right,
+            body_tolerance_rad=0.01,
+            hand_tolerance_rad=cfg.posture_position_tolerance_rad,
+            artifact_directory=tmp_path,
+            phase="loaded_restore" if restore else "loaded_close",
+            label="recorded finger transition",
+            recorded_restoration_start=initial if restore else None,
+        )
+
+    try:
+        if bypass_tabletop_helper:
+            with pytest.raises(RuntimeError, match="departed the active task posture"):
+                move(trace["left_target_q_rad"], trace["right_target_q_rad"])
+            assert clock.monotonic() < 1.0
+            return
+        for restore in (False, True):
+            left, right = (
+                (initial.left_dex3_q_rad, initial.right_dex3_q_rad)
+                if restore
+                else (trace["left_target_q_rad"], trace["right_target_q_rad"])
+            )
+            first_message = len(Publisher.instances[0].messages)
+            measured_start = observer.observe().left.position.copy()
+            movement_started = clock.monotonic()
+            result = move(left, right, restore=restore)
+            assert result.maximum_target_error(tuple(left), tuple(right))[2] < 1e-9
+            commands = np.array(
+                [
+                    [motor.q for motor in msg.motor_cmd]
+                    for msg in Publisher.instances[0].messages[first_message:]
+                ]
+            )
+            direction = np.sign(np.asarray(left) - measured_start)
+            assert np.min(np.diff(commands, axis=0) * direction) >= -1e-9
+            replay_recording = False
+            advance_and_track(0.02)
+        assert tick_count > 350 and len(pulses) >= tick_count
+        # A real departure during a stationary hold must still fault at 0.08.
+        drifted = np.array(initial.left_dex3_q_rad)
+        drifted[6] += 0.1164
+        clock.advance(0.02)
+        emit_pair(drifted, initial.right_dex3_q_rad)
+        with pytest.raises(RuntimeError, match="departed the active task posture"):
+            driver.safety_heartbeat()
+    finally:
+        # Production cleanup stops the driver before sending hand timeout.
+        driver.safety_heartbeat = watchdog.pulse
+        controller.timeout_and_close()
+
+
 def test_retained_replacement_release_matches_its_run_local_empty_open() -> None:
     measured_empty_open = np.asarray([-0.0320, 0.0149, 0.0149, -0.0285, -0.0289, -0.0438, -0.0191])
     measured_release = np.asarray([-0.0320, 0.0163, 0.0275, -0.1005, -0.0530, -0.0450, -0.0226])

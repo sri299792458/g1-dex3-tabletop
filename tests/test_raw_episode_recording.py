@@ -182,8 +182,11 @@ def test_read_bag_metadata_preserves_topic_types_and_counts(tmp_path: Path) -> N
     assert result["size_bytes"] > 4
 
 
+@pytest.mark.parametrize(
+    "profile_name", [recording.PROFILE_NAME, recording.STANDING_CALIBRATION_PROFILE_NAME]
+)
 def test_recorder_writes_spark_artifacts_and_audits_completion(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, profile_name
 ) -> None:
     popen_call: dict = {}
 
@@ -227,6 +230,7 @@ def test_recorder_writes_spark_artifacts_and_audits_completion(
         episode,
         repository=Path(__file__).resolve().parents[1],
         topics=(topic,),
+        profile_name=profile_name,
     )
 
     recorder.start()
@@ -269,12 +273,34 @@ def test_recorder_writes_spark_artifacts_and_audits_completion(
     assert manifest["capture"]["complete"] is True
     assert manifest["episode"]["episode_id"] == "run_001"
     assert manifest["profile"]["camera_recording_enabled"] is False
+    assert manifest["profile"]["name"] == profile_name
+    assert f"Profile: `{profile_name}`" in recorder.notes_path.read_text()
     assert manifest["provenance"]["design_source"]["commit"] == recording.SPARK_COMMIT
     assert recorder.notes_path.is_file()
 
 
+def test_recorder_health_check_detects_exit_during_operator_wait(tmp_path):
+    from types import SimpleNamespace
+
+    recorder = recording.RawEpisodeRecorder(tmp_path / "raw_episode", repository=tmp_path)
+    with pytest.raises(RuntimeError, match="was not started"):
+        recorder.check()
+    recorder._process = SimpleNamespace(poll=lambda: None)
+    recorder.check()
+    recorder._process = SimpleNamespace(poll=lambda: 1)
+    with pytest.raises(RuntimeError, match="exited with 1"):
+        recorder.check()
+
+
+@pytest.mark.parametrize(
+    ("topics", "missing_subscription"),
+    [
+        (recording.TABLETOP_RAW_TOPICS, "/lowcmd"),
+        (recording.STANDING_CALIBRATION_TOPICS, "/camera/color/image_raw"),
+    ],
+)
 def test_recorder_refuses_start_without_every_requested_subscription(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, topics, missing_subscription
 ) -> None:
     class FakeProcess:
         pid = 4321
@@ -282,7 +308,11 @@ def test_recorder_refuses_start_without_every_requested_subscription(
         def __init__(self, _command, **kwargs) -> None:
             self.returncode = None
             kwargs["stdout"].write("[INFO] [rosbag2_recorder]: Recording...\n")
-            kwargs["stdout"].write("[INFO] [rosbag2_recorder]: Subscribed to topic '/lowstate'\n")
+            for topic in topics:
+                if topic.name != missing_subscription:
+                    kwargs["stdout"].write(
+                        f"[INFO] [rosbag2_recorder]: Subscribed to topic '{topic.name}'\n"
+                    )
             kwargs["stdout"].flush()
 
         def poll(self):
@@ -299,10 +329,6 @@ def test_recorder_refuses_start_without_every_requested_subscription(
     )
     monkeypatch.setattr(recording.subprocess, "Popen", FakeProcess)
     monkeypatch.setattr(recording.os, "killpg", lambda _process_group, _signal: None)
-    topics = (
-        recording.TopicSpec("/lowstate", "unitree_hg/msg/LowState", "state", "receipt"),
-        recording.TopicSpec("/lowcmd", "unitree_hg/msg/LowCmd", "command", "receipt"),
-    )
     recorder = recording.RawEpisodeRecorder(
         tmp_path / "run_missing" / "raw_episode",
         repository=Path(__file__).resolve().parents[1],
@@ -316,8 +342,71 @@ def test_recorder_refuses_start_without_every_requested_subscription(
     manifest = json.loads(recorder.manifest_path.read_text(encoding="utf-8"))
     assert manifest["capture"]["state"] == "failed_to_start"
     assert manifest["capture"]["problems"] == [
-        "ros2 bag record did not subscribe to all requested topics before timeout: /lowcmd"
+        "ros2 bag record did not subscribe to all requested topics before timeout: "
+        + missing_subscription
     ]
+
+
+@pytest.mark.parametrize(
+    "missing_camera_topic",
+    [
+        None,
+        "/camera/color/image_raw",
+        "/camera/color/camera_info",
+        "/camera/depth/image_rect_raw",
+        "/camera/depth/camera_info",
+    ],
+)
+def test_standing_recording_requires_continuous_camera_evidence(
+    tmp_path: Path, missing_camera_topic
+) -> None:
+    from types import SimpleNamespace
+
+    topics = recording.STANDING_CALIBRATION_TOPICS
+    expected = {topic.name: topic for topic in recording.TABLETOP_RAW_TOPICS}
+    standing = {topic.name: topic for topic in topics}
+    assert standing.keys() - expected.keys() == {"/arm_sdk"}
+    assert expected.keys() - standing.keys() == {"/lowcmd"}
+    assert all(standing[name] is topic for name, topic in expected.items() if name != "/lowcmd")
+
+    recorder = recording.RawEpisodeRecorder(
+        tmp_path / "standing" / "raw_episode",
+        repository=tmp_path,
+        topics=topics,
+        profile_name=recording.STANDING_CALIBRATION_PROFILE_NAME,
+    )
+    recorder.bag_directory.mkdir(parents=True)
+    recorder._start_time_ns = 1
+    recorder._provenance = {"git_commit": "abc", "git_worktree_dirty": False}
+    recorder._process = SimpleNamespace(poll=lambda: 0, returncode=0)
+    retained = [topic for topic in topics if topic.name != missing_camera_topic]
+    (recorder.bag_directory / "metadata.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "rosbag2_bagfile_information": {
+                    "storage_identifier": "mcap",
+                    "duration": {"nanoseconds": 1_000_000},
+                    "message_count": len(retained),
+                    "topics_with_message_count": [
+                        {
+                            "topic_metadata": {"name": topic.name, "type": topic.message_type},
+                            "message_count": 1,
+                        }
+                        for topic in retained
+                    ],
+                }
+            }
+        )
+    )
+
+    result = recorder.stop()
+    manifest = json.loads(recorder.manifest_path.read_text())
+    assert manifest["profile"]["camera_recording_enabled"] is True
+    assert manifest["profile"]["name"] == "g1_standing_calibration_raw_v2"
+    assert result["complete"] is (missing_camera_topic is None)
+    assert result["problems"] == (
+        [f"required topic has no messages: {missing_camera_topic}"] if missing_camera_topic else []
+    )
 
 
 def test_required_empty_topic_marks_episode_incomplete(tmp_path: Path) -> None:

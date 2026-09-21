@@ -33,13 +33,18 @@ from g1_aprilcube_calibration.timestamp_pairing import (
     PairingResult,
     pair_state_to_image,
 )
+from g1_dex3_tabletop.calibration.models import required_marker_sides
 
 _SIDES = ("left", "right")
 
 
+class BilateralGracefulStopRequested(RuntimeError):
+    """The operator requested a certified return instead of an emergency stop."""
+
+
 @dataclass(frozen=True, slots=True)
 class BilateralFrameEvidence:
-    """One raw image with two detections and exactly one paired state window."""
+    """One raw image with accepted detections and one paired state window."""
 
     frame_id: str
     image_bgr: np.ndarray
@@ -47,10 +52,11 @@ class BilateralFrameEvidence:
     camera_info: RectifiedCameraInfo
     state_window: tuple[RobotStateSample, ...]
     pairing: PairingResult
-    left_correspondences: CorrespondenceResult
-    right_correspondences: CorrespondenceResult
-    left_quality: QualityReport
-    right_quality: QualityReport
+    left_correspondences: CorrespondenceResult | None
+    right_correspondences: CorrespondenceResult | None
+    left_quality: QualityReport | None
+    right_quality: QualityReport | None
+    active_arm: str | None = None
 
     def __post_init__(self) -> None:
         if not self.frame_id:
@@ -61,9 +67,14 @@ class BilateralFrameEvidence:
         if image.shape[:2] != (self.camera_info.height, self.camera_info.width):
             raise ValueError("raw bilateral image dimensions do not match CameraInfo")
         expected_size = (self.camera_info.width, self.camera_info.height)
+        required = required_marker_sides(self.active_arm)
         for side in _SIDES:
             correspondences = getattr(self, f"{side}_correspondences")
             quality = getattr(self, f"{side}_quality")
+            if correspondences is None or quality is None:
+                if side in required or correspondences is not None or quality is not None:
+                    raise ValueError(f"{side} target requires correspondences and quality")
+                continue
             if correspondences.image_size_wh != expected_size:
                 raise ValueError(f"{side} correspondence dimensions do not match CameraInfo")
             if not correspondences.valid:
@@ -82,17 +93,22 @@ class BilateralFrameEvidence:
     @property
     def correspondences(self) -> dict[str, CorrespondenceResult]:
         return {
-            "left": self.left_correspondences,
-            "right": self.right_correspondences,
+            side: result
+            for side in _SIDES
+            if (result := getattr(self, f"{side}_correspondences")) is not None
         }
 
     @property
     def qualities(self) -> dict[str, QualityReport]:
-        return {"left": self.left_quality, "right": self.right_quality}
+        return {
+            side: quality
+            for side in _SIDES
+            if (quality := getattr(self, f"{side}_quality")) is not None
+        }
 
 
 class BilateralLiveBurstSource:
-    """Collect new stationary frames only when both hand targets pass quality."""
+    """Require the active marker at excitation and both markers at anchors."""
 
     def __init__(
         self,
@@ -141,6 +157,7 @@ class BilateralLiveBurstSource:
         if set(supplied_history) != set(_SIDES):
             raise ValueError("bilateral capture history must contain left and right")
         self._history = {side: list(supplied_history[side]) for side in _SIDES}
+        self._remembered_sides: list[tuple[str, ...]] = []
 
     def capture_burst(
         self,
@@ -148,7 +165,9 @@ class BilateralLiveBurstSource:
         pose_id: str,
         capture_id: str,
         remember_signatures: bool = True,
+        active_arm: str | None = None,
     ) -> tuple[BilateralFrameEvidence, ...]:
+        required_marker_sides(active_arm)
         seen = {self._frame_key(frame) for frame in self.camera_frames.snapshot()}
         accepted: list[BilateralFrameEvidence] = []
         deadline = self.clock.monotonic() + self.config.timeout_s
@@ -156,7 +175,9 @@ class BilateralLiveBurstSource:
         pose_local_rejection_seen = False
         while len(accepted) < self.config.frame_count:
             if self.cancelled():
-                raise RuntimeError("operator cancelled bilateral live burst")
+                raise BilateralGracefulStopRequested(
+                    "operator requested a graceful bilateral return"
+                )
             if self.clock.monotonic() >= deadline:
                 error_type = RecoverableCaptureError if pose_local_rejection_seen else RuntimeError
                 raise error_type(
@@ -179,6 +200,7 @@ class BilateralLiveBurstSource:
                     candidate = self._evaluate_frame(
                         frame,
                         frame_id=f"{capture_id}_{len(accepted):03d}",
+                        active_arm=active_arm,
                     )
                 except RecoverableCaptureError as error:
                     last_rejection = str(error)
@@ -198,16 +220,19 @@ class BilateralLiveBurstSource:
                 self.wait_once(self.config.poll_interval_s)
         selected = select_bilateral_medoid(tuple(accepted))
         if remember_signatures:
-            for side in _SIDES:
-                signature = getattr(selected, f"{side}_quality").signature
+            remembered = []
+            for side, quality in selected.qualities.items():
+                signature = quality.signature
                 if signature is not None:
                     self._history[side].append(signature)
+                    remembered.append(side)
+            self._remembered_sides.append(tuple(remembered))
         return tuple(accepted)
 
     def undo_last_signatures(self) -> None:
-        if any(not self._history[side] for side in _SIDES):
-            raise ValueError("cannot undo incomplete bilateral capture history")
-        for side in _SIDES:
+        if not self._remembered_sides:
+            raise ValueError("cannot undo absent bilateral capture history")
+        for side in self._remembered_sides.pop():
             self._history[side].pop()
 
     def _evaluate_frame(
@@ -215,7 +240,9 @@ class BilateralLiveBurstSource:
         frame: ROSImageFrame,
         *,
         frame_id: str,
+        active_arm: str | None = None,
     ) -> BilateralFrameEvidence:
+        required = required_marker_sides(active_arm)
         results = {side: self.detectors[side].detect(frame.image_bgr) for side in _SIDES}
         intrinsics = CameraIntrinsics(
             frame.camera_info.rectified_camera_matrix,
@@ -231,18 +258,31 @@ class BilateralLiveBurstSource:
         }
         if self.preview is not None:
             self.preview(frame, results, reports)
-        for side in _SIDES:
+        for side in required:
             if not results[side].valid:
                 raise RecoverableCaptureError(f"{side} target is not detected unambiguously")
             if reports[side].grade is QualityGrade.RED:
                 raise RecoverableCaptureError(
                     f"{side} visual quality is red: " + "; ".join(reports[side].hard_failures)
                 )
-        yellow_sides = tuple(side for side in _SIDES if reports[side].grade is QualityGrade.YELLOW)
+        usable = {
+            side
+            for side in _SIDES
+            if results[side].valid and reports[side].grade is not QualityGrade.RED
+        }
+        yellow_sides = tuple(
+            side
+            for side in _SIDES
+            if side in usable and reports[side].grade is QualityGrade.YELLOW
+        )
         if yellow_sides and not self.accept_yellow(frame, yellow_sides):
-            raise RecoverableCaptureError(
-                "visual quality is yellow and was not confirmed for " + ", ".join(yellow_sides)
-            )
+            required_yellow = tuple(side for side in yellow_sides if side in required)
+            if required_yellow:
+                raise RecoverableCaptureError(
+                    "visual quality is yellow and was not confirmed for "
+                    + ", ".join(required_yellow)
+                )
+            usable.difference_update(yellow_sides)
         state_window = self.robot_states.centered_window(
             center_monotonic_s=frame.timing.receipt_monotonic_s,
             duration_s=self.recording_config.stationary_duration_s,
@@ -272,10 +312,11 @@ class BilateralLiveBurstSource:
             camera_info=frame.camera_info,
             state_window=state_window,
             pairing=pairing,
-            left_correspondences=results["left"],
-            right_correspondences=results["right"],
-            left_quality=reports["left"],
-            right_quality=reports["right"],
+            left_correspondences=results["left"] if "left" in usable else None,
+            right_correspondences=results["right"] if "right" in usable else None,
+            left_quality=reports["left"] if "left" in usable else None,
+            right_quality=reports["right"] if "right" in usable else None,
+            active_arm=active_arm,
         )
 
     def _burst_rejection_reason(
@@ -320,26 +361,22 @@ class BilateralLiveBurstSource:
 def select_bilateral_medoid(
     frames: tuple[BilateralFrameEvidence, ...],
 ) -> BilateralFrameEvidence:
-    """Choose the joint left/right corner medoid from the dominant signature."""
+    """Choose a medoid using required markers; optional visibility cannot bias it."""
 
     if not frames:
         raise ValueError("cannot select a bilateral medoid from no frames")
-    signatures: dict[
-        tuple[tuple[int, ...], tuple[int, ...]],
-        list[BilateralFrameEvidence],
-    ] = {}
+    if len({frame.active_arm for frame in frames}) != 1:
+        raise ValueError("bilateral burst mixes different active arms")
+    required = required_marker_sides(frames[0].active_arm)
+    signatures: dict[tuple[tuple[int, ...], ...], list[BilateralFrameEvidence]] = {}
     for frame in frames:
-        signature = (
-            frame.left_correspondences.tag_ids,
-            frame.right_correspondences.tag_ids,
-        )
+        signature = tuple(frame.correspondences[side].tag_ids for side in required)
         signatures.setdefault(signature, []).append(frame)
     candidates = max(
         signatures.values(),
         key=lambda group: (
             len(group),
-            len(group[0].left_correspondences.tag_ids)
-            + len(group[0].right_correspondences.tag_ids),
+            sum(len(group[0].correspondences[side].tag_ids) for side in required),
         ),
     )
     vectors = np.asarray([_normalized_corner_vector(frame) for frame in candidates])
@@ -352,7 +389,7 @@ def select_bilateral_medoid(
 def _normalized_corner_vector(frame: BilateralFrameEvidence) -> np.ndarray:
     scale = np.asarray([frame.camera_info.width, frame.camera_info.height])
     values: list[np.ndarray] = []
-    for side in _SIDES:
+    for side in required_marker_sides(frame.active_arm):
         result = getattr(frame, f"{side}_correspondences")
         values.extend(observation.image_corners_px / scale for observation in result.observations)
     return np.vstack(values).reshape(-1)

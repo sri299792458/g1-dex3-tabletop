@@ -2,7 +2,8 @@
 
 Importing this module never imports CycloneDDS and never opens a channel.  The
 read-only observer creates only ``rt/lowstate``.  The command transport creates
-``rt/arm_sdk`` explicitly and leaves every non-arm command slot at its default.
+``rt/arm_sdk`` explicitly, commands both arms, and holds the measured waist.
+Leg and unused command slots remain at their defaults.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ SECONDARY_IMU_TOPIC = "rt/secondary_imu"
 HG_MOTOR_COUNT = 35
 ARM_WEIGHT_SLOT = 29
 _ARM_INDICES = LEFT_ARM_INDICES + RIGHT_ARM_INDICES
+_WAIST_INDICES = (12, 13, 14)
 _WRIST_INDICES = frozenset((19, 20, 21, 26, 27, 28))
 
 
@@ -45,6 +47,8 @@ class UnitreeTransportConfig:
     shoulder_elbow_kd: float = 3.0
     wrist_kp: float = 40.0
     wrist_kd: float = 1.5
+    waist_kp: float = 300.0
+    waist_kd: float = 3.0
     subscriber_queue_length: int = 10
 
     def __post_init__(self) -> None:
@@ -59,9 +63,13 @@ class UnitreeTransportConfig:
             self.shoulder_elbow_kd,
             self.wrist_kp,
             self.wrist_kd,
+            self.waist_kp,
+            self.waist_kd,
         )
         if not all(np.isfinite(gain) and gain >= 0 for gain in gains):
             raise ValueError("motor gains must be finite and non-negative")
+        if self.waist_kp <= 0 or self.waist_kd <= 0:
+            raise ValueError("waist hold gains must be positive")
         if self.subscriber_queue_length <= 0:
             raise ValueError("subscriber_queue_length must be positive")
 
@@ -296,7 +304,7 @@ class UnitreeTorsoIMUObserver:
 
 
 class UnitreeArmSDKTransport:
-    """ArmTransport for ``rt/arm_sdk`` with measured-state seeding upstream."""
+    """Standing arm commands with one measured waist hold per ownership lifecycle."""
 
     def __init__(
         self,
@@ -337,6 +345,7 @@ class UnitreeArmSDKTransport:
                 f"HG LowCmd has {len(self._message.motor_cmd)} motors; expected {HG_MOTOR_COUNT}"
             )
         self._message.mode_pr = 0
+        self._waist_hold_q: tuple[float, ...] | None = None
         self._last_weight: float | None = None
         self._closed = False
         self.command_count = 0
@@ -358,6 +367,21 @@ class UnitreeArmSDKTransport:
                 f"expected {G1_MODE_MACHINE}"
             )
         self._message.mode_machine = sample.mode_machine
+        if self._waist_hold_q is None:
+            # Seed at the first command, after the caller's fresh-state gate,
+            # rather than when the publisher is constructed before acquisition.
+            # Unitree XR G1_29_ArmController holds measured waist q with these
+            # body gains. The firmware ownership weight applies to this packet;
+            # locally scaling gains as well would introduce a second ramp.
+            self._waist_hold_q = tuple(float(sample.position[index]) for index in _WAIST_INDICES)
+        for index, target in zip(_WAIST_INDICES, self._waist_hold_q, strict=True):
+            motor = self._message.motor_cmd[index]
+            motor.mode = 1
+            motor.q = target
+            motor.dq = 0.0
+            motor.tau = 0.0
+            motor.kp = self.config.waist_kp
+            motor.kd = self.config.waist_kd
         for offset, motor_index in enumerate(_ARM_INDICES):
             motor = self._message.motor_cmd[motor_index]
             motor.mode = 1

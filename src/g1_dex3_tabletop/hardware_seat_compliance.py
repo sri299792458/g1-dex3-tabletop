@@ -38,11 +38,6 @@ from g1_aprilcube_calibration.transports.unitree_dex3 import (
 )
 from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.calibration_candidates import camera_info_from_hardware
-from g1_dex3_tabletop.hardware_calibration import (
-    _execute_stage,
-    _stage_executor,
-    _stop_driver,
-)
 from g1_dex3_tabletop.hardware_config import (
     debug_lowcmd_config,
     dex3_config,
@@ -53,6 +48,11 @@ from g1_dex3_tabletop.hardware_config import (
     resolve_hardware_path,
     transport_config,
     watchdog,
+)
+from g1_dex3_tabletop.hardware_motion import (
+    _execute_stage,
+    _stage_executor,
+    _stop_driver,
 )
 from g1_dex3_tabletop.hardware_tabletop import (
     MOTION_ACK,

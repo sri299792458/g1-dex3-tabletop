@@ -20,6 +20,7 @@ from g1_aprilcube_calibration.joint_map import (
 from g1_aprilcube_calibration.transports.unitree_dex3 import (
     DEX3_MOTOR_JOINT_SUFFIXES,
 )
+from g1_aprilcube_calibration.urdf_model import URDFModel
 from g1_dex3_tabletop.planning.contracts import RobotSnapshot
 
 CUROBO_COMMIT = "8e734f3ced1df898990bcd92de40abce475907db"
@@ -72,6 +73,33 @@ def tabletop_motion_joint_names(
 
 def curobo_checkout_root() -> Path:
     return Path(__file__).resolve().parents[3] / "third_party" / "curobo"
+
+
+class Dex3FingerTargetLimitError(ValueError):
+    """A fixed finger target cannot be repaired by moving the shoulders."""
+
+
+def validate_dex3_finger_targets(*, left_q_rad, right_q_rad, label: str) -> None:
+    """Check named motor-order targets using the existing URDF limit reader."""
+
+    model = URDFModel(curobo_checkout_root() / CUROBO_G1_URDF_RELATIVE)
+    violations = []
+    for side, values in (("left", left_q_rad), ("right", right_q_rad)):
+        names = tuple(f"{side}_hand_{suffix}_joint" for suffix in DEX3_MOTOR_JOINT_SUFFIXES[side])
+        positions = np.asarray(values, dtype=np.float64).reshape(-1)
+        if positions.shape != (7,) or not np.all(np.isfinite(positions)):
+            raise ValueError(f"{label}: {side} finger target requires seven finite values")
+        for name, value, limit in zip(names, positions, model.joint_limits(names), strict=True):
+            if value < limit.lower - 1e-6 or value > limit.upper + 1e-6:
+                violations.append(
+                    f"{name}={value:.9f}rad outside [{limit.lower:.9f}, {limit.upper:.9f}]rad"
+                )
+    if violations:
+        raise Dex3FingerTargetLimitError(
+            f"{label}: "
+            + "; ".join(violations)
+            + ". Increasing shoulder offset cannot fix a fixed finger target."
+        )
 
 
 def model_source_hashes() -> dict[str, str]:
@@ -183,25 +211,33 @@ def _ignore_invariant_static_collision_pairs(
     *,
     collision_links: list[str],
     self_collision_ignore: dict[str, list[str]],
-    arm: str,
+    arm: str | None,
 ) -> None:
-    """Remove collision work that no selected-arm coordinate can change.
+    """Remove collision work that no active arm coordinate can change.
 
     The hardware tabletop planner exposes exactly seven joints from one arm.
-    Every collision link outside that arm/hand subtree is locked to the live
+    Bilateral calibration passes ``arm=None`` to retain both arm/hand subtrees.
+    Every collision link outside the retained subtrees is locked to the live
     measured snapshot, so the relative transform of any two such links is
-    constant throughout IK and trajectory optimization.  Keep every pair with
-    at least one selected-arm link; remove only locked-link/locked-link pairs.
+    constant throughout IK and trajectory optimization. Keep every pair with
+    at least one retained arm link; remove only locked-link/locked-link pairs.
 
     This optimization is deliberately not used by the offline waist-yaw model:
     unlocking the waist makes upper-body-to-leg relationships variable.
     """
 
-    selected = validate_arm_side(arm)
+    sides = (validate_arm_side(arm),) if arm is not None else ("left", "right")
     collision_link_set = set(collision_links)
-    moving_links = {name.removesuffix("_joint") + "_link" for name in arm_joint_names(selected)}
-    moving_links.update(name for name in collision_links if name.startswith(f"{selected}_hand_"))
-    moving_links.add(attachment_link(selected))
+    moving_links = set()
+    for selected in sides:
+        moving_links.update(
+            name.removesuffix("_joint") + "_link" for name in arm_joint_names(selected)
+        )
+        moving_links.update(
+            name for name in collision_links if name.startswith(f"{selected}_hand_")
+        )
+        if arm is not None or attachment_link(selected) in collision_link_set:
+            moving_links.add(attachment_link(selected))
     missing = sorted(moving_links - collision_link_set)
     if missing:
         raise ValueError(f"selected-arm collision subtree is incomplete: {missing}")
@@ -219,6 +255,44 @@ def _ignore_invariant_static_collision_pairs(
         self_collision_ignore[link] = sorted(set(self_collision_ignore[link]))
 
 
+def _ignore_internal_hand_collision_pairs(kinematics: dict[str, Any]) -> None:
+    """Apply the commissioned same-hand exclusion without removing geometry.
+
+    The earlier calibration's selected-pair profile excludes same-hand contacts
+    for both arm motion and articulated finger sweeps. Tabletop arm planning
+    uses this policy for its locked hands. Cross-hand and hand/body pairs, and
+    all hand spheres used by world collision checks, remain untouched.
+    """
+
+    ignore = kinematics.setdefault("self_collision_ignore", {})
+    for side in ("left", "right"):
+        hand_links = sorted(
+            name for name in kinematics["collision_link_names"] if name.startswith(f"{side}_hand_")
+        )
+        for index, link in enumerate(hand_links):
+            for other in hand_links[index + 1 :]:
+                ignore.setdefault(link, [])
+                ignore.setdefault(other, [])
+                if other not in ignore[link]:
+                    ignore[link].append(other)
+                if link not in ignore[other]:
+                    ignore[other].append(link)
+
+
+def _ignore_adjacent_shoulder_collision_pairs(kinematics: dict[str, Any]) -> None:
+    """Preserve G1Pilot's proximal assembly exclusion, retaining shoulder yaw."""
+
+    ignore = kinematics.setdefault("self_collision_ignore", {})
+    ignore.setdefault("torso_link", [])
+    for side in ("left", "right"):
+        link = f"{side}_shoulder_roll_link"
+        ignore.setdefault(link, [])
+        if link not in ignore["torso_link"]:
+            ignore["torso_link"].append(link)
+        if "torso_link" not in ignore[link]:
+            ignore[link].append("torso_link")
+
+
 def build_locked_robot_config(
     *,
     arm: str,
@@ -234,6 +308,9 @@ def build_locked_robot_config(
         snapshot=snapshot,
         joint_position_offsets_rad=joint_position_offsets_rad,
         tool_frames=(palm_link(selected_arm), "torso_link"),
+        ignore_internal_hand_collisions=True,
+        ignore_adjacent_shoulder_collisions=True,
+        ignore_static_body_collisions=True,
     )
     return robot, reference
 
@@ -244,6 +321,9 @@ def build_robot_config_for_active_joints(
     snapshot: RobotSnapshot,
     joint_position_offsets_rad: dict[str, float],
     tool_frames: tuple[str, ...] = (),
+    ignore_internal_hand_collisions: bool = False,
+    ignore_adjacent_shoulder_collisions: bool = False,
+    ignore_static_body_collisions: bool = False,
 ) -> tuple[dict[str, Any], tuple[float, ...]]:
     """Load the full model while exposing only the explicitly named joints."""
 
@@ -256,6 +336,24 @@ def build_robot_config_for_active_joints(
     robot = load_yaml(str(checkout / CUROBO_G1_CONFIG_RELATIVE))
     kinematics = robot["kinematics"]
     add_mounted_plate_collision_spheres(robot)
+    if ignore_internal_hand_collisions:
+        _ignore_internal_hand_collision_pairs(kinematics)
+    if ignore_adjacent_shoulder_collisions:
+        _ignore_adjacent_shoulder_collision_pairs(kinematics)
+    if ignore_static_body_collisions:
+        allowed = {*arm_joint_names("left"), *arm_joint_names("right")}
+        allowed.update(
+            f"{side}_hand_{suffix}_joint"
+            for side in ("left", "right")
+            for suffix in DEX3_MOTOR_JOINT_SUFFIXES[side]
+        )
+        if not set(active_joint_names).issubset(allowed):
+            raise ValueError("static-body exclusion requires locked legs and waist")
+        _ignore_invariant_static_collision_pairs(
+            collision_links=kinematics["collision_link_names"],
+            self_collision_ignore=kinematics.setdefault("self_collision_ignore", {}),
+            arm=None,
+        )
     corrected = corrected_joint_positions(snapshot, joint_position_offsets_rad)
     active_names = tuple(active_joint_names)
     configured_names = tuple(kinematics["cspace"]["joint_names"])
@@ -371,39 +469,14 @@ def build_tabletop_robot_config(
         kinematics["extra_collision_spheres"] = extra_collision_spheres
     extra_collision_spheres[selected_attachment_link] = 32
     ignore = kinematics.setdefault("self_collision_ignore", {})
-    # Every Dex3 joint is locked while CuRobo plans an arm trajectory.  Contact
-    # between links within one locked hand is therefore constant and cannot be
-    # created or resolved by any active planning coordinate.  NVIDIA's sphere
-    # model leaves a few sub-millimetre cross-finger overlaps at valid closed
-    # postures; retaining those invariant pairs makes every arm IK seed
-    # infeasible.  Ignore only each locked hand's internal pairs.  Hand-to-arm,
-    # hand-to-body, hand-to-world, and left-to-right-hand checks stay enabled.
-    for side in ("left", "right"):
-        locked_hand_links = sorted(
-            name for name in kinematics["collision_link_names"] if name.startswith(f"{side}_hand_")
-        )
-        for index, link in enumerate(locked_hand_links):
-            for other in locked_hand_links[index + 1 :]:
-                ignore.setdefault(link, [])
-                ignore.setdefault(other, [])
-                if other not in ignore[link]:
-                    ignore[link].append(other)
-                if link not in ignore[other]:
-                    ignore[other].append(link)
+    _ignore_internal_hand_collision_pairs(kinematics)
     # G1Pilot's commissioned collision policy starts at shoulder-yaw; the
     # shoulder-roll link is part of the proximal shoulder assembly and is not
     # checked against its adjacent torso geometry. Preserve that relation in
     # CuRobo while keeping shoulder-yaw and every distal arm/body pair active.
     # Both shoulder-roll links are part of their adjacent proximal shoulder
     # assemblies, independent of which arm is active.
-    ignore.setdefault("torso_link", [])
-    for side in ("left", "right"):
-        shoulder_roll_link = f"{side}_shoulder_roll_link"
-        ignore.setdefault(shoulder_roll_link, [])
-        if shoulder_roll_link not in ignore["torso_link"]:
-            ignore["torso_link"].append(shoulder_roll_link)
-        if "torso_link" not in ignore[shoulder_roll_link]:
-            ignore[shoulder_roll_link].append("torso_link")
+    _ignore_adjacent_shoulder_collision_pairs(kinematics)
     # The opposite arm and torso are both locked at the measured takeover
     # state. Their relative geometry is invariant under every active planning
     # coordinate, just like each locked hand's internal geometry above. Keep

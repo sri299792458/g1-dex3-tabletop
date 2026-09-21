@@ -224,6 +224,8 @@ class BilateralCalibrationProjection:
             positions,
         )
         observation = sample.left if side == "left" else sample.right
+        if observation is None:
+            raise ValueError(f"sample has no {side} marker observation")
         torso_points = transform_points(
             torso_T_hand @ hand_T_target,
             np.asarray(observation.object_points_m, dtype=np.float64),
@@ -247,7 +249,8 @@ class BilateralCalibrationProjection:
     ) -> np.ndarray:
         residuals: list[np.ndarray] = []
         for sample in samples:
-            for side in _SIDES:
+            for observation in sample.observations:
+                side = observation.side
                 predicted, depths = self.project_side(
                     sample,
                     side=side,
@@ -255,7 +258,6 @@ class BilateralCalibrationProjection:
                 )
                 if np.any(depths <= 0.0):
                     raise ValueError("bilateral projection contains points behind the camera")
-                observation = sample.left if side == "left" else sample.right
                 residuals.append(
                     (
                         predicted - np.asarray(observation.image_points_px, dtype=np.float64)

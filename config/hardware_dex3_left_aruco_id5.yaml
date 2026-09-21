@@ -50,6 +50,10 @@ control:
   hold_shoulder_elbow_kd: 3.0
   hold_wrist_kp: 40.0
   hold_wrist_kd: 1.5
+  # Standing arm_sdk includes the waist. Hold its measured acquisition posture
+  # with Unitree XR G1_29 body gains; zero dq/tau, shared firmware ownership weight.
+  hold_waist_kp: 300.0
+  hold_waist_kd: 3.0
   guide_kp_scale: 0.5
   guide_kd_scale: 0.25
   gain_transition_ramp_s: 1.0

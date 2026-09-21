@@ -42,11 +42,14 @@ from g1_dex3_tabletop.calibration.models import (
     BilateralCalibrationDataset,
     BilateralCalibrationSample,
     CameraFrameArtifact,
+    required_marker_sides,
 )
 
 BILATERAL_SESSION_SCHEMA_VERSION = 1
 BILATERAL_SOURCE_ARTIFACTS = frozenset(
     {
+        "adapter_plan.json",
+        "adapter_request.json",
         "camera_frames.json",
         "capture_quality.yaml",
         "execution_plan.json",
@@ -110,13 +113,15 @@ class BilateralRawFrameRecord:
         correspondences = {
             str(side): str(value) for side, value in self.correspondence_sha256_by_arm.items()
         }
-        if set(correspondences) != set(_SIDES) or any(
-            not _SHA256_PATTERN.fullmatch(value) for value in correspondences.values()
+        if (
+            not correspondences
+            or not set(correspondences) <= set(_SIDES)
+            or any(not _SHA256_PATTERN.fullmatch(value) for value in correspondences.values())
         ):
-            raise ValueError("bilateral frame requires left/right correspondence hashes")
+            raise ValueError("bilateral frame requires named observed-marker hashes")
         quality = _json_mapping(self.quality_by_arm, name="quality_by_arm")
-        if set(quality) != set(_SIDES):
-            raise ValueError("bilateral frame requires left/right quality evidence")
+        if set(quality) != set(correspondences):
+            raise ValueError("bilateral frame requires quality for each retained marker")
         object.__setattr__(
             self, "image_timing", _json_mapping(self.image_timing, name="image_timing")
         )
@@ -173,6 +178,14 @@ class BilateralRawCaptureRecord:
         if self.outcome == "accepted":
             if not frames or self.selected_frame_id not in frame_ids:
                 raise ValueError("accepted bilateral capture requires a selected raw frame")
+            active_arm = self.metadata.get("active_arm")
+            if self.capture_role == "anchor" and active_arm is not None:
+                raise ValueError("anchor capture cannot name an active arm")
+            required = required_marker_sides(active_arm)
+            if any(
+                not set(required) <= set(frame.correspondence_sha256_by_arm) for frame in frames
+            ):
+                raise ValueError("accepted capture is missing a required marker")
         elif self.selected_frame_id is not None:
             raise ValueError("non-accepted bilateral capture cannot select a frame")
         object.__setattr__(self, "frames", frames)
@@ -354,7 +367,7 @@ class BilateralSessionManifest:
 
 
 class BilateralSessionStore:
-    """Persist both targets, the shared image, and the shared state window."""
+    """Persist available targets, the shared image, and the shared state window."""
 
     def __init__(self, directory: str | Path) -> None:
         self.directory = Path(directory).resolve()
@@ -473,6 +486,17 @@ class BilateralSessionStore:
         if any(capture.capture_id == capture_id for capture in manifest.captures):
             raise ValueError(f"duplicate bilateral capture ID: {capture_id}")
         values = tuple(frames)
+        capture_metadata = {} if metadata is None else dict(metadata)
+        active_arm = values[0].active_arm if values else capture_metadata.get("active_arm")
+        required_marker_sides(active_arm)
+        if capture_role == "anchor" and active_arm is not None:
+            raise ValueError("anchor capture cannot name an active arm")
+        if any(frame.active_arm != active_arm for frame in values):
+            raise ValueError("bilateral capture mixes different active arms")
+        if "active_arm" in capture_metadata and capture_metadata["active_arm"] != active_arm:
+            raise ValueError("capture active arm differs from frame evidence")
+        if active_arm is not None:
+            capture_metadata["active_arm"] = active_arm
         if len({frame.frame_id for frame in values}) != len(values):
             raise ValueError("bilateral capture input contains duplicate frame IDs")
         existing_frame_ids = {
@@ -501,9 +525,8 @@ class BilateralSessionStore:
                 raise ValueError(
                     "bilateral frame is not stationary: " + "; ".join(readiness.hard_failures)
                 )
-            for side in _SIDES:
-                result = getattr(frame, f"{side}_correspondences")
-                quality = getattr(frame, f"{side}_quality")
+            for side, result in frame.correspondences.items():
+                quality = frame.qualities[side]
                 if not result.valid or quality.grade is QualityGrade.RED:
                     raise ValueError(f"bilateral raw frame has invalid {side} evidence")
         if outcome == "accepted" and not values:
@@ -521,7 +544,7 @@ class BilateralSessionStore:
             recorded_at_utc=recorded_at_utc or utc_now_iso(),
             frames=records,
             selected_frame_id=selected_frame_id,
-            metadata={} if metadata is None else dict(metadata),
+            metadata=capture_metadata,
         )
         updated = replace(manifest, captures=(*manifest.captures, capture))
         self._write_manifest(updated)
@@ -619,15 +642,16 @@ class BilateralSessionStore:
                     ),
                     pairing=pairing.to_dict(),
                     left=target_observation_from_correspondences(
-                        results["left"],
+                        results.get("left"),
                         side="left",
                         target_artifact_sha256=(manifest.target_artifact_sha256_by_arm["left"]),
                     ),
                     right=target_observation_from_correspondences(
-                        results["right"],
+                        results.get("right"),
                         side="right",
                         target_artifact_sha256=(manifest.target_artifact_sha256_by_arm["right"]),
                     ),
+                    active_arm=capture.metadata.get("active_arm"),
                 )
             )
         dataset = BilateralCalibrationDataset(
@@ -682,10 +706,10 @@ class BilateralSessionStore:
             },
             camera_info=frame.camera_info.to_dict(),
             pairing=frame.pairing.to_dict(),
-            quality_by_arm={side: getattr(frame, f"{side}_quality").to_dict() for side in _SIDES},
+            quality_by_arm={side: quality.to_dict() for side, quality in frame.qualities.items()},
             correspondence_sha256_by_arm={
-                side: correspondence_sha256(getattr(frame, f"{side}_correspondences"))
-                for side in _SIDES
+                side: correspondence_sha256(result)
+                for side, result in frame.correspondences.items()
             },
         )
 
@@ -710,9 +734,11 @@ class BilateralSessionStore:
         image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f"bilateral raw image cannot be decoded: {frame.frame_id}")
-        results = {side: detectors[side].detect(image) for side in _SIDES}
-        for side in _SIDES:
-            if correspondence_sha256(results[side]) != frame.correspondence_sha256_by_arm[side]:
+        results = {
+            side: detectors[side].detect(image) for side in frame.correspondence_sha256_by_arm
+        }
+        for side, result in results.items():
+            if correspondence_sha256(result) != frame.correspondence_sha256_by_arm[side]:
                 raise ValueError(f"offline {side} correspondence hash changed: {frame.frame_id}")
         states_bytes = (self.directory / frame.states_path).read_bytes()
         if _sha256(states_bytes) != frame.states_sha256:

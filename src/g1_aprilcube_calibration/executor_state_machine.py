@@ -642,9 +642,7 @@ class PoseExecutor:
             if pose_set.calibration_arm == "left"
             else command_q14[7:].copy()
         )
-        self.hold_q = (
-            command_q14[:7].copy() if hold_arm == "left" else command_q14[7:].copy()
-        )
+        self.hold_q = command_q14[:7].copy() if hold_arm == "left" else command_q14[7:].copy()
         self._opposite_hold = OppositeArmHold(
             calibration_arm=pose_set.calibration_arm,
             command_q=self.hold_q,
@@ -878,23 +876,39 @@ class PoseExecutor:
                 transition=ownership_transition,
             )
         except (TypeError, ValueError, RuntimeError) as error:
-            self._enter_fault(str(error), now)
+            detail = str(error)
+            if self.state is ExecutorState.ACQUIRING and self._phase_started_s is not None:
+                detail += (
+                    f"; acquisition elapsed={now - self._phase_started_s:.4f}s, "
+                    f"last blend weight={self._weight:.4f}"
+                )
+            self._enter_fault(detail, now)
             return self.state
 
         if self.state is ExecutorState.ACQUIRING:
             assert self._command_q14 is not None
             measured_q14 = dual_arm_vector(sample.left_q, sample.right_q)
-            acquisition_error = float(np.max(np.abs(measured_q14 - self._command_q14)))
+            acquisition_errors = np.abs(measured_q14 - self._command_q14)
+            acquisition_error = float(np.max(acquisition_errors))
             self._maximum_acquisition_position_change_rad = max(
                 self._maximum_acquisition_position_change_rad,
                 acquisition_error,
             )
             if acquisition_error > self.config.ownership_transition_position_tolerance_rad:
+                joint_index = int(np.argmax(acquisition_errors))
+                joint_name = (*arm_joint_names("left"), *arm_joint_names("right"))[joint_index]
+                assert self._phase_started_s is not None
                 self._enter_fault(
                     "arm position changed by "
                     f"{acquisition_error:.4f}rad during ownership acquisition; "
                     "limit is "
-                    f"{self.config.ownership_transition_position_tolerance_rad:.4f}rad",
+                    f"{self.config.ownership_transition_position_tolerance_rad:.4f}rad; "
+                    f"joint={joint_name}, "
+                    f"acquisition seed={self._command_q14[joint_index]:.6f}rad, "
+                    f"measured={measured_q14[joint_index]:.6f}rad, "
+                    f"acquisition elapsed={now - self._phase_started_s:.4f}s, "
+                    f"last blend weight={self._weight:.4f}, "
+                    f"state age={sample.age_s(now):.4f}s",
                     now,
                 )
                 return self.state

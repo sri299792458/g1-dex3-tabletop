@@ -120,19 +120,23 @@ class BilateralResidualMetrics:
         }
         if set(counts) != set(_SIDES) or set(sums) != set(_SIDES):
             raise ValueError("residual metrics must contain left and right arms")
-        if any(value <= 0 for value in counts.values()):
-            raise ValueError("residual metrics require corners for both arms")
+        if any(value < 0 for value in counts.values()) or sum(counts.values()) == 0:
+            raise ValueError("residual metrics require observed corners")
         if any(not np.isfinite(value) or value < 0.0 for value in sums.values()):
             raise ValueError("residual squared sums must be finite and non-negative")
+        if any(counts[side] == 0 and sums[side] != 0.0 for side in _SIDES):
+            raise ValueError("an unobserved arm cannot have residual error")
         object.__setattr__(self, "corner_count_by_arm", counts)
         object.__setattr__(self, "radial_squared_sum_px2_by_arm", sums)
 
     @property
-    def arm_rms_px(self) -> dict[str, float]:
+    def arm_rms_px(self) -> dict[str, float | None]:
         return {
             side: float(
                 np.sqrt(self.radial_squared_sum_px2_by_arm[side] / self.corner_count_by_arm[side])
             )
+            if self.corner_count_by_arm[side]
+            else None
             for side in _SIDES
         }
 
@@ -409,6 +413,9 @@ def validate_and_select_bilateral_model(
         incumbent_arm = incumbent.pose_holdout.arm_rms_px
         candidate_arm = candidate.pose_holdout.arm_rms_px
         for side in _SIDES:
+            if incumbent_arm[side] is None or candidate_arm[side] is None:
+                regressions.append(side)
+                continue
             allowed = max(
                 settings.maximum_arm_regression_px,
                 settings.maximum_arm_regression_fraction * incumbent_arm[side],
@@ -658,7 +665,8 @@ def evaluate_bilateral_solution(
     counts = {side: 0 for side in _SIDES}
     sums = {side: 0.0 for side in _SIDES}
     for sample in values:
-        for side in _SIDES:
+        for observation in sample.observations:
+            side = observation.side
             predicted, depths = projection.project_side(
                 sample,
                 side=side,
@@ -666,7 +674,6 @@ def evaluate_bilateral_solution(
             )
             if np.any(depths <= 0.0):
                 raise ValueError("bilateral solution projects target points behind camera")
-            observation = sample.left if side == "left" else sample.right
             residual = predicted - np.asarray(observation.image_points_px)
             counts[side] += len(residual)
             sums[side] += float(np.sum(np.square(residual)))
@@ -963,7 +970,9 @@ def _eligibility_failures(
     if pose_holdout.combined_rms_px > config.maximum_combined_rms_px:
         failures.append("pose-grouped combined RMS exceeds its limit")
     for side, value in pose_holdout.arm_rms_px.items():
-        if value > config.maximum_arm_rms_px:
+        if value is None:
+            failures.append(f"{side} arm has no pose-holdout observations")
+        elif value > config.maximum_arm_rms_px:
             failures.append(f"pose-grouped {side} RMS exceeds its limit")
     if (
         pose_anchor_holdout is not None
@@ -974,7 +983,9 @@ def _eligibility_failures(
         if day_holdout.combined_rms_px > config.maximum_combined_rms_px:
             failures.append("day-grouped combined RMS exceeds its limit")
         for side, value in day_holdout.arm_rms_px.items():
-            if value > config.maximum_arm_rms_px:
+            if value is None:
+                failures.append(f"{side} arm has no day-holdout observations")
+            elif value > config.maximum_arm_rms_px:
                 failures.append(f"day-grouped {side} RMS exceeds its limit")
     for name, value in joint_std.items():
         if np.rad2deg(value) > config.maximum_joint_fold_std_deg:

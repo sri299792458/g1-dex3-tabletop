@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "purpose": "readiness_reference_only; never a finger motion target",
+  "source": "/home/kanth042/g1-dex3-tabletop/sessions/dex3_bilateral_curobo_20260907T133509Z/runtime/loaded_restore_motion.json",
+  "source_sha256": "025a5a9195c8f50adf1da1b43bf33295d2af26947f287569b9aa70e256912fc7",
+  "motor_order": [
+    "thumb_0",
+    "thumb_1",
+    "thumb_2",
+    "middle_0",
+    "middle_1",
+    "index_0",
+    "index_1"
+  ],
+  "reference_q_rad": {
+    "left": [
+      -0.02054714970290661,
+      0.9401182532310486,
+      1.5915743112564087,
+      -1.5702836513519287,
+      -1.687824010848999,
+      -1.5776798725128174,
+      -1.7247925996780396
+    ],
+    "right": [
+      -0.03296596556901932,
+      -0.9736303687095642,
+      -1.6244198083877563,
+      1.480675220489502,
+      1.6517856121063232,
+      1.5490012168884277,
+      1.7161020040512085
+    ]
+  }
+}

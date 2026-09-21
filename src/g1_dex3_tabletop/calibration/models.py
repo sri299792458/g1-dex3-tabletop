@@ -26,6 +26,16 @@ _CAPTURE_ROLES = frozenset({"anchor", "excitation"})
 _CAMERA_COMPONENTS = ("x", "y", "z", "roll", "pitch", "yaw")
 
 
+def required_marker_sides(active_arm: str | None) -> tuple[str, ...]:
+    """Anchors require both markers; excitation requires its active marker."""
+
+    if active_arm is None:
+        return ("left", "right")
+    if active_arm not in {"left", "right"}:
+        raise ValueError("active arm must be left, right or None")
+    return (active_arm,)
+
+
 def _validate_sha256(value: str, name: str) -> str:
     if not _SHA256_PATTERN.fullmatch(value):
         raise ValueError(f"{name} must be lowercase SHA-256")
@@ -257,8 +267,9 @@ class BilateralCalibrationSample:
     joint_positions_rad: tuple[float, ...]
     joint_velocities_rad_s: tuple[float, ...]
     pairing: dict[str, Any]
-    left: TargetObservation
-    right: TargetObservation
+    left: TargetObservation | None
+    right: TargetObservation | None
+    active_arm: Literal["left", "right"] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -274,18 +285,19 @@ class BilateralCalibrationSample:
         if not self.raw_image_path:
             raise ValueError("raw image path must be non-empty")
         _validate_sha256(self.raw_image_sha256, "raw image hash")
-        left = (
-            self.left
-            if isinstance(self.left, TargetObservation)
-            else TargetObservation.from_dict(self.left)
-        )
-        right = (
-            self.right
-            if isinstance(self.right, TargetObservation)
-            else TargetObservation.from_dict(self.right)
-        )
-        if left.side != "left" or right.side != "right":
-            raise ValueError("bilateral sample must contain left and right observations")
+        if self.capture_role == "anchor" and self.active_arm is not None:
+            raise ValueError("anchor sample cannot name an active arm")
+        required = required_marker_sides(self.active_arm)
+        for side in ("left", "right"):
+            observation = getattr(self, side)
+            if observation is not None and not isinstance(observation, TargetObservation):
+                observation = TargetObservation.from_dict(observation)
+            if observation is None:
+                if side in required:
+                    raise ValueError(f"bilateral sample requires the {side} observation")
+            elif observation.side != side:
+                raise ValueError("bilateral sample must use the named left and right observations")
+            object.__setattr__(self, side, observation)
         positions = validate_full_joint_vector(
             self.joint_positions_rad,
             name="bilateral sample joint positions",
@@ -296,8 +308,6 @@ class BilateralCalibrationSample:
         )
         camera_info = _canonical_mapping(self.camera_info, "camera_info")
         pairing = _canonical_mapping(self.pairing, "pairing")
-        object.__setattr__(self, "left", left)
-        object.__setattr__(self, "right", right)
         object.__setattr__(self, "camera_info", camera_info)
         object.__setattr__(self, "pairing", pairing)
         object.__setattr__(self, "joint_positions_rad", tuple(float(value) for value in positions))
@@ -308,8 +318,8 @@ class BilateralCalibrationSample:
         )
 
     @property
-    def observations(self) -> tuple[TargetObservation, TargetObservation]:
-        return self.left, self.right
+    def observations(self) -> tuple[TargetObservation, ...]:
+        return tuple(item for item in (self.left, self.right) if item is not None)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -326,10 +336,8 @@ class BilateralCalibrationSample:
             "joint_positions_rad": list(self.joint_positions_rad),
             "joint_velocities_rad_s": list(self.joint_velocities_rad_s),
             "pairing": self.pairing,
-            "observations": {
-                "left": self.left.to_dict(),
-                "right": self.right.to_dict(),
-            },
+            "observations": {item.side: item.to_dict() for item in self.observations},
+            **({"active_arm": self.active_arm} if self.active_arm is not None else {}),
         }
 
     @classmethod
@@ -350,13 +358,17 @@ class BilateralCalibrationSample:
             "pairing",
             "observations",
         }
-        if set(data) != expected:
+        if set(data) - {"active_arm"} != expected:
             raise ValueError("bilateral sample fields do not match schema version 1")
         if tuple(data["joint_names"]) != G1_29_JOINT_NAMES:
             raise ValueError("bilateral sample joint names do not match G1 mode-5 order")
         observations = data["observations"]
-        if not isinstance(observations, dict) or set(observations) != {"left", "right"}:
-            raise ValueError("bilateral sample requires exactly left and right observations")
+        if (
+            not isinstance(observations, dict)
+            or not observations
+            or not set(observations) <= {"left", "right"}
+        ):
+            raise ValueError("bilateral sample requires named left/right observations")
         return cls(
             source_session_id=data["source_session_id"],
             capture_id=data["capture_id"],
@@ -370,8 +382,17 @@ class BilateralCalibrationSample:
             joint_positions_rad=tuple(data["joint_positions_rad"]),
             joint_velocities_rad_s=tuple(data["joint_velocities_rad_s"]),
             pairing=dict(data["pairing"]),
-            left=TargetObservation.from_dict(observations["left"]),
-            right=TargetObservation.from_dict(observations["right"]),
+            left=(
+                TargetObservation.from_dict(observations["left"])
+                if "left" in observations
+                else None
+            ),
+            right=(
+                TargetObservation.from_dict(observations["right"])
+                if "right" in observations
+                else None
+            ),
+            active_arm=data.get("active_arm"),
         )
 
 
@@ -431,10 +452,12 @@ class BilateralCalibrationDataset:
         if len(frame_ids) != len(set(frame_ids)):
             raise ValueError("bilateral dataset contains duplicate frame IDs")
         for sample in samples:
-            if sample.left.target_artifact_sha256 != self.left_target_artifact_sha256:
-                raise ValueError("left observation target hash differs from dataset")
-            if sample.right.target_artifact_sha256 != self.right_target_artifact_sha256:
-                raise ValueError("right observation target hash differs from dataset")
+            for observation in sample.observations:
+                expected = getattr(self, f"{observation.side}_target_artifact_sha256")
+                if observation.target_artifact_sha256 != expected:
+                    raise ValueError(
+                        f"{observation.side} observation target hash differs from dataset"
+                    )
         object.__setattr__(self, "samples", samples)
         object.__setattr__(
             self,

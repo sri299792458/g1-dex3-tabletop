@@ -42,6 +42,8 @@ def transport_config(
         shoulder_elbow_kd=float(control["hold_shoulder_elbow_kd"]),
         wrist_kp=float(control["hold_wrist_kp"]),
         wrist_kd=float(control["hold_wrist_kd"]),
+        waist_kp=float(control["hold_waist_kp"]),
+        waist_kd=float(control["hold_waist_kd"]),
     )
 
 

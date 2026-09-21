@@ -109,10 +109,15 @@ and completeness audit. It retains the RealSense gyro, accelerometer, and
 The manifest records `profile.camera_recording_enabled` so a state-only episode
 cannot be mistaken for a dropped-camera episode.
 
-The Unitree `rt/arm_sdk` channel is intentionally absent: seated tabletop
-execution uses `rt/lowcmd`. A future standing-calibration recording profile may
-select `rt/arm_sdk`, but the tabletop profile must not record an idle command
-surface and imply that it controlled this run.
+Standing bilateral calibration uses `g1_standing_calibration_raw_v2`: the same
+complete topic contract, replacing `/lowcmd` with `/arm_sdk`
+(`unitree_hg/msg/LowCmd`). Both profiles contain 14 required topics. Calibration
+always records the camera; its selected session images supplement continuous
+RGB/depth recording, including failed captures and motion between waypoints.
+The same startup subscription check and final non-empty-topic/type audit apply.
+Recording starts before SPACE and remains active through control cleanup at
+`work/<session>_collection/raw_episode/`. The older standing v1 profile retained
+only six state/command topics; those historical bags contain no camera stream.
 
 The bag deliberately excludes:
 

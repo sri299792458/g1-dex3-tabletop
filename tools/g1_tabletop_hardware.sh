@@ -56,6 +56,7 @@ set +u
 source "${ros_prefix}/setup.bash"
 if [[ "${hardware_command}" == "run-tabletop" || \
       "${hardware_command}" == "run-stack" || \
+      "${hardware_command}" == "collect-bilateral-calibration" || \
       "${hardware_command}" == "measure-seat-compliance" ]]; then
     if [[ ! -f "${unitree_ros_setup}" ]]; then
         echo "official Unitree ROS message installation is unavailable: ${unitree_ros_setup}" >&2
@@ -65,6 +66,7 @@ if [[ "${hardware_command}" == "run-tabletop" || \
 fi
 if [[ "${hardware_command}" == "run-tabletop" || \
       "${hardware_command}" == "run-stack" || \
+      "${hardware_command}" == "collect-bilateral-calibration" || \
       "${hardware_command}" == "measure-seat-compliance" ]]; then
     if [[ ! -f "${local_mcap_prefix}/lib/librosbag2_storage_mcap.so" ]]; then
         echo "account-local MCAP plugin is unavailable; run ./tools/setup_recording_benchmark.sh once" >&2
@@ -86,6 +88,7 @@ fi
 
 if [[ "${hardware_command}" == "run-tabletop" || \
       "${hardware_command}" == "run-stack" || \
+      "${hardware_command}" == "collect-bilateral-calibration" || \
       "${hardware_command}" == "measure-seat-compliance" ]]; then
     storage_plugins="$(ros2 bag list storage)"
     if ! grep -qx mcap <<<"${storage_plugins}"; then
@@ -94,6 +97,7 @@ if [[ "${hardware_command}" == "run-tabletop" || \
     fi
 fi
 if [[ "${hardware_command}" == "run-tabletop" || \
+      "${hardware_command}" == "collect-bilateral-calibration" || \
       "${hardware_command}" == "measure-seat-compliance" ]]; then
     for message_type in \
         unitree_hg/msg/LowState \
@@ -111,7 +115,7 @@ fi
 
 cd "${workspace_root}"
 case "${hardware_command}" in
-    collect-calibration|collect-bilateral-calibration|run-tabletop|run-stack|measure-seat-compliance)
+    collect-bilateral-calibration|run-tabletop|run-stack|measure-seat-compliance)
         "${workspace_root}/tools/g1_realsense_pc2.sh" stop
         "${workspace_root}/tools/g1_realsense_pc2.sh" start
         ;;

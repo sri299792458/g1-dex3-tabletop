@@ -178,8 +178,8 @@ def export_bilateral_solver_inputs(
         "robot_calibration_revision": ROBOT_CALIBRATION_REVISION,
         "optimizer_backend": "mikeferguson/robot_calibration:Ceres",
         "observation_policy": (
-            "one same-frame CalibrationData record with left_arm, left_camera, "
-            "right_arm, right_camera"
+            "one same-frame CalibrationData record with a complete arm/camera pair "
+            "per observed target; excitation requires its active arm, anchors require both"
         ),
     }
     provenance_path = output / "provenance.json"
@@ -276,7 +276,8 @@ def solve_bilateral_dataset(
     ordered = {name: parameters[name] for name in expected}
     residual_by_arm: dict[str, list[np.ndarray]] = {"left": [], "right": []}
     for sample in dataset.samples:
-        for side in ("left", "right"):
+        for observation in sample.observations:
+            side = observation.side
             predicted, depths = projection.project_side(
                 sample,
                 side=side,
@@ -284,10 +285,11 @@ def solve_bilateral_dataset(
             )
             if np.any(depths <= 0.0):
                 raise RuntimeError("bilateral solution projects target points behind camera")
-            observation = sample.left if side == "left" else sample.right
             residual_by_arm[side].append(
                 predicted - np.asarray(observation.image_points_px, dtype=np.float64)
             )
+    if any(not residuals for residuals in residual_by_arm.values()):
+        raise RuntimeError("bilateral fitting requires observations of each arm")
     arm_rms = {side: _radial_rms(np.vstack(residual_by_arm[side])) for side in ("left", "right")}
     combined = _radial_rms(
         np.vstack([item for side in ("left", "right") for item in residual_by_arm[side]])
