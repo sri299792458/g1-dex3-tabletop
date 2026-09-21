@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "description": "Nested same-frame bilateral models; the final all-offset model is an observability sentinel, not a preferred model.",
+  "models": [
+    {
+      "name": "shared_camera_two_targets",
+      "left_joint_offsets": [],
+      "right_joint_offsets": [],
+      "camera_components": ["x", "y", "z", "roll", "pitch", "yaw"],
+      "optimize_hand_targets": true,
+      "joint_offset_prior_sigma_deg": 5.0
+    },
+    {
+      "name": "shared_camera_two_targets_shoulder_rolls",
+      "left_joint_offsets": ["left_shoulder_roll_joint"],
+      "right_joint_offsets": ["right_shoulder_roll_joint"],
+      "camera_components": ["x", "y", "z", "roll", "pitch", "yaw"],
+      "optimize_hand_targets": true,
+      "joint_offset_prior_sigma_deg": 5.0
+    },
+    {
+      "name": "shared_camera_two_targets_prior_selected_offsets",
+      "left_joint_offsets": [
+        "left_shoulder_roll_joint",
+        "left_wrist_roll_joint"
+      ],
+      "right_joint_offsets": [
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint"
+      ],
+      "camera_components": ["x", "y", "z", "roll", "pitch", "yaw"],
+      "optimize_hand_targets": true,
+      "joint_offset_prior_sigma_deg": 5.0
+    },
+    {
+      "name": "shared_camera_two_targets_all_arm_offsets_sentinel",
+      "left_joint_offsets": [
+        "left_shoulder_roll_joint",
+        "left_wrist_roll_joint",
+        "left_shoulder_pitch_joint",
+        "left_shoulder_yaw_joint",
+        "left_elbow_joint",
+        "left_wrist_pitch_joint",
+        "left_wrist_yaw_joint"
+      ],
+      "right_joint_offsets": [
+        "right_shoulder_roll_joint",
+        "right_shoulder_yaw_joint",
+        "right_elbow_joint",
+        "right_wrist_roll_joint",
+        "right_wrist_pitch_joint",
+        "right_shoulder_pitch_joint",
+        "right_wrist_yaw_joint"
+      ],
+      "camera_components": ["x", "y", "z", "roll", "pitch", "yaw"],
+      "optimize_hand_targets": true,
+      "joint_offset_prior_sigma_deg": 5.0
+    }
+  ]
+}

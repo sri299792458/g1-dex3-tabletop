@@ -1,0 +1,14 @@
+schema_version: 1
+hardware_ready: true
+blocking_reasons: []
+required_attached_boxes:
+  - calibration_plate
+attached_boxes:
+  - name: calibration_plate
+    parent_link: left_rubber_hand
+    size_m: [0.050, 0.060, 0.007]
+    xyz_m: [0.037, -0.027, 0.000]
+    rpy_rad: [0.0, 0.0, 0.0]
+visual_fallback_links: []
+pairs:
+  - [calibration_plate, torso_link]

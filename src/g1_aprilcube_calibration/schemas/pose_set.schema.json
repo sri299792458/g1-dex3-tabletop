@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/g1-calibration/pose-set-v3.schema.json",
+  "title": "G1 calibration pose set",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "robot",
+    "calibration_arm",
+    "joint_order",
+    "full_joint_order",
+    "poses",
+    "audit_log",
+    "content_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 3},
+    "robot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "mode_machine", "urdf_sha256"],
+      "properties": {
+        "model": {"type": "string", "minLength": 1},
+        "mode_machine": {"const": 5},
+        "urdf_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "joint_order": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"type": "string"}
+    },
+    "full_joint_order": {
+      "type": "array",
+      "minItems": 29,
+      "maxItems": 29,
+      "items": {"type": "string"}
+    },
+    "calibration_arm": {"enum": ["left", "right"]},
+    "poses": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/pose"}
+    },
+    "audit_log": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/audit"}
+    },
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "$defs": {
+    "finiteNumber": {"type": "number"},
+    "vector7": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "items": {"$ref": "#/$defs/finiteNumber"}
+    },
+    "vector29": {
+      "type": "array",
+      "minItems": 29,
+      "maxItems": 29,
+      "items": {"$ref": "#/$defs/finiteNumber"}
+    },
+    "pose": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "group",
+        "measured_calibration_q",
+        "measured_full_q",
+        "calibration_q_spread",
+        "recorded_at_utc",
+        "recorded_monotonic_s",
+        "source",
+        "anchor",
+        "preview_path",
+        "visual_quality"
+      ],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"},
+        "group": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"},
+        "measured_calibration_q": {"$ref": "#/$defs/vector7"},
+        "replay_calibration_q": {"$ref": "#/$defs/vector7"},
+        "measured_full_q": {"$ref": "#/$defs/vector29"},
+        "calibration_q_spread": {"$ref": "#/$defs/vector7"},
+        "recorded_at_utc": {"type": "string", "minLength": 1},
+        "recorded_monotonic_s": {"type": "number", "minimum": 0},
+        "source": {"type": "string", "minLength": 1},
+        "anchor": {"type": "boolean"},
+        "preview_path": {"type": ["string", "null"]},
+        "visual_quality": {"type": "object"}
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "pose_id", "occurred_at_utc", "details"],
+      "properties": {
+        "action": {"enum": ["add", "undo"]},
+        "pose_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"},
+        "occurred_at_utc": {"type": "string", "minLength": 1},
+        "details": {"type": "object"}
+      }
+    }
+  }
+}

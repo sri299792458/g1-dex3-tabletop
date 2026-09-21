@@ -1,0 +1,35 @@
+schema_version: 1
+table:
+  # A single resting cube determines only its supporting plane. It cannot
+  # reveal the complete physical table footprint. This local patch is a
+  # conservative planning aid centred under the cube. It may extend beyond the
+  # real table without weakening safety. The independent plane guard still
+  # validates the complete moving selected wrist/hand/payload route, including
+  # any
+  # samples outside this patch. Full-robot self-collision remains active
+  # independently.
+  collision_policy: local_manipulation_geometry_plane
+  open_transit_patch_dimensions_m: [0.400, 0.400, 0.020]
+  # A mathematically positive sphere/plane distance is not enough execution
+  # margin. This matches the commissioned 5 mm minimum collision clearance
+  # used by the calibration route validator. It applies to selected wrist/hand
+  # geometry after the supported escape; the resting cube is intentionally
+  # allowed to contact its supporting plane.
+  minimum_hand_plane_clearance_m: 0.005
+motion:
+  supported_escape_m: 0.100
+  # Pause once within the normal payload lift, after 30 mm of planned vertical
+  # travel. This gives the object unambiguous table separation despite modest
+  # tracking/table-pose error while keeping a failed-retention drop low.
+  retention_test_lift_m: 0.030
+  payload_lift_m: 0.100
+  # Commissioned default after successful 40 mm and 60 mm tabletop trials.
+  # A run may explicitly request a slower value; the hardware executor still
+  # independently refuses anything above its commissioned ceiling. Dex3
+  # posture timing is separate and unchanged.
+  maximum_arm_velocity_rad_s: 0.200
+perception:
+  minimum_frames: 3
+  maximum_translation_spread_mm: 5.0
+  maximum_rotation_spread_deg: 2.0
+  calibration_validation_claim: false

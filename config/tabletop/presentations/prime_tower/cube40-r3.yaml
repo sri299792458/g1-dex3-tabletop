@@ -1,0 +1,2891 @@
+format: g1_aprilcube_executable_grasp_shortlist
+format_version: 2
+shortlist_id: cube40-r3_prime_tower_h60_v1
+applicable_hand_sides:
+- left
+- right
+qualification_source_hand_side: right
+canonical_grasp_frame: GraspGenX_G
+handedness_policy: preserve_object_T_G_and_apply_exact_dex3_side_adapter
+object_id: cube_head
+object_mesh: third_party/aprilcube/models/dex3_safe_cube/mujoco/cube.obj
+object_mesh_sha256: 27c8460e40a85475e87c3cc0d6090c3c9500de4fa7f5728a2462fc099ef3d927
+candidate_count: 113
+presentation:
+  id: prime-tower
+  fixture_id: cube_prime_tower_h60
+  fixture_mesh: config/tabletop/presentations/prime_tower/fixture.stl
+  fixture_mesh_sha256: 2e1409589b2a4cb394b8ac89756f8e9739e2c8ebbe2324815258f8cc7eb2ad56
+  fixture_mesh_scale:
+  - 0.001
+  - 0.001
+  - 0.001
+  support_height_m: 0.06
+  cube_pose_contract: centred_and_yaw_aligned
+runtime_policy:
+  candidate_grouping: none
+  candidate_submission: independent_batched_ik_rows_with_16_seeds_each
+  curobo_selection_role: reachability_self_collision_and_arm_route
+  serialization_order_is_planner_cost: false
+execution_contract:
+  applicability: stationary_cube_centred_and_yaw_aligned_on_prime_tower
+  source_retention_pass_required: true
+  fixed_cube_during_qualification: true
+  fixed_descriptor_close_target: true
+  initial_open_hand_object_collision_free: true
+  exact_fixture_and_table_open_approach_clear: true
+  exact_fixture_and_table_fixed_close_sweep_clear: true
+  approach_distance_m: 0.07
+  fixed_close_sweep_samples: 51
+  fixed_close_sweep_maximum_joint_step_rad: 0.02
+  required_contact_groups_during_fixed_close_sweep:
+  - thumb
+  - opposing
+audit:
+  source_candidate_count: 3178
+  admitted_candidate_count: 113
+  rejection_counts_nonexclusive:
+    fixture_or_table_collision_during_fixed_close: 1228
+    fixture_or_table_collision_during_open_approach: 1478
+    open_hand_cube_collision: 69
+    opposing_never_reaches_fixed_cube: 348
+    thumb_never_reaches_fixed_cube: 80
+source:
+  generator: adapted_existing_exact_fixture_and_fixed_close_tools
+  source_repository: sri299792458/g1-aprilcube-demo
+  source_revision: 4325bc94988b44554f106b206fb1bcd650cfd619
+  arm_grasp_pool: artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml
+  arm_grasp_pool_sha256: 8e9343f9080421a5e26e3854fa0886f965392aae1c032a414e4446b2b1bfa9e4
+  qualification_object_mesh: third_party/aprilcube/models/dex3_safe_cube/mujoco/cube.obj
+  qualification_object_mesh_sha256: 27c8460e40a85475e87c3cc0d6090c3c9500de4fa7f5728a2462fc099ef3d927
+  fixture_source_filename: prime_tower_collision.stl
+  fixture_mesh_sha256: 2e1409589b2a4cb394b8ac89756f8e9739e2c8ebbe2324815258f8cc7eb2ad56
+  dex3_descriptor_urdf_sha256: a0eb8466fd854328d7d43f7f30e823d9d45e331acf77a03154fb6861d80e73d9
+  dex3_descriptor_config_sha256: c54143b12d91a4a9a0a777b52e9dbd0c5ef4eb9406e40a88fcc56ca86b9da5ab
+  dex3_descriptor_collision_mesh_sha256: b516e791d18d777b1c6ecc885073bad3511c8c1e1bab1c3cb97b61d79c2d0871
+candidates:
+- candidate_id: cube_head__seed_0000000099__sample_218
+  candidate_content_sha256: 9604dd42a1b03c708866fccbbe62c26d1acfaf581ddb6ac42acd5dc2e8372d18
+  source_pool_index: 9
+  graspgenx_score: 0.12810474634170532
+  object_T_G:
+    position:
+    - 0.1039650576082891
+    - -0.03852437610848775
+    - -0.001581638847113386
+    orientation:
+      w: 0.19885474621484722
+      xyz:
+      - -0.669297097792708
+      - 0.10252437587739871
+      - 0.7085103648818677
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.76
+    opposing_first_contact_alpha: 0.56
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000159__sample_235
+  candidate_content_sha256: 32e6386d2cdb0730ae7808ddafd7089321c510538b1c4c34e62c494527983081
+  source_pool_index: 75
+  graspgenx_score: 0.0975349098443985
+  object_T_G:
+    position:
+    - -0.0805689333113009
+    - -0.07999025459512105
+    - 0.005176718667513892
+    orientation:
+      w: 0.6540759250622634
+      xyz:
+      - -0.29078614086672033
+      - 0.6386742746922245
+      - 0.282353104073863
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.68
+    opposing_first_contact_alpha: 0.56
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000099__sample_011
+  candidate_content_sha256: 54ba171339b8c697d4a450d4a53d2fc6e896362cd4c63e32ac180638329ba124
+  source_pool_index: 204
+  graspgenx_score: 0.9459743499755859
+  object_T_G:
+    position:
+    - 0.07105640935580192
+    - 0.00478698744327793
+    - -0.004439153387778238
+    orientation:
+      w: 0.4175920490228398
+      xyz:
+      - -0.5704833783036074
+      - -0.3725868093987924
+      - 0.6011195098599253
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000169__sample_149
+  candidate_content_sha256: 936f2a245eaf669ddcb2889f5d0f6a56edada15b8b541daeea44881f8a2c24a5
+  source_pool_index: 245
+  graspgenx_score: 0.6421250104904175
+  object_T_G:
+    position:
+    - 0.002311072161970109
+    - -0.07651921535952916
+    - 0.01263777897170858
+    orientation:
+      w: 0.7316890862534638
+      xyz:
+      - -0.6806551757116797
+      - 0.02712373396791401
+      - 0.024574700203908437
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.44
+    opposing_first_contact_alpha: 0.9400000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_030
+  candidate_content_sha256: 549e77a6f3e0f424d3a6dd0df53d4e84273cbfe3f140abe3b9f617e0ba0c30c8
+  source_pool_index: 395
+  graspgenx_score: 0.9363588094711304
+  object_T_G:
+    position:
+    - -0.003626195631372362
+    - -0.07063168461545338
+    - 0.00022214226251581292
+    orientation:
+      w: 0.7378601200558437
+      xyz:
+      - -0.6731728108514677
+      - -0.02775274931986693
+      - -0.040380624892378196
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.32
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_069
+  candidate_content_sha256: 4a6563dc5657bc4cc06431203abfc65ea76b3b4410bf18dfa7c0629c4a0a4f30
+  source_pool_index: 442
+  graspgenx_score: 0.8504555821418762
+  object_T_G:
+    position:
+    - 0.06630520391146598
+    - -0.0003334091707967769
+    - 0.015454893786824509
+    orientation:
+      w: 0.49520409984534064
+      xyz:
+      - 0.4986441887208963
+      - -0.520510712230637
+      - -0.4849695567810424
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.26
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000099__sample_028
+  candidate_content_sha256: fdbc79d8d3c96ce779e923306a1893984afd2c4656e34e65be9223938ad5c355
+  source_pool_index: 497
+  graspgenx_score: 0.926694393157959
+  object_T_G:
+    position:
+    - 0.00014301132861469732
+    - -0.07060834194644322
+    - 0.004842811119175717
+    orientation:
+      w: 0.7254547607680265
+      xyz:
+      - -0.6864664388308331
+      - -0.030106694475428908
+      - -0.03965861048603079
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.34
+    opposing_first_contact_alpha: 0.98
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_228
+  candidate_content_sha256: c0c4aa6079faa4a9806d522c38c084fd29dd4900e78b481838aea72c20701863
+  source_pool_index: 998
+  graspgenx_score: 0.15402135252952576
+  object_T_G:
+    position:
+    - -0.08090368044694009
+    - 0.004553537004450654
+    - 0.03526426464728193
+    orientation:
+      w: 0.49008782852730753
+      xyz:
+      - -0.4918765546826136
+      - 0.5466639182042305
+      - -0.46800634164138016
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5
+    opposing_first_contact_alpha: 0.8200000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_124
+  candidate_content_sha256: bc552abf37e46a213fe3e4d6833b7c22c2068847de5caa6ad31924785ab490e5
+  source_pool_index: 1243
+  graspgenx_score: 0.6981328725814819
+  object_T_G:
+    position:
+    - 0.013860931236845822
+    - -0.06706112052424779
+    - -0.004797015484058097
+    orientation:
+      w: 0.7526874686464821
+      xyz:
+      - -0.6504577510184145
+      - 0.09141930529964526
+      - 0.04481963075648042
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5
+    opposing_first_contact_alpha: 0.92
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_139
+  candidate_content_sha256: a34503100584f8ed638450d56868a73b59d465ca7b4fde3fe86edc1e7e42d866
+  source_pool_index: 1314
+  graspgenx_score: 0.6573466062545776
+  object_T_G:
+    position:
+    - -0.07429480684121194
+    - -0.011171345479031708
+    - -0.022612426574908927
+    orientation:
+      w: 0.6432004580808932
+      xyz:
+      - -0.3663664383643394
+      - 0.38463091357287904
+      - -0.5514778906618568
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.46
+    opposing_first_contact_alpha: 0.88
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_072
+  candidate_content_sha256: 08ca6c968daf9f82129c0ca97b864d0ce00f7aece0f5134a211a03752a09016c
+  source_pool_index: 1339
+  graspgenx_score: 0.860625684261322
+  object_T_G:
+    position:
+    - -0.0031559925166988667
+    - -0.0672531517885529
+    - 0.008117428835845753
+    orientation:
+      w: 0.21759983332907648
+      xyz:
+      - -0.17092483824436983
+      - 0.6806715312592556
+      - 0.6783224002931606
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.24
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000169__sample_148
+  candidate_content_sha256: ff0a096d23f51344237db0d651fd43a1fe891421391b4713da56f979aadc06b0
+  source_pool_index: 1374
+  graspgenx_score: 0.6465772390365601
+  object_T_G:
+    position:
+    - -0.07870503646452966
+    - -0.0015357582561575424
+    - -0.021313006203257278
+    orientation:
+      w: 0.6255394616718024
+      xyz:
+      - -0.3567454165736847
+      - 0.39141548713566165
+      - -0.572910993152839
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5
+    opposing_first_contact_alpha: 0.86
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_107
+  candidate_content_sha256: afcf95234ec4259fc93996bd0699f2b18bdd845f48d1f68ef86aa293269667ec
+  source_pool_index: 1433
+  graspgenx_score: 0.7752399444580078
+  object_T_G:
+    position:
+    - -0.07993811500390115
+    - 0.06688479904905925
+    - 0.0006983289792120604
+    orientation:
+      w: 0.7068925781091027
+      xyz:
+      - 0.19921680804119407
+      - 0.6595112021407831
+      - -0.16018901541292996
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.68
+    opposing_first_contact_alpha: 0.52
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000099__sample_166
+  candidate_content_sha256: cd0fbc06bb8b3ac700bb0e3accc366f32be2bc9a4139d7f904fdd5530ab6900c
+  source_pool_index: 1463
+  graspgenx_score: 0.5706270337104797
+  object_T_G:
+    position:
+    - 0.010535872158212037
+    - -0.07264340843184819
+    - 0.012546525191880032
+    orientation:
+      w: 0.7225814172811298
+      xyz:
+      - -0.689205656332407
+      - 0.05020186581615027
+      - 0.018746502286756648
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.52
+    opposing_first_contact_alpha: 0.8400000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_116
+  candidate_content_sha256: 7e89eeb77424873854bbdbdb11c0b5f3af101a1aac906211ce86a7ecad8e7841
+  source_pool_index: 1594
+  graspgenx_score: 0.696476399898529
+  object_T_G:
+    position:
+    - -0.045091786804991395
+    - 0.05301985715405116
+    - 0.04515660912207441
+    orientation:
+      w: 0.4748969762196531
+      xyz:
+      - 0.25817208342134873
+      - 0.7894245280904056
+      - -0.2909105563030512
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 0.9600000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_049
+  candidate_content_sha256: 7a65aa936878ba2a3fbf082598ab48d6c8f1a5140a168991fc77d937384fbded
+  source_pool_index: 1623
+  graspgenx_score: 0.8977152109146118
+  object_T_G:
+    position:
+    - 0.0025853394424444143
+    - 0.10842749302164684
+    - 0.001671317819870278
+    orientation:
+      w: 0.4810162125821297
+      xyz:
+      - 0.48681986797793164
+      - 0.48858770053100664
+      - -0.5412133389569368
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7000000000000001
+    opposing_first_contact_alpha: 0.56
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000019__sample_138
+  candidate_content_sha256: 35e901d83803dc7fc59d01af8068f8abb142eb87b256df649c87ce61e47a8703
+  source_pool_index: 1776
+  graspgenx_score: 0.6325690150260925
+  object_T_G:
+    position:
+    - -0.08960554880221429
+    - 0.05987206672207484
+    - 0.007705489494270846
+    orientation:
+      w: 0.7058425094358352
+      xyz:
+      - 0.18062086536786023
+      - 0.6691284361276888
+      - -0.14638849282782398
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.54
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_179
+  candidate_content_sha256: ce79d34f52f490d2b6b776788bd30f7f79f0c0748ef00f98e451cc4b99e6a5ea
+  source_pool_index: 1800
+  graspgenx_score: 0.5560812950134277
+  object_T_G:
+    position:
+    - -0.007734609685289293
+    - 0.10558058147207866
+    - 0.024629339430845543
+    orientation:
+      w: 0.5054831511948745
+      xyz:
+      - 0.508461969438444
+      - 0.501983410832895
+      - -0.48370018062995573
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.68
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_067
+  candidate_content_sha256: 8bdf4f6d093ab2708f484f54a24a1bfcd48f3baae0eaa79c9babd1f9bafb36af
+  source_pool_index: 1881
+  graspgenx_score: 0.878017008304596
+  object_T_G:
+    position:
+    - -0.002228656235533386
+    - 0.10285325919167171
+    - 0.006757260155297085
+    orientation:
+      w: 0.4779274163348608
+      xyz:
+      - 0.48187100330227606
+      - 0.501510390079866
+      - -0.5365380224493724
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.62
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_173
+  candidate_content_sha256: c8e18415d87d79c19f2d1adeae43855a55e834330eeab7dbd8ac362ff53fb429
+  source_pool_index: 1914
+  graspgenx_score: 0.39678317308425903
+  object_T_G:
+    position:
+    - 0.09891030805985389
+    - -0.002126020841477121
+    - 0.012279967632509037
+    orientation:
+      w: 0.23420992498824852
+      xyz:
+      - -0.665323659025708
+      - -0.1654625132257932
+      - 0.6892839012298533
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5800000000000001
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000129__sample_179
+  candidate_content_sha256: 5b076c4552e519b580c70bddf51353a9e02bd00d7980f6076e6f902e17c73cef
+  source_pool_index: 1926
+  graspgenx_score: 0.44963932037353516
+  object_T_G:
+    position:
+    - 0.006761253893924326
+    - 0.09152295266167293
+    - 0.0015778143139474241
+    orientation:
+      w: 0.070782984373579
+      xyz:
+      - 0.0058552329370004505
+      - -0.6169438283960108
+      - 0.7837957629220103
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.6
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000019__sample_144
+  candidate_content_sha256: aa74c4420b57c718ef08f0b5d821fe62ea2aabc23680c92cec4979bed11bfe58
+  source_pool_index: 1930
+  graspgenx_score: 0.6137486100196838
+  object_T_G:
+    position:
+    - 0.004755221855444283
+    - -0.06918006564601292
+    - 0.017589842755711838
+    orientation:
+      w: 0.7149451007254398
+      xyz:
+      - -0.6984891747133873
+      - 0.02558851576921428
+      - 0.017652297800300254
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.38
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_146
+  candidate_content_sha256: 798b3de71d4b2f1ee4ab3e9c7c93382b252e0ea41d094b1a5d9779d676a633c3
+  source_pool_index: 1961
+  graspgenx_score: 0.6107190251350403
+  object_T_G:
+    position:
+    - -0.00879384708722177
+    - -0.06584052170737614
+    - 0.01719832033327894
+    orientation:
+      w: 0.28071567606138764
+      xyz:
+      - -0.23940362632658063
+      - 0.6732790766218444
+      - 0.64076508792093
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.24
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_159
+  candidate_content_sha256: 85acbe4c4bd4eb1075b9101aeea149d03b4bdc56aeee113d4f7cb601a9b00124
+  source_pool_index: 1979
+  graspgenx_score: 0.6072612404823303
+  object_T_G:
+    position:
+    - -0.01055257898886743
+    - -0.06841384048684468
+    - 0.013401612494505211
+    orientation:
+      w: 0.2973886318355837
+      xyz:
+      - -0.24243037411562193
+      - 0.6537208488840726
+      - 0.6522549862556876
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.28
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_155
+  candidate_content_sha256: aa84c227b5b824f3a3192f2050079531b490711ca57d8c3448de5c360bebfc63
+  source_pool_index: 2020
+  graspgenx_score: 0.5893394351005554
+  object_T_G:
+    position:
+    - 0.009928983253044458
+    - -0.06646860565169682
+    - 0.018302336190260216
+    orientation:
+      w: 0.6718976491140249
+      xyz:
+      - -0.6966072072297607
+      - 0.17108138032311482
+      - 0.18445354227375862
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.32
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_205
+  candidate_content_sha256: f18431923dc5545c53fe50d86f88178b1d5b3c913b4652794735de76ac51f07c
+  source_pool_index: 2034
+  graspgenx_score: 0.3202165961265564
+  object_T_G:
+    position:
+    - 0.0026570200813835565
+    - 0.09192891989723811
+    - 0.028424177173889443
+    orientation:
+      w: 0.03228956649810054
+      xyz:
+      - 0.017816654574121325
+      - 0.718469216307753
+      - -0.6945804027852169
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.56
+    opposing_first_contact_alpha: 0.7000000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_207
+  candidate_content_sha256: b0795d68fdc542377ef3aad62a6539eb55fa5e74ebe84724249002ac2b48e87c
+  source_pool_index: 2040
+  graspgenx_score: 0.2051461786031723
+  object_T_G:
+    position:
+    - 0.09020101892630515
+    - 0.004891186141232347
+    - 0.023472990695751473
+    orientation:
+      w: 0.3328640646080284
+      xyz:
+      - -0.6427132283806694
+      - -0.29757603025345725
+      - 0.6225509832742324
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.6
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_204
+  candidate_content_sha256: a0a00631675149f6a3a61d2856fdab461128e9c806150762dac9d2577a72befc
+  source_pool_index: 2052
+  graspgenx_score: 0.2432282269001007
+  object_T_G:
+    position:
+    - -0.012700672644572883
+    - 0.06534831051603923
+    - 0.018854083348429963
+    orientation:
+      w: 0.25692326263952836
+      xyz:
+      - 0.20214011334812906
+      - 0.7026959876879644
+      - -0.6319399976085557
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.28
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000019__sample_158
+  candidate_content_sha256: 06f86434c73929a7484c3353fa6032740e00d963f811091e3b38ec59e5772381
+  source_pool_index: 2069
+  graspgenx_score: 0.5615981221199036
+  object_T_G:
+    position:
+    - -0.0008024461906501945
+    - -0.06965779687388768
+    - 0.011547805596507355
+    orientation:
+      w: 0.12008462051404986
+      xyz:
+      - -0.09047523138209473
+      - -0.6633540853957564
+      - -0.7330452058441637
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 0.98
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_213
+  candidate_content_sha256: 5a8a2ccfe629608cdc454335f215658fca4dc1cca2a5f7e872b48d23d327bac4
+  source_pool_index: 2070
+  graspgenx_score: 0.24118560552597046
+  object_T_G:
+    position:
+    - 0.01013509238938746
+    - 0.08838929061667095
+    - 0.02717635207287149
+    orientation:
+      w: 0.051163336177637304
+      xyz:
+      - 0.06342612796252343
+      - 0.7058409344870439
+      - -0.7036675454540396
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5
+    opposing_first_contact_alpha: 0.78
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000039__sample_151
+  candidate_content_sha256: 37c83ac98693d0cf6eb0e948aca6b49d9b4b097d9d6c96313a778634b60cc9f5
+  source_pool_index: 2087
+  graspgenx_score: 0.548522412776947
+  object_T_G:
+    position:
+    - -0.0020781357646087106
+    - -0.06263439531548848
+    - 0.02266866885534601
+    orientation:
+      w: 0.12582083002336628
+      xyz:
+      - -0.037603962987091344
+      - 0.751408117208794
+      - 0.6466381539103867
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.16
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_206
+  candidate_content_sha256: 6ceb85b0577c4adea045315664eba3836f866a25d01023f47345cb070793bd2e
+  source_pool_index: 2119
+  graspgenx_score: 0.31822529435157776
+  object_T_G:
+    position:
+    - -0.07073948663790765
+    - 0.007419335310170745
+    - -0.01771706543453856
+    orientation:
+      w: 0.6426730437370285
+      xyz:
+      - -0.33553986783244566
+      - 0.36101001230552576
+      - -0.5865629778326729
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.34
+    opposing_first_contact_alpha: 0.9600000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_212
+  candidate_content_sha256: 1697644df056fd4d365df24f6363312d40505c65e137314dda1910821e90eac1
+  source_pool_index: 2249
+  graspgenx_score: 0.20788148045539856
+  object_T_G:
+    position:
+    - -0.09377995264847817
+    - 0.000883953532958721
+    - 0.029115665559089943
+    orientation:
+      w: 0.5095210306149652
+      xyz:
+      - -0.478320629846614
+      - 0.5427024491496147
+      - -0.4659095900614325
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_169
+  candidate_content_sha256: a120e6276cdf767d923c585b72d9ba2ae3d5ab564f66907dcbb4ee1ed3815de6
+  source_pool_index: 2253
+  graspgenx_score: 0.4390752911567688
+  object_T_G:
+    position:
+    - -0.017133004415231377
+    - -0.0782232599995934
+    - 0.016943821538604065
+    orientation:
+      w: 0.4070669632725035
+      xyz:
+      - -0.3266764605600079
+      - 0.6165269787318671
+      - 0.5894687964802241
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 0.86
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_213
+  candidate_content_sha256: 8bb3101b518956115204d29b9dfde053c87b8cf0a94abdf7bbf64e6e5b735d4d
+  source_pool_index: 2265
+  graspgenx_score: 0.2027694135904312
+  object_T_G:
+    position:
+    - -0.09058604520876946
+    - 1.7468500938584318e-05
+    - 0.026905309263981148
+    orientation:
+      w: 0.5102916998974996
+      xyz:
+      - -0.47493614829045927
+      - 0.5335340402544066
+      - -0.47893576182255726
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.6
+    opposing_first_contact_alpha: 0.7200000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_100
+  candidate_content_sha256: 7bd94fb6c3f22d15e73d94b38e920a9abbdfa96c7ba5ce71c20beffd050e3e00
+  source_pool_index: 2266
+  graspgenx_score: 0.764316737651825
+  object_T_G:
+    position:
+    - -0.030273997608023316
+    - 0.10328695003763805
+    - 0.011170567799723908
+    orientation:
+      w: 0.5290682699104124
+      xyz:
+      - 0.43437228422662566
+      - 0.5644877714754208
+      - -0.4612602739500332
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.66
+    opposing_first_contact_alpha: 0.54
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000159__sample_222
+  candidate_content_sha256: 6d4ca745ac89747f2f194052607825def905cf6e944e111e3025bd3c1ff7377a
+  source_pool_index: 2281
+  graspgenx_score: 0.1785213202238083
+  object_T_G:
+    position:
+    - -0.07345627379735055
+    - 0.009242845819155071
+    - 0.023937653605259224
+    orientation:
+      w: 0.5766044618098086
+      xyz:
+      - -0.3866106601320304
+      - 0.577564161598617
+      - -0.4295103390259458
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.34
+    opposing_first_contact_alpha: 0.9600000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000099__sample_121
+  candidate_content_sha256: e6a274ffac87c7a96518bc8c964a68b16c71152d2d2ac3e0679db3b7c6c68f8b
+  source_pool_index: 2282
+  graspgenx_score: 0.7555161714553833
+  object_T_G:
+    position:
+    - 0.013116138604087205
+    - 0.10390978877321849
+    - 0.005508154951400324
+    orientation:
+      w: 0.47535666507964897
+      xyz:
+      - 0.4871646799643897
+      - 0.49862782319608023
+      - -0.5367279660072569
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.6
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000019__sample_213
+  candidate_content_sha256: 5b3a0df978a524628537b1f250374af96f7456ce1a02218236c6eba44eb2fb0a
+  source_pool_index: 2296
+  graspgenx_score: 0.17415852844715118
+  object_T_G:
+    position:
+    - -0.09140030426104608
+    - -0.005355306315412427
+    - 0.01726140812448339
+    orientation:
+      w: 0.5860792544873453
+      xyz:
+      - -0.38566546536185703
+      - 0.5729188277692332
+      - -0.4237183888791081
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000169__sample_196
+  candidate_content_sha256: 5ac4e3ae8ef6bc52e2a6816b0933b95a56fd53a2087f4e83ba7746ed41f94224
+  source_pool_index: 2333
+  graspgenx_score: 0.39205384254455566
+  object_T_G:
+    position:
+    - -0.00439879196827355
+    - -0.08640321518405308
+    - 0.016717240069425866
+    orientation:
+      w: 0.7211196009640007
+      xyz:
+      - -0.6916860417820072
+      - 0.028790617925397277
+      - 0.026982235432474414
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5
+    opposing_first_contact_alpha: 0.8
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_126
+  candidate_content_sha256: ad10068201f130e20525b03d49d6a23cb4095d5be79bcc8d79be6ca679436b0f
+  source_pool_index: 2376
+  graspgenx_score: 0.6942970752716064
+  object_T_G:
+    position:
+    - -0.07048185301144662
+    - 0.012379835479716156
+    - -0.013315491523229316
+    orientation:
+      w: 0.5692694062240247
+      xyz:
+      - 0.4531671450958978
+      - 0.42562765009302983
+      - 0.5379711750821461
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.42000000000000004
+    opposing_first_contact_alpha: 1.0
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000089__sample_183
+  candidate_content_sha256: 83a86de01ee60bc11aeeebd8907830c79bac19a004f8c076b7cc7e66ddd695a6
+  source_pool_index: 2385
+  graspgenx_score: 0.37973055243492126
+  object_T_G:
+    position:
+    - -0.09339607638438287
+    - -0.001600358165977205
+    - 0.01848399997166471
+    orientation:
+      w: 0.6290921257794361
+      xyz:
+      - 0.3622302375399037
+      - 0.5877479495454846
+      - 0.35719000559810493
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.52
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000039__sample_241
+  candidate_content_sha256: 0a4d6a55ace98eb05bf03d448b0923b90874d0f392aa9660ade4a3102e355edd
+  source_pool_index: 2461
+  graspgenx_score: 0.013301958329975605
+  object_T_G:
+    position:
+    - -0.10115488005002084
+    - -0.04923886234982839
+    - 0.04536544517091589
+    orientation:
+      w: 0.5375113102410414
+      xyz:
+      - -0.6387386134726901
+      - 0.42817056096698125
+      - -0.3460701456976113
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.9
+    opposing_first_contact_alpha: 0.4
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_203
+  candidate_content_sha256: b3bbf688aba626e6c8989c9b795671c1b4f30659fc799dcf4701f3e8d6881c76
+  source_pool_index: 2488
+  graspgenx_score: 0.30495598912239075
+  object_T_G:
+    position:
+    - -0.09550430012066903
+    - 0.003444302947083806
+    - 0.03230585515908079
+    orientation:
+      w: 0.6166698453356098
+      xyz:
+      - 0.3661424005749975
+      - 0.6254700301893658
+      - 0.3073195172615082
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.56
+    opposing_first_contact_alpha: 0.7000000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_181
+  candidate_content_sha256: d1f47be07de5f4439fad903cf77027fa401438151ea5ae5075e62bd72821b947
+  source_pool_index: 2491
+  graspgenx_score: 0.4907722473144531
+  object_T_G:
+    position:
+    - -0.02438932602425161
+    - -0.084549592687925
+    - 0.008722762432313725
+    orientation:
+      w: 0.692306280524968
+      xyz:
+      - -0.6210091677974748
+      - 0.2764865187929143
+      - 0.24210500280445874
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.4
+    opposing_first_contact_alpha: 0.88
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_206
+  candidate_content_sha256: 4ac1f09cf343673d5aab66d6ee431904cf5d094cef914fdbc32913552b1d3215
+  source_pool_index: 2529
+  graspgenx_score: 0.257333904504776
+  object_T_G:
+    position:
+    - -0.1138001619013125
+    - -0.004971822603782321
+    - -0.004011910087995962
+    orientation:
+      w: 0.7124984075459295
+      xyz:
+      - 0.07672444802448464
+      - 0.6912616430094584
+      - 0.09282628519830517
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.8200000000000001
+    opposing_first_contact_alpha: 0.48000000000000004
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000129__sample_170
+  candidate_content_sha256: e11763cab6db40deef20aa038e36c8d7e7438edc521968b9e4c12a6e47408850
+  source_pool_index: 2554
+  graspgenx_score: 0.4977979362010956
+  object_T_G:
+    position:
+    - 0.08615237342993674
+    - -0.03963876317365995
+    - 0.010964549001670643
+    orientation:
+      w: 0.2994372972150422
+      xyz:
+      - -0.6912458245291063
+      - 0.051048411020059414
+      - 0.6556756628394512
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5800000000000001
+    opposing_first_contact_alpha: 0.78
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_204
+  candidate_content_sha256: c9a5eef17150203e6e7beace7820e488c328419358b55099bab7e1d92b45508e
+  source_pool_index: 2561
+  graspgenx_score: 0.3093767762184143
+  object_T_G:
+    position:
+    - -0.00016149375486242725
+    - -0.09026482875569691
+    - 0.027515409369386002
+    orientation:
+      w: 0.6881335509350963
+      xyz:
+      - -0.7250480825931737
+      - 0.020212856307265326
+      - -0.01920766631632707
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.7000000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_177
+  candidate_content_sha256: 71f229fc26991cefe278184680e460bf30ed33a29e6e2130842fecb83132cd9c
+  source_pool_index: 2588
+  graspgenx_score: 0.43735548853874207
+  object_T_G:
+    position:
+    - 0.09387998896519599
+    - -0.014859980783601906
+    - 0.009644884471214577
+    orientation:
+      w: 0.19740923022284812
+      xyz:
+      - -0.6758116459444887
+      - -0.08463010641801705
+      - 0.705085782097681
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.52
+    opposing_first_contact_alpha: 0.76
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000039__sample_082
+  candidate_content_sha256: 2e50a1478e4d5d426246cc32aeca40157b082546356d0cb251ff2eda33feaaa8
+  source_pool_index: 2591
+  graspgenx_score: 0.803185760974884
+  object_T_G:
+    position:
+    - -0.016712247777181298
+    - 0.10050920222775112
+    - 0.01277818330041246
+    orientation:
+      w: 0.5185898295695252
+      xyz:
+      - 0.47091294066468053
+      - 0.5218750573126627
+      - -0.4867771723658573
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.6
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_207
+  candidate_content_sha256: 63ad190ed785dd9db77360bdcd60a970b75c402374c9b044e48e2f990a720972
+  source_pool_index: 2607
+  graspgenx_score: 0.22050563991069794
+  object_T_G:
+    position:
+    - -0.10388395321686807
+    - 0.0018662536785102833
+    - 0.02468294822088556
+    orientation:
+      w: 0.48842507877543534
+      xyz:
+      - 0.5237143545916564
+      - 0.47068997958851544
+      - 0.5153786572344825
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7200000000000001
+    opposing_first_contact_alpha: 0.52
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000089__sample_208
+  candidate_content_sha256: 1f881f13d3100cacc76cd783165494533874bd7b5245d87ffeb8c3e8846d533d
+  source_pool_index: 2613
+  graspgenx_score: 0.27009665966033936
+  object_T_G:
+    position:
+    - 0.006742615800899834
+    - -0.09100621367915501
+    - 0.02246272176913099
+    orientation:
+      w: 0.7096403718479877
+      xyz:
+      - -0.703693228089594
+      - -0.02819628244208605
+      - -0.020769040438659066
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_178
+  candidate_content_sha256: edcd3ceeb904f285c844273b167b6f6ba71e80b26faddbe28277dafd8bd87b33
+  source_pool_index: 2632
+  graspgenx_score: 0.4359801113605499
+  object_T_G:
+    position:
+    - 0.08892561363856254
+    - -0.026440976067622805
+    - 0.027650739852703377
+    orientation:
+      w: 0.13243948633134675
+      xyz:
+      - -0.7452470114232115
+      - 0.09046152886236636
+      - 0.6472120102570286
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.56
+    opposing_first_contact_alpha: 0.78
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_217
+  candidate_content_sha256: b207feb5f40e3ea181146980a41cabe1b92bb2d2bdc0cbf5f19d1358ba43ea70
+  source_pool_index: 2633
+  graspgenx_score: 0.1817023903131485
+  object_T_G:
+    position:
+    - -0.0963375507028872
+    - -0.0075629804015063294
+    - 0.03666565180233793
+    orientation:
+      w: 0.48036654403110457
+      xyz:
+      - 0.5336381493818686
+      - 0.5152930962354906
+      - 0.4679223588074722
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000139__sample_207
+  candidate_content_sha256: 7061606b7092d987e43e8f1f5f1003967587eb34f2d3172ae367cb866829ab10
+  source_pool_index: 2649
+  graspgenx_score: 0.23925577104091644
+  object_T_G:
+    position:
+    - -0.03163531181533876
+    - -0.05635989259107938
+    - 0.07997382045201139
+    orientation:
+      w: 0.31323687588557947
+      xyz:
+      - -0.5444926387231296
+      - 0.739605953630148
+      - 0.24164738632272717
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5800000000000001
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_166
+  candidate_content_sha256: 0c0f0470c60213af58949ae7bef872474be4bb671ddac0a323050506e639ae10
+  source_pool_index: 2660
+  graspgenx_score: 0.61009281873703
+  object_T_G:
+    position:
+    - -0.0010511280027316805
+    - 0.08419780258909831
+    - 0.02318412609807329
+    orientation:
+      w: 0.6789376071039465
+      xyz:
+      - 0.6932774471271145
+      - 0.1564022965456744
+      - -0.18425099348475
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.44
+    opposing_first_contact_alpha: 0.8200000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000019__sample_201
+  candidate_content_sha256: 587a953a00c1d0dec82a136f73b08cb22da7e3d3d74e076a5fafbe40949abadb
+  source_pool_index: 2665
+  graspgenx_score: 0.25302502512931824
+  object_T_G:
+    position:
+    - -0.00778405686040464
+    - -0.0819088536046349
+    - 0.02233038455656843
+    orientation:
+      w: 0.712977302299097
+      xyz:
+      - -0.7008639973926615
+      - 0.02056517086479326
+      - 0.0054861017474625755
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.44
+    opposing_first_contact_alpha: 0.86
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_191
+  candidate_content_sha256: 8e4cf02ad7aab0e1bda65e9e2c8f17db39280b603890c97f76112abe37ebfd30
+  source_pool_index: 2666
+  graspgenx_score: 0.39900508522987366
+  object_T_G:
+    position:
+    - 0.1106285588709539
+    - 0.024543127164999342
+    - -0.007790989853077367
+    orientation:
+      w: 0.20429513831274632
+      xyz:
+      - 0.6693628387046913
+      - -0.12961100370681988
+      - -0.7024370963588727
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.76
+    opposing_first_contact_alpha: 0.54
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000129__sample_218
+  candidate_content_sha256: 0cb01ecc2cab776f7451f385592eb6cf2c87827b5510c2266bd1eb7b3c442549
+  source_pool_index: 2691
+  graspgenx_score: 0.20534706115722656
+  object_T_G:
+    position:
+    - 0.00886650624553618
+    - -0.09138848061784138
+    - 0.02805586703530626
+    orientation:
+      w: 0.6972353780371503
+      xyz:
+      - -0.7143564423860645
+      - -0.04282059086558787
+      - -0.041522257077854875
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7000000000000001
+    opposing_first_contact_alpha: 0.46
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_197
+  candidate_content_sha256: 458c70b60774f31025db0b6afa4407005226a36e028ebd88e5c5522516dc4381
+  source_pool_index: 2700
+  graspgenx_score: 0.36436203122138977
+  object_T_G:
+    position:
+    - -0.0066048106284910734
+    - -0.09308533544762959
+    - 0.015191221464789673
+    orientation:
+      w: 0.48518916323075434
+      xyz:
+      - -0.4409268274717535
+      - 0.5266052689209108
+      - 0.5411671640481064
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.48000000000000004
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_228
+  candidate_content_sha256: 44ee9a2bfc27c5fd7c04aa7b7ce850c4c85eba0638e32077f474681c49e96c6b
+  source_pool_index: 2704
+  graspgenx_score: 0.19242703914642334
+  object_T_G:
+    position:
+    - -0.011555042500990062
+    - -0.0943437906645142
+    - 0.025094339479125306
+    orientation:
+      w: 0.7041040192772369
+      xyz:
+      - -0.7100903018624992
+      - 0.0026370634233826573
+      - 0.0015294230828498466
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.54
+    opposing_first_contact_alpha: 0.7000000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000139__sample_214
+  candidate_content_sha256: f5aac2ab1295607900d809acb135772c4f9701e54f3fcefbbb7faeb5625874b2
+  source_pool_index: 2725
+  graspgenx_score: 0.17843328416347504
+  object_T_G:
+    position:
+    - 0.007320602972609371
+    - -0.08309151406510701
+    - 0.02701008119098024
+    orientation:
+      w: 0.2395782316360628
+      xyz:
+      - -0.24421361178342962
+      - 0.6816417277904984
+      - 0.6467816769827459
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.4
+    opposing_first_contact_alpha: 0.8400000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000099__sample_114
+  candidate_content_sha256: fb0e0952f2ade30ecbf693023effbb067d87479ef1aaed8cb351924da9cc3474
+  source_pool_index: 2731
+  graspgenx_score: 0.7757018208503723
+  object_T_G:
+    position:
+    - 0.016188161995810836
+    - 0.10284354363457332
+    - 0.005540632032222315
+    orientation:
+      w: 0.48868159157951696
+      xyz:
+      - 0.5139806984262835
+      - 0.4687458835912127
+      - -0.5265846943396981
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.5800000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_220
+  candidate_content_sha256: e1761306faba5abb47048b8410aeb15e097679c03ff38a0699cffa1eaaa226f4
+  source_pool_index: 2740
+  graspgenx_score: 0.1690831333398819
+  object_T_G:
+    position:
+    - 0.011962221552235456
+    - -0.09757788653596272
+    - 0.0035715264681644883
+    orientation:
+      w: 0.6268419899265798
+      xyz:
+      - -0.542308888398619
+      - 0.38801070210380917
+      - 0.40301102253120685
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5800000000000001
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_203
+  candidate_content_sha256: 4178d28791a255ff0f0731296a44d9e5150d43bf54e6b7b39f008154b59f8a76
+  source_pool_index: 2748
+  graspgenx_score: 0.334086537361145
+  object_T_G:
+    position:
+    - -0.015782090287106663
+    - -0.07514114107116093
+    - 0.017188086960829064
+    orientation:
+      w: 0.7270620546077748
+      xyz:
+      - -0.6836265156737759
+      - -0.0031653514407010697
+      - -0.06344711472959667
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.38
+    opposing_first_contact_alpha: 0.9400000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_230
+  candidate_content_sha256: 485ae9641ca2b8c1f7451b2a3e179f6b95df6ea1eb6157eede920db74eaf1a92
+  source_pool_index: 2752
+  graspgenx_score: 0.1426442712545395
+  object_T_G:
+    position:
+    - -0.014584251131313472
+    - -0.09627411688788762
+    - 0.031569693092621136
+    orientation:
+      w: 0.6896544847420317
+      xyz:
+      - -0.7230339086168158
+      - 0.03645701905581833
+      - 0.016417808229366126
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.6
+    opposing_first_contact_alpha: 0.68
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_207
+  candidate_content_sha256: ecb73efb77776d0b4c289170f659a6b700c05a4acf0c0a2981a80371beda7657
+  source_pool_index: 2784
+  graspgenx_score: 0.29226621985435486
+  object_T_G:
+    position:
+    - -0.03118225132246557
+    - -0.07708667392953267
+    - 0.02180320196262674
+    orientation:
+      w: 0.6378901446230615
+      xyz:
+      - -0.5718505901641483
+      - 0.40330131801328406
+      - 0.32160707829653384
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.34
+    opposing_first_contact_alpha: 0.9
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000139__sample_199
+  candidate_content_sha256: 7e9ea4f576bd12419b70c09bb41d90ec64476e9baac0794784ee44c33e725eca
+  source_pool_index: 2793
+  graspgenx_score: 0.3303733766078949
+  object_T_G:
+    position:
+    - 0.09142961966673789
+    - 0.06994505797402034
+    - 0.005403816555059716
+    orientation:
+      w: 0.23576061125554115
+      xyz:
+      - 0.6573186123366104
+      - 0.22401771039494833
+      - -0.6798273615306254
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7200000000000001
+    opposing_first_contact_alpha: 0.6
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_243
+  candidate_content_sha256: 72629445dd8f45c290815bb7c4f83bbdc073379843be63d7b8438f2b9d1df16c
+  source_pool_index: 2800
+  graspgenx_score: 0.062487635761499405
+  object_T_G:
+    position:
+    - 0.01953479329924044
+    - -0.09297336812241902
+    - 0.021864686016357705
+    orientation:
+      w: 0.5497714691165658
+      xyz:
+      - -0.536741238336445
+      - 0.436318178068997
+      - 0.4682804953241413
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000169__sample_236
+  candidate_content_sha256: edf3a3214b641eab135235e1bf8be3f81a006767d953ac88d8676a2e792c372b
+  source_pool_index: 2809
+  graspgenx_score: 0.1246635764837265
+  object_T_G:
+    position:
+    - 0.010101770598990293
+    - -0.08762152667268147
+    - 0.030568180460847184
+    orientation:
+      w: 0.11101484462846913
+      xyz:
+      - -0.10598035166703342
+      - 0.7299431638217568
+      - 0.6660531862565724
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.46
+    opposing_first_contact_alpha: 0.78
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_236
+  candidate_content_sha256: 349679b7635b12f8bad8d00e9be6b8dc258640028c4fba7c9891f2924d7cd1b0
+  source_pool_index: 2829
+  graspgenx_score: 0.1082656979560852
+  object_T_G:
+    position:
+    - -0.020949856761294038
+    - -0.09503366972430577
+    - 0.0327057166438468
+    orientation:
+      w: 0.02704357707450694
+      xyz:
+      - 0.045720446092740646
+      - 0.7337958499513496
+      - 0.6772901419201908
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.76
+    opposing_first_contact_alpha: 0.52
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_210
+  candidate_content_sha256: b5e5873c4951f955c209d24c00cd65fd9e16036dce6f2bebb21134a65965153e
+  source_pool_index: 2832
+  graspgenx_score: 0.21890121698379517
+  object_T_G:
+    position:
+    - 0.08640610295216498
+    - 0.08513210539595256
+    - 0.00228030778876619
+    orientation:
+      w: 0.2735991009094396
+      xyz:
+      - 0.6401806586336687
+      - 0.2467312720436149
+      - -0.6741186362122382
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.8200000000000001
+    opposing_first_contact_alpha: 0.54
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000139__sample_236
+  candidate_content_sha256: a3d8b3f8a9181d50d9ea36971579f5c29664ce85839b285a7cef0c2b9499fd6f
+  source_pool_index: 2841
+  graspgenx_score: 0.014727574773132801
+  object_T_G:
+    position:
+    - 0.06389436739365516
+    - -0.09254897560103764
+    - 0.0036087416525848355
+    orientation:
+      w: 0.36827949639273433
+      xyz:
+      - -0.5924027954313357
+      - 0.3525931591646333
+      - 0.6237845818967931
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.66
+    opposing_first_contact_alpha: 0.52
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_232
+  candidate_content_sha256: a717cd74a368baff4b36140e14f3f87bc75084232295591181a0243bad3ebc4b
+  source_pool_index: 2849
+  graspgenx_score: 0.08002080768346786
+  object_T_G:
+    position:
+    - -0.002480981323319107
+    - -0.09614315058215489
+    - 0.03844880298189001
+    orientation:
+      w: 0.04252017279062382
+      xyz:
+      - 0.00752573993250746
+      - 0.7514811495903507
+      - 0.6583399425484441
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.6
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_152
+  candidate_content_sha256: 11130f3870a6ef0cd4eedf8ba87a77950ef88cbdd493f8228f645806b342468c
+  source_pool_index: 2850
+  graspgenx_score: 0.5415636897087097
+  object_T_G:
+    position:
+    - -0.0893453968795115
+    - 0.020658539728084898
+    - 0.021395506192363068
+    orientation:
+      w: 0.703327567985537
+      xyz:
+      - 0.08694446001592813
+      - 0.70515240172814
+      - -0.023045245087100145
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.46
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_116
+  candidate_content_sha256: 173044e8a18c48ae3d70ae2126c354b6708968ea45617f746eb42f6f5d517ae4
+  source_pool_index: 2854
+  graspgenx_score: 0.7375105023384094
+  object_T_G:
+    position:
+    - 0.016493030440611213
+    - 0.10148146574274669
+    - 0.007994416956222817
+    orientation:
+      w: 0.4802670542339255
+      xyz:
+      - 0.5082110560674126
+      - 0.48448921325590755
+      - -0.5256760231806131
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.6
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_195
+  candidate_content_sha256: 870764365d64d929423b44710a2e3fe3018d8bcfb75d74301a6237f17ba19a09
+  source_pool_index: 2856
+  graspgenx_score: 0.29776549339294434
+  object_T_G:
+    position:
+    - 0.09284859019200263
+    - 0.07275023882166515
+    - 0.0018441576691262571
+    orientation:
+      w: 0.247128409417431
+      xyz:
+      - 0.6610883932212803
+      - 0.24137763224879105
+      - -0.6660529440343944
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.78
+    opposing_first_contact_alpha: 0.5
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_219
+  candidate_content_sha256: d352c9e57dd04c3d6cb496aa488a30505185d64bd60dc4de5e0f0c3636ae299a
+  source_pool_index: 2885
+  graspgenx_score: 0.178183451294899
+  object_T_G:
+    position:
+    - -0.025301567661958367
+    - -0.08301495934947362
+    - 0.03571765110305624
+    orientation:
+      w: 0.5351198251783099
+      xyz:
+      - -0.4244946206550321
+      - 0.6253427149611508
+      - 0.37735603689498937
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.48000000000000004
+    opposing_first_contact_alpha: 0.86
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_113
+  candidate_content_sha256: 01668d16dfefa1a473350b5b23009c511e3405e4adeb8eeb22f04b0476cb5f52
+  source_pool_index: 2889
+  graspgenx_score: 0.716876208782196
+  object_T_G:
+    position:
+    - -0.010958983946042685
+    - 0.11187221680657039
+    - 0.008052346151686474
+    orientation:
+      w: 0.5193496327580226
+      xyz:
+      - 0.4917398670695944
+      - 0.4852787545977234
+      - -0.5029636094436332
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.78
+    opposing_first_contact_alpha: 0.56
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_225
+  candidate_content_sha256: 48cccfe72e6b46021f184b44fc7204cfe3f7e2e2d87b3e7d3961384cef223e43
+  source_pool_index: 2892
+  graspgenx_score: 0.20882104337215424
+  object_T_G:
+    position:
+    - 0.059260240372819274
+    - 0.09987050865666042
+    - 0.01286801681331472
+    orientation:
+      w: 0.4450892476936911
+      xyz:
+      - 0.6408021956357141
+      - 0.3138815597177691
+      - -0.541060508746529
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.78
+    opposing_first_contact_alpha: 0.46
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000099__sample_211
+  candidate_content_sha256: f47cfd4946173289554dee76aca0c1da27e2d0e65f7b393b02ec6c471dd94e97
+  source_pool_index: 2893
+  graspgenx_score: 0.17177386581897736
+  object_T_G:
+    position:
+    - -0.02146068160553518
+    - -0.0994811597011887
+    - 0.010874360654867455
+    orientation:
+      w: 0.4568978895877144
+      xyz:
+      - -0.3885310189574886
+      - 0.5693948858558208
+      - 0.5622076393641278
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5800000000000001
+    opposing_first_contact_alpha: 0.6
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_224
+  candidate_content_sha256: 8ff7f50a17d348503e12ca22d56db1b06f5b74672fa866cbf6af8d13debf4b58
+  source_pool_index: 2911
+  graspgenx_score: 0.12923593819141388
+  object_T_G:
+    position:
+    - 0.09075462686697898
+    - -0.028589030607780123
+    - 0.016319962073481842
+    orientation:
+      w: 0.39541124778099795
+      xyz:
+      - 0.49121409058153687
+      - -0.4688833535197502
+      - -0.6184715540220919
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7000000000000001
+    opposing_first_contact_alpha: 0.62
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_127
+  candidate_content_sha256: d1d21f66839c602f5ac277c3ea5c4534e87c8a9fc5e912916ff5edfaf6841403
+  source_pool_index: 2913
+  graspgenx_score: 0.7103437781333923
+  object_T_G:
+    position:
+    - 0.005926140200895638
+    - 0.10479730938450466
+    - 0.006555558968699738
+    orientation:
+      w: 0.419988688058579
+      xyz:
+      - 0.40088379307201727
+      - 0.5636331978027851
+      - -0.5875536611149932
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000019__sample_168
+  candidate_content_sha256: 344169c35307857e843f3130309c173f15186884b092a2f202ce4793ba8b08d4
+  source_pool_index: 2926
+  graspgenx_score: 0.48697736859321594
+  object_T_G:
+    position:
+    - -0.1001253513725573
+    - 0.06175127078668246
+    - 0.004486016318566367
+    orientation:
+      w: 0.7079178656571946
+      xyz:
+      - 0.16752294345698016
+      - 0.6784405420792962
+      - -0.1025026329516578
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.88
+    opposing_first_contact_alpha: 0.44
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_120
+  candidate_content_sha256: 2bd1a597fab238aa0c290fbf755208cfbceedb5c8551289ef479e65c08269bee
+  source_pool_index: 2929
+  graspgenx_score: 0.7056221961975098
+  object_T_G:
+    position:
+    - 0.004224237602753014
+    - 0.08131420438067088
+    - -0.002491779537507132
+    orientation:
+      w: 0.050224692633699004
+      xyz:
+      - -0.010595596056489574
+      - -0.613832152338831
+      - 0.7877660200523603
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.52
+    opposing_first_contact_alpha: 0.88
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000139__sample_220
+  candidate_content_sha256: 5799f73ca52a5bb63b680c044c86d6e556871bb8fbe987dc62b5eeb2c598d065
+  source_pool_index: 2933
+  graspgenx_score: 0.12144600600004196
+  object_T_G:
+    position:
+    - -0.006047750275033146
+    - -0.08246755774243703
+    - 0.02620856076887922
+    orientation:
+      w: 0.5279845424547632
+      xyz:
+      - -0.5296405501333986
+      - 0.4509658597379621
+      - 0.48717861604756957
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 0.9
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000119__sample_229
+  candidate_content_sha256: f7447b1c9d627da9fb5601c6f9bb042267290e11d0c0835a75eea30e78d76e98
+  source_pool_index: 2935
+  graspgenx_score: 0.1174645647406578
+  object_T_G:
+    position:
+    - 0.09485602247397361
+    - -0.00735123396961918
+    - 0.019881507236874863
+    orientation:
+      w: 0.2283480878196491
+      xyz:
+      - 0.6499949403131121
+      - -0.23720575298456348
+      - -0.6849066791231414
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.54
+    opposing_first_contact_alpha: 0.7000000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_203
+  candidate_content_sha256: a6a9ef9d7641ebc4828f9a372fe4891d83dc419d84ebf41c427681a17e1b9fe4
+  source_pool_index: 2939
+  graspgenx_score: 0.24470311403274536
+  object_T_G:
+    position:
+    - 0.09988306331316886
+    - 0.06582283799425731
+    - -0.0031186157424084697
+    orientation:
+      w: 0.24314997411026368
+      xyz:
+      - 0.6705019497375516
+      - 0.1702330572291174
+      - -0.6799455358444145
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.8200000000000001
+    opposing_first_contact_alpha: 0.5
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_129
+  candidate_content_sha256: 26c6b20bfae7bc41c44afb3dabff696f42603cb71a991d4fee9e68d2f40b9bac
+  source_pool_index: 2953
+  graspgenx_score: 0.6945654153823853
+  object_T_G:
+    position:
+    - -0.05393906814177576
+    - 0.09540693287626872
+    - 0.014206188585973546
+    orientation:
+      w: 0.5920950812085883
+      xyz:
+      - 0.3517568102580308
+      - 0.6218741505282983
+      - -0.3727775504914396
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.66
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_136
+  candidate_content_sha256: a9557bb7ab961a589d48d2c0faa11b013f11c6d578cde86610aa4bd840eb4984
+  source_pool_index: 2961
+  graspgenx_score: 0.6929464340209961
+  object_T_G:
+    position:
+    - -0.06315983963330331
+    - 0.09071452741400371
+    - 0.00721920872516112
+    orientation:
+      w: 0.6389499197711136
+      xyz:
+      - 0.3324484917255816
+      - 0.6171118954747922
+      - -0.3168499784399281
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.66
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000029__sample_233
+  candidate_content_sha256: a4766419db5580461b5dcf1b530989b6e84758aec0f6bf2f3da128688fc61d2c
+  source_pool_index: 2974
+  graspgenx_score: 0.07804837077856064
+  object_T_G:
+    position:
+    - 0.1031386690108007
+    - -0.00425160338281622
+    - 0.02515700817517118
+    orientation:
+      w: 0.4659285326900698
+      xyz:
+      - 0.5342376324470612
+      - -0.4737774538651597
+      - -0.5225281606877128
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7200000000000001
+    opposing_first_contact_alpha: 0.52
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_210
+  candidate_content_sha256: c7ccdd85b874ec7579064d297dfbf09d466d4cf889187ee165133f6ca6be7147
+  source_pool_index: 2978
+  graspgenx_score: 0.21676547825336456
+  object_T_G:
+    position:
+    - 0.09992651509921012
+    - 0.04949950997606883
+    - 0.0014966173045255391
+    orientation:
+      w: 0.22113692240007957
+      xyz:
+      - 0.6748586606180919
+      - 0.16736673314181127
+      - -0.6838513189119503
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.78
+    opposing_first_contact_alpha: 0.54
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000039__sample_231
+  candidate_content_sha256: 74604d703c61a8651ac0ebac1f9e46cc2dfd5268c6e0ed36e9248b0f9d6a0b90
+  source_pool_index: 2988
+  graspgenx_score: 0.06609554588794708
+  object_T_G:
+    position:
+    - 0.10280801969448981
+    - -0.01569109584315648
+    - 0.01769188031963186
+    orientation:
+      w: 0.5065005886455104
+      xyz:
+      - 0.47952413893631785
+      - -0.49250058530659224
+      - -0.5205352316143436
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.78
+    opposing_first_contact_alpha: 0.46
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000069__sample_226
+  candidate_content_sha256: 8a70ba98f7c905ac55ce7c818637a663ecd23fde34c270d00df68623709c19a1
+  source_pool_index: 2992
+  graspgenx_score: 0.20291896164417267
+  object_T_G:
+    position:
+    - 0.09801929312626777
+    - -0.007247338882824088
+    - 0.022309232358253762
+    orientation:
+      w: 0.09338931772041124
+      xyz:
+      - -0.7057856437718628
+      - 0.005080063590953254
+      - 0.7022245035137732
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5800000000000001
+    opposing_first_contact_alpha: 0.7200000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000159__sample_241
+  candidate_content_sha256: 364cca29fe7cb708f419d0d7d2d8707451f4553b7674f1f625a96723ab8d64b2
+  source_pool_index: 2993
+  graspgenx_score: 0.03115127608180046
+  object_T_G:
+    position:
+    - 0.045664461877745956
+    - -0.09619944716914525
+    - 0.021024243761218354
+    orientation:
+      w: 0.425761433500712
+      xyz:
+      - -0.6104792199182925
+      - 0.3588339217062162
+      - 0.5632766109331263
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000099__sample_215
+  candidate_content_sha256: c6610bfee5fa32d5507c7b1d0b04b2d0e64602bd0c3cf62fd61a0e71b8f0bde5
+  source_pool_index: 3028
+  graspgenx_score: 0.15127968788146973
+  object_T_G:
+    position:
+    - 0.10474965589920936
+    - -0.00796976859792104
+    - 0.017687044892824456
+    orientation:
+      w: 0.37896153425761936
+      xyz:
+      - -0.6233638632709402
+      - -0.2816452670669445
+      - 0.623282915745193
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7000000000000001
+    opposing_first_contact_alpha: 0.5800000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_200
+  candidate_content_sha256: b94061230bf584aee9f6006b2d9b34bb7290abd8250d55da28f28ab3d505d92d
+  source_pool_index: 3029
+  graspgenx_score: 0.3450462818145752
+  object_T_G:
+    position:
+    - -0.09879200291951241
+    - -0.0006903411668629001
+    - 0.024360291514910027
+    orientation:
+      w: 0.5104155517352114
+      xyz:
+      - 0.5104244802520693
+      - 0.4979371208135205
+      - 0.4806260898267862
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.62
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_188
+  candidate_content_sha256: ef5aff1da118dd726ad5f9ac098ae16927b47d6be1fe87458de51c01a8bc2347
+  source_pool_index: 3049
+  graspgenx_score: 0.32210099697113037
+  object_T_G:
+    position:
+    - -0.07837928963025155
+    - -0.010205369322737362
+    - 0.01778415576032476
+    orientation:
+      w: 0.5686184683819107
+      xyz:
+      - 0.42588218729572014
+      - 0.5460572207938135
+      - 0.4439807558646657
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 0.9
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000149__sample_217
+  candidate_content_sha256: c84b7eabf9244c4200d1e22275242fb4048a7b0ad53fb14dc1942c678c975a95
+  source_pool_index: 3056
+  graspgenx_score: 0.1330423504114151
+  object_T_G:
+    position:
+    - 0.09963232892434058
+    - -0.020619910090407038
+    - 0.011991095584250256
+    orientation:
+      w: 0.12314259838261687
+      xyz:
+      - 0.6556271947194671
+      - -0.18237665010294535
+      - -0.7223071642349169
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.5800000000000001
+    opposing_first_contact_alpha: 0.62
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_136
+  candidate_content_sha256: 0b4d5291284fc4b8aa44c0e3c171dc8f2339e1045485c822acc940d7f8757780
+  source_pool_index: 3066
+  graspgenx_score: 0.6356611251831055
+  object_T_G:
+    position:
+    - -0.06247760859449449
+    - 0.09088332031742702
+    - 0.013716058660662934
+    orientation:
+      w: 0.611594924051371
+      xyz:
+      - 0.33041689104463584
+      - 0.6302973445711111
+      - -0.3456900120246472
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.66
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_226
+  candidate_content_sha256: 3ed2d0215d2468ea25bab9f57a34779c4abd2ad6f849bb3177e6fd2bb2a55de7
+  source_pool_index: 3072
+  graspgenx_score: 0.116518035531044
+  object_T_G:
+    position:
+    - 0.10293604302088676
+    - -0.02004983450396886
+    - 0.01818718374184446
+    orientation:
+      w: 0.41519273104314225
+      xyz:
+      - -0.6164002447585702
+      - -0.30659735228495866
+      - 0.5946963913816565
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.68
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_202
+  candidate_content_sha256: 90dc858499001fdcfad3d66308153e695b050ebb30652bbac6f45af239fb742c
+  source_pool_index: 3089
+  graspgenx_score: 0.2499866485595703
+  object_T_G:
+    position:
+    - -0.05948416275103632
+    - -0.04964588384254804
+    - 0.040931910131490994
+    orientation:
+      w: 0.5843909299618195
+      xyz:
+      - -0.291210826050875
+      - 0.7209676528445073
+      - 0.2321403440184602
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 0.9600000000000001
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000159__sample_214
+  candidate_content_sha256: 8dd0a1114d9f91d1d3443a2c63ec1a9e75af0c3c226be9466dedfe2023ced514
+  source_pool_index: 3097
+  graspgenx_score: 0.2275749146938324
+  object_T_G:
+    position:
+    - -0.10080455375035348
+    - 0.016921812788406706
+    - 0.03115906551889257
+    orientation:
+      w: 0.6734199945814955
+      xyz:
+      - -0.09748757693667694
+      - 0.7195751944709802
+      - -0.13861176985712662
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_150
+  candidate_content_sha256: e89ee9a3783deadfd2e27d65cef7ee3323df6187db18cfa3cdae9c9250a6095a
+  source_pool_index: 3106
+  graspgenx_score: 0.5511102676391602
+  object_T_G:
+    position:
+    - 0.020722525742453902
+    - 0.10559413407818447
+    - 0.005713826366133257
+    orientation:
+      w: 0.4157848975959359
+      xyz:
+      - 0.45068722784736326
+      - 0.524819036823456
+      - -0.5903972562386245
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.68
+    opposing_first_contact_alpha: 0.6
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_220
+  candidate_content_sha256: 1debc2402d1034e5100a8e69e6d0b8b04dddb7cabc65443d33079abb358dd9ee
+  source_pool_index: 3109
+  graspgenx_score: 0.21056047081947327
+  object_T_G:
+    position:
+    - -0.10234464091380181
+    - 0.005968376648435687
+    - 0.02747058481386976
+    orientation:
+      w: 0.6825376502616797
+      xyz:
+      - -0.1583537078478167
+      - 0.6852169153635669
+      - -0.19885733098317399
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.68
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000129__sample_231
+  candidate_content_sha256: 21816b10203ceadd09acf9b44c28e702a5114f59fb735a5506f2860c0c0cce55
+  source_pool_index: 3137
+  graspgenx_score: 0.12173258513212204
+  object_T_G:
+    position:
+    - -0.09016707671006265
+    - -0.06643590505345692
+    - 0.010458773788429066
+    orientation:
+      w: 0.6703311770305251
+      xyz:
+      - -0.23554942972916862
+      - 0.6576868349812929
+      - 0.25024109643986087
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.7000000000000001
+    opposing_first_contact_alpha: 0.6
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000039__sample_193
+  candidate_content_sha256: e1e51e3818b0e1dc0d62f30816165ed1860efd98f8bb897055c4daf7fbd9d1dc
+  source_pool_index: 3142
+  graspgenx_score: 0.357650488615036
+  object_T_G:
+    position:
+    - 0.01968166473190245
+    - 0.1041924190975822
+    - 0.008573695872343346
+    orientation:
+      w: 0.4561083788468893
+      xyz:
+      - 0.4429020017559655
+      - 0.5358786913870646
+      - -0.5555510702928299
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.64
+    opposing_first_contact_alpha: 0.64
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000109__sample_227
+  candidate_content_sha256: bec562732788a9bf0124d4e9f462b3e86ee89842f45850714ed4885f01c4a379
+  source_pool_index: 3145
+  graspgenx_score: 0.07464244961738586
+  object_T_G:
+    position:
+    - -0.10860273373444619
+    - 0.00226225809083352
+    - 0.044375765923775005
+    orientation:
+      w: 0.4534371142761588
+      xyz:
+      - 0.5581647541135843
+      - 0.5196397277838293
+      - 0.4613257460525903
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.9600000000000001
+    opposing_first_contact_alpha: 0.42000000000000004
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000059__sample_189
+  candidate_content_sha256: fa8010c29088f4e775fac5a3424e56d9cbb6fefb063f83deaba2ab915786cb0a
+  source_pool_index: 3150
+  graspgenx_score: 0.3170608580112457
+  object_T_G:
+    position:
+    - 0.019430317532820075
+    - 0.09364706848637233
+    - 0.018251798902071282
+    orientation:
+      w: 0.4480646552240515
+      xyz:
+      - 0.462551986195333
+      - 0.5379545896900596
+      - -0.5439564175897766
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.52
+    opposing_first_contact_alpha: 0.74
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000049__sample_205
+  candidate_content_sha256: 7f5d2e4eeb0de6e4e000a730764d8d2edede180d1ea3fcc8976eb332b344ec2e
+  source_pool_index: 3154
+  graspgenx_score: 0.3042964041233063
+  object_T_G:
+    position:
+    - 0.0078052194682782594
+    - 0.10607296799198757
+    - 0.018099691573894783
+    orientation:
+      w: 0.2829749242209737
+      xyz:
+      - 0.28446729623094535
+      - 0.6358817687142784
+      - -0.6592859211707706
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.68
+    opposing_first_contact_alpha: 0.66
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000169__sample_216
+  candidate_content_sha256: 40e973a75e6e42bd0e3f6bdf005371212eda7a4be13a7c9b658cf1c55d676824
+  source_pool_index: 3167
+  graspgenx_score: 0.25148338079452515
+  object_T_G:
+    position:
+    - 0.011715385679704518
+    - 0.0807188284851707
+    - 0.01904164798966722
+    orientation:
+      w: 0.3024424407520535
+      xyz:
+      - 0.28152109188254343
+      - 0.6334234497128471
+      - -0.6542546738167617
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.34
+    opposing_first_contact_alpha: 0.92
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000159__sample_211
+  candidate_content_sha256: 013729e9f7435ff8ae6d7c3a68d24cd0d90f7e86d859f477f0f09192b04bbfdc
+  source_pool_index: 3170
+  graspgenx_score: 0.23634009063243866
+  object_T_G:
+    position:
+    - 0.004456596531522841
+    - 0.07657817576901088
+    - 0.03620738894156294
+    orientation:
+      w: 0.34439578734246074
+      xyz:
+      - 0.39576236441622314
+      - 0.6226267916635958
+      - -0.5806027651287451
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.36000000000000004
+    opposing_first_contact_alpha: 0.92
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true
+- candidate_id: cube_head__seed_0000000079__sample_219
+  candidate_content_sha256: 5bd606317b3142204eeff1afe6baa0823aca011068efb38602d405e8f98bff1a
+  source_pool_index: 3171
+  graspgenx_score: 0.21421727538108826
+  object_T_G:
+    position:
+    - 0.044109909412068694
+    - 0.08836703573242793
+    - 0.039456527535236645
+    orientation:
+      w: 0.27710742993589615
+      xyz:
+      - 0.5765588308078895
+      - 0.484955433046667
+      - -0.5963301223737412
+  valid_approach_distances_m:
+  - 0.07
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close_on_prime_tower
+    open_hand_object_collision_free: true
+    thumb_first_contact_alpha: 0.62
+    opposing_first_contact_alpha: 0.76
+    exact_fixture_and_table_open_approach_clear: true
+    exact_fixture_and_table_fixed_close_sweep_clear: true

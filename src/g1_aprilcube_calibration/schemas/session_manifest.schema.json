@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "G1 immutable capture session manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "session_id", "created_at_utc", "finalized",
+    "camera_profile_sha256", "pose_set_content_sha256", "artifact_sha256",
+    "pairing_config", "recording_gate_config", "provenance", "captures",
+    "content_sha256"
+  ],
+  "properties": {
+    "schema_version": {"const": 3},
+    "session_id": {"$ref": "#/$defs/id"},
+    "created_at_utc": {"type": "string", "minLength": 1},
+    "finalized": {"type": "boolean"},
+    "camera_profile_sha256": {"$ref": "#/$defs/sha"},
+    "pose_set_content_sha256": {"$ref": "#/$defs/sha"},
+    "artifact_sha256": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"$ref": "#/$defs/sha"}
+    },
+    "pairing_config": {"type": "object"},
+    "recording_gate_config": {"type": "object"},
+    "provenance": {"type": "object"},
+    "captures": {"type": "array", "items": {"$ref": "#/$defs/capture"}},
+    "content_sha256": {"$ref": "#/$defs/sha"}
+  },
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$"},
+    "sha": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame_id", "image_path", "image_sha256", "states_path",
+        "states_sha256", "image_timing", "camera_info", "pairing", "quality",
+        "live_correspondence_sha256"
+      ],
+      "properties": {
+        "frame_id": {"$ref": "#/$defs/id"},
+        "image_path": {"type": "string", "minLength": 1},
+        "image_sha256": {"$ref": "#/$defs/sha"},
+        "states_path": {"type": "string", "minLength": 1},
+        "states_sha256": {"$ref": "#/$defs/sha"},
+        "image_timing": {"type": "object"},
+        "camera_info": {"type": "object"},
+        "pairing": {"type": "object"},
+        "quality": {"type": "object"},
+        "live_correspondence_sha256": {"$ref": "#/$defs/sha"}
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture_id", "pose_id", "outcome", "reason", "recorded_at_utc",
+        "metadata", "frames", "supported_frames",
+        "selected_supported_frame_id", "selected_frame_id"
+      ],
+      "properties": {
+        "capture_id": {"$ref": "#/$defs/id"},
+        "pose_id": {"$ref": "#/$defs/id"},
+        "outcome": {"enum": ["accepted", "rejected", "retry", "skipped", "aborted"]},
+        "reason": {"type": "string", "minLength": 1},
+        "recorded_at_utc": {"type": "string", "minLength": 1},
+        "metadata": {"type": "object"},
+        "frames": {"type": "array", "items": {"$ref": "#/$defs/frame"}},
+        "supported_frames": {
+          "type": "array", "items": {"$ref": "#/$defs/frame"}
+        },
+        "selected_supported_frame_id": {"type": ["string", "null"]},
+        "selected_frame_id": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

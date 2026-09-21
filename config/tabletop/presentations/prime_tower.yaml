@@ -1,0 +1,32 @@
+schema_version: 1
+presentation_id: prime-tower
+applicable_hand_sides: [left, right]
+object_profile_ids: [cube40-r3, cube60-r3]
+grasp_shortlists:
+  cube40-r3: config/tabletop/presentations/prime_tower/cube40-r3.yaml
+  cube60-r3: config/tabletop/presentations/prime_tower/cube60-r3.yaml
+fixture:
+  fixture_id: cube_prime_tower_h60
+  mesh_path: config/tabletop/presentations/prime_tower/fixture.stl
+  mesh_sha256: 2e1409589b2a4cb394b8ac89756f8e9739e2c8ebbe2324815258f8cc7eb2ad56
+  mesh_scale: [0.001, 0.001, 0.001]
+  support_height_m: 0.060
+  cube_pose_contract: centred_and_yaw_aligned
+operator_contract:
+  fixture_base_fixed_to_table: true
+  cube_centred_on_tower: true
+  cube_yaw_aligned_with_fixture: true
+source:
+  supplied_mesh: prime_tower_collision.stl
+  supplied_mesh_sha256: 2e1409589b2a4cb394b8ac89756f8e9739e2c8ebbe2324815258f8cc7eb2ad56
+  dimensions_mm: [35.42, 34.75, 60.0]
+  qualification_source_repository: sri299792458/g1-aprilcube-demo
+  qualification_source_revision: 4325bc94988b44554f106b206fb1bcd650cfd619
+  cube40_source_pool: artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml
+  cube40_source_pool_sha256: 8e9343f9080421a5e26e3854fa0886f965392aae1c032a414e4446b2b1bfa9e4
+  cube40_admitted_candidate_count: 113
+  cube40_shortlist_sha256: 540c822b5cbc478c11c10d7315d91675bc1add492c30ab112f330d4d0133870b
+  cube60_source_pool: artifacts/grasp_atlas/cube60_r3_experiment_v1/right/arm_grasp_pool.yaml
+  cube60_source_pool_sha256: b7749554c66336a25b44afb525a3898dd8dbc0752ccd99e7faa685a689880a48
+  cube60_admitted_candidate_count: 312
+  cube60_shortlist_sha256: ce20cf26111d36ee11596c49a60ac352f96e79ef3415e611794ccd473e597dfe

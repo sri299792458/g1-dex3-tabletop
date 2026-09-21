@@ -1,0 +1,86 @@
+solid prime_tower_collision
+  facet normal 0.000000 0.000000 -1.000000
+    outer loop
+      vertex -17.710000 -17.375000 0.000000
+      vertex 17.710000 17.375000 0.000000
+      vertex 17.710000 -17.375000 0.000000
+    endloop
+  endfacet
+  facet normal 0.000000 0.000000 -1.000000
+    outer loop
+      vertex -17.710000 -17.375000 0.000000
+      vertex -17.710000 17.375000 0.000000
+      vertex 17.710000 17.375000 0.000000
+    endloop
+  endfacet
+  facet normal 0.000000 0.000000 1.000000
+    outer loop
+      vertex -17.710000 -17.375000 60.000000
+      vertex 17.710000 -17.375000 60.000000
+      vertex 17.710000 17.375000 60.000000
+    endloop
+  endfacet
+  facet normal 0.000000 0.000000 1.000000
+    outer loop
+      vertex -17.710000 -17.375000 60.000000
+      vertex 17.710000 17.375000 60.000000
+      vertex -17.710000 17.375000 60.000000
+    endloop
+  endfacet
+  facet normal 0.000000 -1.000000 0.000000
+    outer loop
+      vertex -17.710000 -17.375000 0.000000
+      vertex 17.710000 -17.375000 0.000000
+      vertex 17.710000 -17.375000 60.000000
+    endloop
+  endfacet
+  facet normal 0.000000 -1.000000 0.000000
+    outer loop
+      vertex -17.710000 -17.375000 0.000000
+      vertex 17.710000 -17.375000 60.000000
+      vertex -17.710000 -17.375000 60.000000
+    endloop
+  endfacet
+  facet normal 1.000000 0.000000 0.000000
+    outer loop
+      vertex 17.710000 -17.375000 0.000000
+      vertex 17.710000 17.375000 0.000000
+      vertex 17.710000 17.375000 60.000000
+    endloop
+  endfacet
+  facet normal 1.000000 0.000000 0.000000
+    outer loop
+      vertex 17.710000 -17.375000 0.000000
+      vertex 17.710000 17.375000 60.000000
+      vertex 17.710000 -17.375000 60.000000
+    endloop
+  endfacet
+  facet normal 0.000000 1.000000 0.000000
+    outer loop
+      vertex 17.710000 17.375000 0.000000
+      vertex -17.710000 17.375000 0.000000
+      vertex -17.710000 17.375000 60.000000
+    endloop
+  endfacet
+  facet normal 0.000000 1.000000 -0.000000
+    outer loop
+      vertex 17.710000 17.375000 0.000000
+      vertex -17.710000 17.375000 60.000000
+      vertex 17.710000 17.375000 60.000000
+    endloop
+  endfacet
+  facet normal -1.000000 0.000000 0.000000
+    outer loop
+      vertex -17.710000 17.375000 0.000000
+      vertex -17.710000 -17.375000 0.000000
+      vertex -17.710000 -17.375000 60.000000
+    endloop
+  endfacet
+  facet normal -1.000000 0.000000 0.000000
+    outer loop
+      vertex -17.710000 17.375000 0.000000
+      vertex -17.710000 -17.375000 60.000000
+      vertex -17.710000 17.375000 60.000000
+    endloop
+  endfacet
+endsolid prime_tower_collision

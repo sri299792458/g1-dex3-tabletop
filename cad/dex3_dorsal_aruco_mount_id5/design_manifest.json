@@ -1,0 +1,103 @@
+{
+  "schema_version": 3,
+  "hand_side": "left",
+  "units": "millimetres unless a transform is explicitly in metres",
+  "sources": {
+    "official_dimensioned_drawing": "https://marketing.unitree.com/article/zh/Dex3-1/User_Manual.html",
+    "official_urdf_and_mesh": "unitree_ros/robots/dexterous_hand_description/dex3_1"
+  },
+  "target": {
+    "dictionary": "DICT_6X6_50",
+    "id": 5,
+    "active_size_mm": 40.0,
+    "quiet_zone_mm": 5.0
+  },
+  "spec": {
+    "marker_id": 5,
+    "marker_size_mm": 40.0,
+    "marker_bits": 6,
+    "border_bits": 1,
+    "quiet_zone_mm": 5.0,
+    "mounting_tab_depth_mm": 10.0,
+    "mounting_tab_width_mm": 30.0,
+    "plate_thickness_mm": 4.0,
+    "plate_corner_radius_mm": 3.0,
+    "black_inlay_depth_mm": 0.6,
+    "hole_spacing_mm": 15.0,
+    "thread_depth_mm": 3.0,
+    "hole_clearance_diameter_mm": 3.4,
+    "countersink_major_diameter_mm": 6.0,
+    "countersink_depth_mm": 1.7,
+    "hole_line_from_distal_edge_mm": 5.0,
+    "minimum_tab_ligament_mm": 2.0,
+    "nominal_screw_length_mm": 8.0,
+    "screw_boss_diameter_mm": 7.0,
+    "screw_boss_height_mm": 1.5,
+    "wrist_pad_diameter_mm": 6.0,
+    "wrist_pad_height_mm": 2.57,
+    "wrist_pad_from_proximal_edge_mm": 20.0,
+    "palm_hole_midpoint_x_mm": 66.7,
+    "palm_hole_midpoint_z_mm": 0.0,
+    "palm_dorsal_surface_y_at_holes_mm": -21.33,
+    "palm_mounting_surface_dy_dx": 0.019947,
+    "palm_wrist_surface_dy_dx": -0.01485,
+    "palm_dorsal_surface_y_at_wrist_pad_mm": -20.95771
+  },
+  "derived_geometry": {
+    "mounting_pitch_deg": 1.142727372832295,
+    "wrist_pad_face_pitch_deg": -1.993507163583325
+  },
+  "plate_hole_centers_mm": [
+    [
+      17.5,
+      55.0,
+      0.0
+    ],
+    [
+      32.5,
+      55.0,
+      0.0
+    ]
+  ],
+  "fastener_stack": {
+    "nominal_screw": "M3 x 8 mm ISO 10642",
+    "printed_face_to_shell_mm": 5.5,
+    "effective_screw_stack_mm": 5.5,
+    "nominal_thread_engagement_mm": 2.5,
+    "blind_hole_depth_mm": 3.0,
+    "nominal_bottoming_clearance_mm": 0.5
+  },
+  "nominal_palm_T_marker_face_m": [
+    [
+      0.0,
+      -0.9998011179423463,
+      0.01994303289959598,
+      0.03681565314267739
+    ],
+    [
+      0.0,
+      0.01994303289959598,
+      0.9998011179423463,
+      0.02742719713567078
+    ],
+    [
+      -1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "evidence_status": {
+    "marker_dictionary_and_id": "decoded directly from the original GraspGen-X project video",
+    "palm_outer_surface": "official Unitree Dex3 palm STL",
+    "hole_thread_and_spacing": "official Dex3-1 user-manual drawing: 2 x M3, 3 mm deep, 15.00 mm center spacing",
+    "absolute_hole_pose_in_palm_link": "manual drawing fixes x=66.70 mm and z=0; palm STL ray intersection fixes the local dorsal surface y=-21.33 mm",
+    "plate_pitch_and_wrist_pad": "least-squares tangent fits over the M3 boss and wrist-pad footprints in the official palm STL; physically confirmed by the first print leaving the former 2.0 mm pad unseated"
+  }
+}

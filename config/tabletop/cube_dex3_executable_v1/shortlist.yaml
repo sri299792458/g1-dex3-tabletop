@@ -1,0 +1,148 @@
+format: g1_aprilcube_executable_grasp_shortlist
+format_version: 2
+shortlist_id: cube_dex3_executable_v1
+applicable_hand_sides: [left, right]
+qualification_source_hand_side: right
+canonical_grasp_frame: GraspGenX_G
+handedness_policy: preserve_object_T_G_and_apply_exact_dex3_side_adapter
+object_id: cube_head
+object_mesh: third_party/aprilcube/models/dex3_safe_cube/mujoco/cube.obj
+object_mesh_sha256: 27c8460e40a85475e87c3cc0d6090c3c9500de4fa7f5728a2462fc099ef3d927
+candidate_count: 5
+runtime_policy:
+  candidate_grouping: none
+  candidate_submission: independent_batched_ik_rows_with_16_seeds_each
+  curobo_selection_role: reachability_self_collision_and_arm_route
+  serialization_order_is_planner_cost: false
+execution_contract:
+  applicability: upright_stationary_40mm_cube_with_arbitrary_tabletop_yaw
+  source_retention_pass_required: true
+  fixed_cube_during_qualification: true
+  fixed_descriptor_close_target: true
+  initial_open_hand_object_collision_free: true
+  exact_collision_mesh_table_clearance_m: 0.005
+  exact_open_and_pregrasp_table_clear: true
+  exact_fixed_close_sweep_table_clear: true
+  approach_distance_m: 0.05
+  fixed_close_sweep_samples: 51
+  fixed_close_sweep_maximum_joint_step_rad: 0.02
+  required_contact_groups_during_fixed_close_sweep: [thumb, opposing]
+audit:
+  source_candidate_count: 3178
+  admitted_candidate_count: 5
+  rejection_counts_nonexclusive:
+    fixed_close_sweep_below_5mm: 3173
+    open_grasp_below_5mm: 3137
+    open_pregrasp_below_5mm: 2533
+    open_hand_cube_collision: 69
+    opposing_never_reaches_fixed_cube: 348
+    thumb_never_reaches_fixed_cube: 80
+source:
+  repository: sri299792458/g1-aprilcube-demo
+  commit: 4325bc94988b44554f106b206fb1bcd650cfd619
+  arm_grasp_pool: artifacts/grasp_atlas/cube40_viral_v1/right/arm_grasp_pool.yaml
+  arm_grasp_pool_sha256: 8e9343f9080421a5e26e3854fa0886f965392aae1c032a414e4446b2b1bfa9e4
+  dex3_descriptor_urdf_sha256: a0eb8466fd854328d7d43f7f30e823d9d45e331acf77a03154fb6861d80e73d9
+  dex3_descriptor_config_sha256: c54143b12d91a4a9a0a777b52e9dbd0c5ef4eb9406e40a88fcc56ca86b9da5ab
+  dex3_descriptor_collision_mesh_sha256: b516e791d18d777b1c6ecc885073bad3511c8c1e1bab1c3cb97b61d79c2d0871
+candidates:
+- candidate_id: cube_head__seed_0000000079__sample_213
+  candidate_content_sha256: 5a8a2ccfe629608cdc454335f215658fca4dc1cca2a5f7e872b48d23d327bac4
+  source_pool_index: 2070
+  graspgenx_score: 0.24118560552597046
+  object_T_G:
+    position: [0.01013509238938746, 0.08838929061667095, 0.02717635207287149]
+    orientation:
+      w: 0.051163336177637304
+      xyz: [0.06342612796252343, 0.7058409344870439, -0.7036675454540396]
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close
+    open_hand_object_collision_free: true
+    open_hand_table_clearance_m: 0.012210922257499118
+    open_pregrasp_table_clearance_m: 0.012881211809257546
+    fixed_close_sweep_table_clearance_m: 0.006053263527939598
+    fixed_close_sweep_minimum_link: right_hand_index_1_link
+    fixed_close_sweep_minimum_sample: 50
+    thumb_first_contact_alpha: 0.50
+    opposing_first_contact_alpha: 0.78
+- candidate_id: cube_head__seed_0000000079__sample_203
+  candidate_content_sha256: b3bbf688aba626e6c8989c9b795671c1b4f30659fc799dcf4701f3e8d6881c76
+  source_pool_index: 2488
+  graspgenx_score: 0.30495598912239075
+  object_T_G:
+    position: [-0.09550430012066903, 0.003444302947083806, 0.03230585515908079]
+    orientation:
+      w: 0.6166698453356098
+      xyz: [0.3661424005749975, 0.6254700301893658, 0.3073195172615082]
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close
+    open_hand_object_collision_free: true
+    open_hand_table_clearance_m: 0.015811127710899996
+    open_pregrasp_table_clearance_m: 0.02339303256007252
+    fixed_close_sweep_table_clearance_m: 0.005772246976842966
+    fixed_close_sweep_minimum_link: right_hand_middle_1_link
+    fixed_close_sweep_minimum_sample: 48
+    thumb_first_contact_alpha: 0.56
+    opposing_first_contact_alpha: 0.70
+- candidate_id: cube_head__seed_0000000159__sample_222
+  candidate_content_sha256: 6d4ca745ac89747f2f194052607825def905cf6e944e111e3025bd3c1ff7377a
+  source_pool_index: 2281
+  graspgenx_score: 0.1785213202238083
+  object_T_G:
+    position: [-0.07345627379735055, 0.009242845819155071, 0.023937653605259224]
+    orientation:
+      w: 0.5766044618098086
+      xyz: [-0.3866106601320304, 0.577564161598617, -0.4295103390259458]
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close
+    open_hand_object_collision_free: true
+    open_hand_table_clearance_m: 0.01925160220591233
+    open_pregrasp_table_clearance_m: 0.014166051193163661
+    fixed_close_sweep_table_clearance_m: 0.005598273620100583
+    fixed_close_sweep_minimum_link: right_hand_index_1_link
+    fixed_close_sweep_minimum_sample: 50
+    thumb_first_contact_alpha: 0.34
+    opposing_first_contact_alpha: 0.96
+- candidate_id: cube_head__seed_0000000079__sample_230
+  candidate_content_sha256: 485ae9641ca2b8c1f7451b2a3e179f6b95df6ea1eb6157eede920db74eaf1a92
+  source_pool_index: 2752
+  graspgenx_score: 0.1426442712545395
+  object_T_G:
+    position: [-0.014584251131313472, -0.09627411688788762, 0.031569693092621136]
+    orientation:
+      w: 0.6896544847420317
+      xyz: [-0.7230339086168158, 0.03645701905581833, 0.016417808229366126]
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close
+    open_hand_object_collision_free: true
+    open_hand_table_clearance_m: 0.00760590019521035
+    open_pregrasp_table_clearance_m: 0.014838044369654284
+    fixed_close_sweep_table_clearance_m: 0.005558093558310034
+    fixed_close_sweep_minimum_link: right_hand_index_1_link
+    fixed_close_sweep_minimum_sample: 41
+    thumb_first_contact_alpha: 0.60
+    opposing_first_contact_alpha: 0.68
+- candidate_id: cube_head__seed_0000000079__sample_228
+  candidate_content_sha256: c0c4aa6079faa4a9806d522c38c084fd29dd4900e78b481838aea72c20701863
+  source_pool_index: 998
+  graspgenx_score: 0.15402135252952576
+  object_T_G:
+    position: [-0.08090368044694009, 0.004553537004450654, 0.03526426464728193]
+    orientation:
+      w: 0.49008782852730753
+      xyz: [-0.4918765546826136, 0.5466639182042305, -0.46800634164138016]
+  execution_evidence:
+    intrinsic_retention_passed: true
+    qualification_model: stationary_cube_fixed_descriptor_close
+    open_hand_object_collision_free: true
+    open_hand_table_clearance_m: 0.006699151061377435
+    open_pregrasp_table_clearance_m: 0.018934346415229415
+    fixed_close_sweep_table_clearance_m: 0.005161327586143249
+    fixed_close_sweep_minimum_link: right_hand_index_1_link
+    fixed_close_sweep_minimum_sample: 27
+    thumb_first_contact_alpha: 0.50
+    opposing_first_contact_alpha: 0.82
