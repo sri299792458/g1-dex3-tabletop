@@ -11,9 +11,11 @@ committed source baseline associated with the August 25 cube-stacking demo.
 This branch has not replaced that demonstrated baseline or its calibration bundle.
 
 Read [September calibration development](docs/september-calibration.md) for the
-source map, findings and limits. The
-[G1 research guide](https://sri299792458.github.io/g1-research-docs/) explains the
-broader project.
+source map, findings and limits.
+
+**[Calibration findings and evidence](https://sri299792458.github.io/g1-research-docs/calibration/investigation.html)** ·
+[Full G1 guide](https://sri299792458.github.io/g1-research-docs/) ·
+[Documentation source](https://github.com/sri299792458/g1-research-docs)
 
 ## Development setup
 
