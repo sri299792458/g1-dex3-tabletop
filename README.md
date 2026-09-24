@@ -1,30 +1,34 @@
 # G1 Dex3 Tabletop
 
-This `main` branch publishes the committed baseline used for the August 25,
-2026 cube-stacking demo, derived from
-`d1b010351189259633ccaa536e3618aa5892dd88`. Runtime code, configuration, tests,
-CAD assets and upstream pins are preserved from that baseline. Later calibration
-development is separate from this version. Personal running notes, internal
-design proposals and research-planning documents are excluded from this branch's
-new history.
+Cube stacking on the Unitree G1, with calibrated perception, CuRobo planning,
+control ownership, recovery and experiment recording.
 
-The [G1 research guide](https://sri299792458.github.io/g1-research-docs/)
-provides diagrams, hardware setup and the reasoning behind the system. The guide
-also discusses later experiments; check a section's source version before using
-its commands with this baseline.
+[![The physical G1 after placing one marker cube on another](docs/assets/g1-physical-cube-stacking.jpg)](https://sri299792458.github.io/g1-research-docs/manipulation/tasks.html#physical-demonstration)
 
-Focused Unitree G1 software for two connected operations:
+*Watch the physical pickup, stacking and release demonstration in the guide.*
 
-1. automatically collect dorsal-Dex3 calibration observations and solve the
-   fixed-marker camera extrinsic with Mike Ferguson's Ceres optimizer;
-2. use a removable calibration bundle and official NVLabs CuRobo to plan and
-   execute a selected-Dex3 hash-bound AprilCube pick, 100 mm lift, exact replacement,
-   retreat, and controller handback.
+**[How the system works](https://sri299792458.github.io/g1-research-docs/manipulation/tasks.html)** ·
+[Full G1 guide](https://sri299792458.github.io/g1-research-docs/) ·
+[Documentation source](https://github.com/sri299792458/g1-research-docs)
 
-The repository contains no historical manual-teaching pipeline or custom IK.
-CuRobo is the only IK, collision, grasp-goal, attachment, and trajectory
-planner. The research guide documents commissioning evidence, rejected
-approaches, and remaining physical limits.
+The task brings together components that can inform other G1 experiments:
+
+- **Control and recovery:** acquisition from measured state, continuous holding
+  during planning, independent watchdog support and controller handback.
+- **Perception and planning:** calibrated camera/arm geometry, AprilCube pose
+  estimation, offline grasp candidates and checked motion/recovery routes.
+- **Recording:** state, commands, camera data and task outcomes, with offline
+  conversion to LeRobot and selected recordings available for inspection.
+
+Start with [control ownership](https://sri299792458.github.io/g1-research-docs/control/ownership.html)
+or [recording](https://sri299792458.github.io/g1-research-docs/data/recording.html)
+when adapting those components. They live within this application; the guide
+explains the surrounding responsibilities that another task must preserve.
+
+This `main` branch preserves the runtime used by the August 25, 2026 demo.
+Later calibration development is on
+[`experimental/september-calibration`](https://github.com/sri299792458/g1-dex3-tabletop/tree/experimental/september-calibration).
+The guide labels which version each procedure describes.
 
 ## Safety boundary
 
