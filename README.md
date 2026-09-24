@@ -17,6 +17,11 @@ source map, findings and limits.
 [Full G1 guide](https://sri299792458.github.io/g1-research-docs/) ·
 [Documentation source](https://github.com/sri299792458/g1-research-docs)
 
+The AprilCube submodule uses a public revision whose implementation, tests and
+assets match the original dependency used locally (`9381a52`). The publication
+fix changes the dependency reference and its provenance entry; it does not
+change the detector algorithm or the selected calibration bundle.
+
 ## Development setup
 
 Initialize the pinned submodules before using the existing setup scripts.
