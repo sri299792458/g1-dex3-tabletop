@@ -36,7 +36,7 @@
   "upstream": {
     "aprilcube": {
       "repository": "sri299792458/aprilcube",
-      "commit": "9381a52b936059a977e6c4e6fb4de60eae33129b"
+      "commit": "b7f86f20f367b75f681c9a30b296be6f8eb8dad9"
     },
     "curobo": {
       "repository": "NVlabs/curobo",

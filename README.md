@@ -30,6 +30,11 @@ Later calibration development is on
 [`experimental/september-calibration`](https://github.com/sri299792458/g1-dex3-tabletop/tree/experimental/september-calibration).
 The guide labels which version each procedure describes.
 
+The AprilCube submodule uses a public revision whose implementation, tests and
+assets match the original dependency used locally (`9381a52`). The publication
+fix changes the dependency reference and its provenance entry; it does not
+change the detector algorithm or the selected calibration bundle.
+
 ## Safety boundary
 
 - Inspection, candidate generation, Ferguson solving, and CuRobo planning do
